@@ -365,6 +365,7 @@ def solve_arc(start, end, clockwise: bool,
         mx, my = (x1 + x2) / 2, (y1 + y2) / 2
         h = math.sqrt(max(r * r - (chord / 2) ** 2, 0.0))
         ux, uy = (x2 - x1) / chord, (y2 - y1) / chord
+        # 弦的两个垂直方向上的候选圆心
         c1 = (mx - uy * h, my + ux * h)
         c2 = (mx + uy * h, my - ux * h)
         want_major = r < 0
@@ -372,12 +373,12 @@ def solve_arc(start, end, clockwise: bool,
         for cand in (c1, c2):
             s = _signed_sweep(
                 _angle(cand[0], cand[1], x1, y1),
-                _angle(cand[0], cand[1], x2, y2), clockwise,
-            )
-            if h < GEOM_TOL:  # 半圆，两圆心重合
+                _angle(cand[0], cand[1], x2, y2), clockwise)
+            if h < GEOM_TOL:  # 半圆，c1 与 c2 重合（弦中点），取第一个
                 cx, cy, sweep = cand[0], cand[1], s
                 break
-            if (abs(s) > math.pi + 1e-9) == want_major:
+            # 两个候选圆心分别给出优弧与劣弧，按扫角大小直接匹配 R 符号
+            if (abs(s) > math.pi) == want_major:
                 cx, cy, sweep = cand[0], cand[1], s
                 break
         if cx is None:
@@ -509,6 +510,31 @@ class Analyzer:
                         if w.letter != "N")
 
     @staticmethod
+    def _collect_unsupported(pl: ParsedLine, g_words=None, m_words=None) -> list[str]:
+        """列出本行全部未支持指令（保持行内出现顺序，去重）。
+
+        用于正常段阻断；词法残缺时也调用，以便把残缺片段中恢复出的
+        合法词（如 `G55 X-` 中的 G55）一并显式列出。
+        """
+        g_words = g_words if g_words is not None else pl.g_words
+        m_words = m_words if m_words is not None else pl.m_words
+        out: list[str] = []
+        for w in pl.words:
+            if w.letter == "G":
+                tok = "G" + fmt_num(w.value)
+                if g_code_key(w) not in SUPPORTED_G and tok not in out:
+                    out.append(tok)
+            elif w.letter == "M":
+                tok = "M" + fmt_num(w.value)
+                if g_code_key(w) not in SUPPORTED_M and tok not in out:
+                    out.append(tok)
+            elif w.letter not in ALLOWED_LETTERS:
+                tok = f"{w.letter}{fmt_num(w.value)}"
+                if tok not in out:
+                    out.append(tok)
+        return out
+
+    @staticmethod
     def _normalized(applied_g: list[str], m_words: list[Word],
                     motion_g: str | None,
                     coord_words: list[tuple[str, float]],
@@ -566,17 +592,25 @@ class Analyzer:
             })
             return
 
-        # 1) 词法残缺 -> 整段阻断
+        # 1) 词法残缺 -> 整段阻断；残缺片段中恢复出的词仍参与
+        # “未支持指令”检查，两类问题都要列出
         if pl.malformed:
             normalized = self._blocked_normalized(pl)
-            idx = self._issue(
+            issue_indexes = [self._issue(
                 "MALFORMED_LINE", pl,
                 f"存在无法识别的片段 {pl.malformed}；按保守策略整段不执行、"
                 "不改变任何模态状态",
-                {"malformed_tokens": pl.malformed}, normalized,
-            )
+                {"malformed_tokens": pl.malformed}, normalized)]
+            unsupported = self._collect_unsupported(pl)
+            if unsupported:
+                issue_indexes.append(self._issue(
+                    "UNSUPPORTED_INSTRUCTION", pl,
+                    "同一程序段还包含本工具不支持的指令；即使语法可修复，"
+                    "该段也必须按未支持指令处理，不猜测执行",
+                    {"unsupported_tokens": unsupported}, normalized))
             self._finish_line(pl, "blocked", normalized, executed=False,
-                              block_reason="malformed", issue_indexes=[idx])
+                              block_reason="malformed",
+                              issue_indexes=issue_indexes)
             self.blocked_count += 1
             return
 
@@ -584,18 +618,7 @@ class Analyzer:
         m_words = pl.m_words
 
         # 2) 未支持指令 -> 整段阻断
-        unsupported = [
-            "G" + fmt_num(w.value) for w in g_words
-            if g_code_key(w) not in SUPPORTED_G
-        ]
-        unsupported += [
-            "M" + fmt_num(w.value) for w in m_words
-            if g_code_key(w) not in SUPPORTED_M
-        ]
-        unsupported += sorted({
-            f"{w.letter}{fmt_num(w.value)}" for w in pl.words
-            if w.letter not in ALLOWED_LETTERS
-        })
+        unsupported = self._collect_unsupported(pl, g_words, m_words)
         if unsupported:
             normalized = self._blocked_normalized(pl)
             idx = self._issue(
@@ -609,19 +632,23 @@ class Analyzer:
             self.blocked_count += 1
             return
 
-        # 3) 应用模态设定（同组多个取最后一个）
+        # 3) 应用模态设定（同组多个取同行最后一个，如 G20 G21 -> mm）
         applied_g: list[str] = []
+        last_unit = last_mode = None
+        wcs_g = False
         for w in g_words:
             key = g_code_key(w)
             if key in SETTING_G_UNIT:
                 self.state.unit = SETTING_G_UNIT[key]
-                applied_g.append(key)
+                last_unit = key
             elif key in SETTING_G_MODE:
                 self.state.distance_mode = SETTING_G_MODE[key]
-                applied_g.append(key)
+                last_mode = key
             elif key == "54":
                 self.state.wcs = "G54"
-                applied_g.append(key)
+                wcs_g = True
+        applied_g = [g for g in (last_unit, last_mode, "54" if wcs_g else None)
+                     if g is not None]
 
         line_motion_keys = [g_code_key(w) for w in g_words
                             if g_code_key(w) in MOTION_G]
@@ -903,15 +930,28 @@ class Analyzer:
 
         if motion_mode == "rapid":
             zs = [p[2] for p in points if p[2] is not None]
-            if zs and min(zs) < self.cfg.safe_z - MM_EPS:
+            s0, s1 = segment["start"], segment["end"]
+            xy_known = all(v is not None for v in
+                           (s0[0], s0[1], s1[0], s1[1]))
+            xy_move = (xy_known and
+                       math.hypot(s1[0] - s0[0], s1[1] - s0[1]) > MM_EPS)
+            end_below = s1[2] is not None and s1[2] < self.cfg.safe_z - MM_EPS
+            horiz_below = (xy_move and zs
+                           and min(zs) < self.cfg.safe_z - MM_EPS)
+            # 纯垂直抬刀必然经过当前低 Z，不报警；
+            # 报警条件：快速终点低于安全 Z，或安全 Z 以下存在水平快速移动
+            if end_below or horiz_below:
+                z_ref = s1[2] if end_below else min(zs)
                 issue_indexes.append(self._issue(
                     "RAPID_BELOW_SAFE_Z", pl,
-                    f"快速移动经过 Z={fmt_num(min(zs))} mm（工件坐标），"
+                    f"快速移动到达/经过 Z={fmt_num(z_ref)} mm（工件坐标），"
                     f"低于安全 Z {fmt_num(self.cfg.safe_z)} mm（低 "
-                    f"{fmt_num(self.cfg.safe_z - min(zs))} mm）",
-                    {"min_z_mm": round(min(zs), 6),
+                    f"{fmt_num(self.cfg.safe_z - z_ref)} mm）",
+                    {"ref_z_mm": round(z_ref, 6),
                      "safe_z_mm": self.cfg.safe_z,
-                     "below_mm": round(self.cfg.safe_z - min(zs), 6)}))
+                     "below_mm": round(self.cfg.safe_z - z_ref, 6),
+                     "end_below_safe_z": end_below,
+                     "horizontal_travel_below_safe_z": horiz_below}))
 
         if motion_mode in ("linear", "arc_cw", "arc_ccw"):
             if not self.state.spindle_on:

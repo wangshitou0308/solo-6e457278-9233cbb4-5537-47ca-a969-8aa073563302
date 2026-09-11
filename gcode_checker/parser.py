@@ -150,9 +150,23 @@ def parse_line(line: str, line_no: int) -> ParsedLine:
             continue
         m = _WORD_RE.match(text, pos)
         if not m or m.start() != pos:
-            # 字母后面没有合法数字
-            pl.malformed.append(text[pos:pos + 2].strip() or ch)
-            pos += 1
+            # 字母后面没有合法数字：把到下一个空白为止的残片整体记为残缺；
+            # 同时尝试从残片中恢复合法词（如 "X-T5" 中的 T5），
+            # 便于分析阶段完整列出未支持指令（残片所在行仍会被整段阻断）。
+            j = pos + 1
+            while j < len(text) and not text[j].isspace():
+                j += 1
+            frag = text[pos:j]
+            pl.malformed.append(frag)
+            for wm in _WORD_RE.finditer(frag):
+                num_text = wm.group(2)
+                pl.words.append(Word(
+                    letter=wm.group(1),
+                    raw_num=num_text,
+                    value=float(num_text),
+                    raw=wm.group(0).replace(" ", ""),
+                ))
+            pos = j
             continue
         letter = m.group(1)
         num_text = m.group(2)
