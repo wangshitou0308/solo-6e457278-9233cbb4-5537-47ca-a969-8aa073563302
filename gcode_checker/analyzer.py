@@ -61,6 +61,7 @@ ISSUE_SEVERITY = {
     "CYCLE_BAD_PARAM": "error",            # Q<=0、P 或 L 非法、平面顺序矛盾
     "CYCLE_PLANE_CONFLICT": "error",       # 孔底与 R 平面 / 初始平面顺序矛盾
     "CYCLE_NO_INHERITABLE_STATE": "error",  # 后续孔位没有可继承的循环/位置状态
+    "CYCLE_PLANE_NOT_G17": "error",        # 固定循环只允许在 G17(XY) 平面展开
 }
 
 ISSUE_TITLE = {
@@ -81,16 +82,34 @@ ISSUE_TITLE = {
     "CYCLE_BAD_PARAM": "固定循环参数非法（对应孔已阻断）",
     "CYCLE_PLANE_CONFLICT": "固定循环平面顺序矛盾（对应孔已阻断）",
     "CYCLE_NO_INHERITABLE_STATE": "后续孔位没有可继承的循环状态（该孔已阻断）",
+    "CYCLE_PLANE_NOT_G17": "固定循环仅允许在 G17(XY) 平面展开（对应孔已阻断）",
 }
 
-ALLOWED_LETTERS = {"G", "M", "X", "Y", "Z", "I", "J", "R", "F", "S", "N",
+ALLOWED_LETTERS = {"G", "M", "X", "Y", "Z", "I", "J", "K", "R", "F", "S", "N",
                    "Q", "P", "L"}
 MOTION_G = {"0": "rapid", "1": "linear", "2": "arc_cw", "3": "arc_ccw"}
 MOTION_CN = {"rapid": "快速", "linear": "直线",
              "arc_cw": "顺时针圆弧", "arc_ccw": "逆时针圆弧"}
 SETTING_G_UNIT = {"20": "inch", "21": "mm"}
 SETTING_G_MODE = {"90": "absolute", "91": "relative"}
-# 固定循环返回平面模态 G98/G99 的中文名
+# 圆弧平面选择模态 G17/G18/G19
+PLANE_G = {"17": "G17", "18": "G18", "19": "G19"}
+# 平面 -> (平面轴 u 下标, 平面轴 v 下标, 垂直轴下标, u 圆心词, v 圆心词, 标签)
+# u/v 取右手系（u × v = 垂直轴），G2/G3 旋向按“从垂直轴正向看向平面”判定
+PLANE_SPEC = {
+    "G17": (0, 1, 2, "I", "J", "G17(XY)"),
+    "G18": (2, 0, 1, "K", "I", "G18(XZ)"),
+    "G19": (1, 2, 0, "J", "K", "G19(YZ)"),
+}
+PLANE_AXIS_NAMES = ("X", "Y", "Z")
+CENTER_WORD_ORDER = {"I": 0, "J": 1, "K": 2}
+
+
+def plane_center_words(plane: str) -> list[str]:
+    """当前平面接受的圆心词（按 I/J/K 惯例顺序，如 G18 -> ['I', 'K']）。"""
+    return sorted((PLANE_SPEC[plane][3], PLANE_SPEC[plane][4]),
+                  key=CENTER_WORD_ORDER.get)
+# 固定钻孔循环返回平面模态 G98/G99 的中文名
 RETURN_MODE_G = {"98": "G98", "99": "G99"}
 
 GEOM_TOL = 1e-6      # 几何相对容差
@@ -241,6 +260,7 @@ class State:
     distance_mode: str | None = None   # 'absolute' | 'relative' | None
     wcs: str | None = None             # 'G54' | None
     motion_mode: str | None = None     # rapid/linear/arc_cw/arc_ccw
+    plane: str = "G17"                 # G17/G18/G19（上电默认 G17）
     x: Axis = field(default_factory=Axis)
     y: Axis = field(default_factory=Axis)
     z: Axis = field(default_factory=Axis)
@@ -261,6 +281,7 @@ class State:
             distance_mode=self.distance_mode,
             wcs=self.wcs,
             motion_mode=self.motion_mode,
+            plane=self.plane,
             x=Axis(self.x.value, self.x.known),
             y=Axis(self.y.value, self.y.known),
             z=Axis(self.z.value, self.z.known),
@@ -290,6 +311,7 @@ class State:
             "distance_mode": self.distance_mode,
             "wcs": self.wcs,
             "motion_mode": self.motion_mode,
+            "plane": self.plane,
             "x": ax(self.x),
             "y": ax(self.y),
             "z": ax(self.z),
@@ -365,9 +387,12 @@ def _signed_sweep(a0: float, a1: float, clockwise: bool) -> float:
 
 def solve_arc(start, end, clockwise: bool,
               i: float | None, j: float | None,
-              r_word: float | None) -> dict:
-    """解算 G17 平面圆弧。I/J 优先于 R；抛 ArcError 表示无解。
+              r_word: float | None,
+              words: tuple[str, str] = ("I", "J")) -> dict:
+    """解算当前平面内的二维圆弧。圆心词（I/J、I/K 或 J/K）优先于 R 的
+    旧策略已废弃：调用方须先拒绝混用；抛 ArcError 表示无解。
 
+    words 为当前平面的两个圆心词名（仅用于报错文本）。
     返回 {center, radius, sweep, samples, length_xy}。
     """
     x1, y1 = start
@@ -380,12 +405,14 @@ def solve_arc(start, end, clockwise: bool,
         cx, cy = x1 + i, y1 + j
         radius = math.hypot(i, j)
         if radius < GEOM_TOL:
-            raise ArcError("I/J 指定的圆心与起点重合，半径为 0")
+            raise ArcError(
+                f"{words[0]}/{words[1]} 指定的圆心与起点重合，半径为 0")
         r_end = math.hypot(x2 - cx, y2 - cy)
         tol = max(GEOM_TOL, radius * 1e-4)
         if abs(r_end - radius) > tol:
             raise ArcError(
-                f"终点到圆心距离 {r_end:.6g} 与半径 {radius:.6g} 不一致"
+                f"终点到圆心距离 {r_end:.6g} 与起点半径 {radius:.6g} 不一致"
+                f"（起终半径差 {abs(r_end - radius):.6g}）"
             )
         if chord < tol:
             sweep = -2 * math.pi if clockwise else 2 * math.pi  # 整圆
@@ -396,7 +423,8 @@ def solve_arc(start, end, clockwise: bool,
     elif r_word is not None:
         r = r_word
         if chord < GEOM_TOL:
-            raise ArcError("R 编程圆弧的起点与终点重合（整圆请用 I/J）")
+            raise ArcError(
+                f"R 编程圆弧的起点与终点重合（整圆请用 {words[0]}/{words[1]}）")
         if abs(r) * 2 < chord - GEOM_TOL:
             raise ArcError(
                 f"弦长 {chord:.6g} 大于 2R={2 * abs(r):.6g}，圆弧不存在"
@@ -424,7 +452,8 @@ def solve_arc(start, end, clockwise: bool,
             raise ArcError("R 圆弧圆心候选均不满足旋向/半径符号约束")
         radius = abs(r)
     else:
-        raise ArcError("圆弧段缺少圆心参数 I/J 或半径 R")
+        raise ArcError(
+            f"圆弧段缺少圆心参数 {words[0]}/{words[1]} 或半径 R")
 
     n = int(min(512, max(16, math.ceil(abs(sweep) / (2 * math.pi) * 96))))
     a0 = _angle(cx, cy, x1, y1)
@@ -441,6 +470,22 @@ def solve_arc(start, end, clockwise: bool,
         "samples": samples,
         "length_xy": abs(sweep) * radius,
     }
+
+
+def arc_extreme_angles(a0: float, sweep: float) -> list[float]:
+    """真实弧线上平面轴取极值的角度集合（起点/终点 + 扫过的象限角）。
+
+    平面内两轴的极值只可能出现在端点或角度为 k·π/2 的位置；
+    垂直轴随扫角线性联动，极值恒在端点。
+    """
+    angles = [a0, a0 + sweep]
+    lo, hi = (a0 + sweep, a0) if sweep < 0 else (a0, a0 + sweep)
+    step = math.pi / 2
+    k0 = math.ceil(lo / step - 1e-9)
+    k1 = math.floor(hi / step + 1e-9)
+    for k in range(k0, k1 + 1):
+        angles.append(k * step)
+    return angles
 
 
 def _dist3(a, b) -> float | None:
@@ -484,6 +529,12 @@ class Analyzer:
         self.unknown_length_segments = 0
         self.length_cycle_rapid = 0.0
         self.length_cycle_cutting = 0.0
+        # 已执行弧段的分平面统计（报告 arcs 节）
+        self.arc_stats = {
+            p: {"count": 0, "arc_length_mm": 0.0, "length_3d_mm": 0.0,
+                "helical_count": 0, "full_circle_count": 0}
+            for p in PLANE_G.values()
+        }
         self._snap_in: dict = {}
         self._snap_in_cycle: CycleDef | None = None
         self._snap_in_return = "initial"
@@ -609,14 +660,17 @@ class Analyzer:
                     coord_words: list[tuple[str, float]],
                     f_val: float | None, s_val: float | None,
                     motion_is_modal: bool = False) -> str:
-        """G(单位/模式/WCS/运动) -> M -> XYZIJR -> F S 的规范顺序。"""
+        """G(单位/模式/平面/WCS/运动) -> M -> XYZIJKR -> F S 的规范顺序。"""
         out: list[str] = []
         unit_g = next((g for g in applied_g if g in SETTING_G_UNIT), None)
         mode_g = next((g for g in applied_g if g in SETTING_G_MODE), None)
+        plane_g = next((g for g in applied_g if g in PLANE_G), None)
         if unit_g:
             out.append(f"G{unit_g}")
         if mode_g:
             out.append(f"G{mode_g}")
+        if plane_g:
+            out.append(f"G{plane_g}")
         if "54" in applied_g:
             out.append("G54")
         if motion_g is not None:
@@ -710,7 +764,7 @@ class Analyzer:
 
         # 3) 应用模态设定（同组多个取同行最后一个，如 G20 G21 -> mm）
         applied_g: list[str] = []
-        last_unit = last_mode = None
+        last_unit = last_mode = last_plane = None
         wcs_g = False
         for w in g_words:
             key = g_code_key(w)
@@ -720,10 +774,14 @@ class Analyzer:
             elif key in SETTING_G_MODE:
                 self.state.distance_mode = SETTING_G_MODE[key]
                 last_mode = key
+            elif key in PLANE_G:
+                self.state.plane = PLANE_G[key]
+                last_plane = key
             elif key == "54":
                 self.state.wcs = "G54"
                 wcs_g = True
-        applied_g = [g for g in (last_unit, last_mode, "54" if wcs_g else None)
+        applied_g = [g for g in (last_unit, last_mode, last_plane,
+                                 "54" if wcs_g else None)
                      if g is not None]
 
         issue_indexes: list[int] = []
@@ -815,13 +873,13 @@ class Analyzer:
                          round(s_raw - self.cfg.max_spindle_rpm, 6)}))
 
         axis_words = {w.letter: w.value for w in pl.words if w.letter in "XYZ"}
-        ij_words = {w.letter: w.value for w in pl.words if w.letter in "IJ"}
+        ijk_words = {w.letter: w.value for w in pl.words if w.letter in "IJK"}
         r_word = next((w.value for w in pl.words if w.letter == "R"), None)
         q_word = next((w.value for w in pl.words if w.letter == "Q"), None)
         p_word = next((w.value for w in pl.words if w.letter == "P"), None)
         l_word = next((w.value for w in pl.words if w.letter == "L"), None)
         coord_words = [(w.letter, w.value) for w in pl.words
-                       if w.letter in ("X", "Y", "Z", "I", "J", "R", "Q",
+                       if w.letter in ("X", "Y", "Z", "I", "J", "K", "R", "Q",
                                        "P", "L")]
 
         # 5) 固定循环处理（本行定义/重定义循环，或在激活循环上给出触发词）
@@ -939,7 +997,7 @@ class Analyzer:
 
             if motion_mode in ("arc_cw", "arc_ccw"):
                 arc = self._build_arc(
-                    pl, motion_mode, start_pt, end_pt, ij_words, r_word,
+                    pl, motion_mode, start_pt, end_pt, ijk_words, r_word,
                     issue_indexes)
                 if arc is None:
                     # 几何无解：回滚本行全部状态改动，整段阻断
@@ -987,6 +1045,7 @@ class Analyzer:
             distance_mode=snapshot["distance_mode"],
             wcs=snapshot["wcs"],
             motion_mode=snapshot["motion_mode"],
+            plane=snapshot["plane"],
             x=ax(snapshot["x"]), y=ax(snapshot["y"]), z=ax(snapshot["z"]),
             feed=ax(snapshot["feed_mm_per_min"]),
             spindle_rpm=snapshot["spindle_rpm"],
@@ -1245,6 +1304,17 @@ class Analyzer:
                 {"cycle": cd.cycle, "unknown": why,
                  "definition_line_no": cd.def_line_no}, normalized))
             block_codes.append("CYCLE_NO_INHERITABLE_STATE")
+
+        # 阻断条件六：固定循环只允许在 G17(XY) 平面展开
+        if self.state.plane != "G17":
+            block_codes.append("CYCLE_PLANE_NOT_G17")
+            issue_indexes.append(self._issue(
+                "CYCLE_PLANE_NOT_G17", pl,
+                f"固定循环 {cd.cycle} 只允许在 G17(XY) 平面展开，当前平面为 "
+                f"{self.state.plane}；本行对应孔全部阻断（循环模态仍登记，"
+                "G17 恢复后后续孔位可正常触发）",
+                {"cycle": cd.cycle, "plane": self.state.plane,
+                 "definition_line_no": cd.def_line_no}, normalized))
 
         g = self._group_for(cd)
         g["parameters"] = cd.params_out()
@@ -1515,6 +1585,7 @@ class Analyzer:
             "CYCLE_PLANE_CONFLICT": "孔底与 R 平面顺序矛盾",
             "CYCLE_MISSING_PARAMS": "首次启用缺少 Z/R（G83 还需 Q）",
             "CYCLE_NO_INHERITABLE_STATE": "后续孔位没有可继承的状态",
+            "CYCLE_PLANE_NOT_G17": "固定循环仅允许在 G17(XY) 平面展开",
         }
         return "；".join(parts.get(c, c) for c in block_codes)
 
@@ -1589,74 +1660,154 @@ class Analyzer:
             text += "  [" + "，".join(inherited) + "]"
         return text
 
-    # -- 圆弧 --------------------------------------------------------------
+    # -- 圆弧（G17/G18/G19 + 垂直轴联动螺旋） -------------------------------
 
-    def _build_arc(self, pl, motion_mode, start_pt, end_pt, ij_words, r_word,
+    def _build_arc(self, pl, motion_mode, start_pt, end_pt, ijk_words, r_word,
                    issue_indexes):
-        if any(v is None for v in start_pt[:2] + end_pt[:2]):
+        plane = self.state.plane
+        ui, vi, pi, uw, vw, plane_label = PLANE_SPEC[plane]
+        u_name = PLANE_AXIS_NAMES[ui]
+        v_name = PLANE_AXIS_NAMES[vi]
+        perp_name = PLANE_AXIS_NAMES[pi]
+        factor = self.state.unit_factor() or 1.0
+        blocked_norm = self._blocked_normalized(pl)
+
+        def fail(basis, details):
             issue_indexes.append(self._issue(
-                "ARC_NO_SOLUTION", pl,
-                "圆弧起点或终点 XY 坐标未知（此前位置未建立），"
-                "无法解算几何；整段不执行并回滚本行状态",
-                {"start_mm": [round6(v) for v in start_pt],
-                 "end_mm": [round6(v) for v in end_pt]},
-                self._blocked_normalized(pl)))
+                "ARC_NO_SOLUTION", pl, basis, details, blocked_norm))
             return None
 
-        factor = self.state.unit_factor() or 1.0
-        i = ij_words.get("I")
-        j = ij_words.get("J")
-        i = i * factor if i is not None else None
-        j = j * factor if j is not None else None
+        center_words = {w: v for w, v in ijk_words.items()}
+        # 阻断一：圆心参数混用（I/J/K 与 R 同时出现）
+        if r_word is not None and center_words:
+            mixed = sorted(center_words) + ["R"]
+            return fail(
+                f"圆心参数混用：{'/'.join(mixed)} 同时出现在 {plane_label} "
+                f"圆弧段（圆心编程与 R 编程二选一）；整段不执行，"
+                "本行模态改动全部回滚",
+                {"reason": "mixed_center_params",
+                 "plane": plane,
+                 "mixed_words": mixed,
+                 "start_mm": [round6(v) for v in start_pt],
+                 "end_mm": [round6(v) for v in end_pt]})
+        # 阻断二：圆心词不属于当前平面
+        wrong = [w for w in sorted(center_words) if w not in (uw, vw)]
+        if wrong:
+            return fail(
+                f"圆心参数 {'/'.join(wrong)} 不属于当前平面 {plane_label}"
+                f"（该平面接受 {'/'.join(plane_center_words(plane))} 或 R）；"
+                "整段不执行，本行模态改动全部回滚",
+                {"reason": "center_word_not_in_plane",
+                 "plane": plane,
+                 "invalid_words": wrong,
+                 "plane_center_words": plane_center_words(plane),
+                 "start_mm": [round6(v) for v in start_pt],
+                 "end_mm": [round6(v) for v in end_pt]})
+
+        # 平面内起终点必须已知（垂直轴允许未知，退化为长度未知）
+        u0, v0, u1, v1 = (start_pt[ui], start_pt[vi],
+                          end_pt[ui], end_pt[vi])
+        if any(v is None for v in (u0, v0, u1, v1)):
+            return fail(
+                f"圆弧起点或终点的 {u_name}/{v_name} 坐标未知"
+                "（此前位置未建立），无法解算几何；整段不执行并回滚本行状态",
+                {"reason": "position_unknown",
+                 "plane": plane,
+                 "start_mm": [round6(v) for v in start_pt],
+                 "end_mm": [round6(v) for v in end_pt]})
+
+        u_off = center_words.get(uw)
+        v_off = center_words.get(vw)
+        u_off = u_off * factor if u_off is not None else None
+        v_off = v_off * factor if v_off is not None else None
         r_mm = r_word * factor if r_word is not None else None
         try:
             sol = solve_arc(
-                (start_pt[0], start_pt[1]), (end_pt[0], end_pt[1]),
-                clockwise=(motion_mode == "arc_cw"), i=i, j=j, r_word=r_mm)
+                    (u0, v0), (u1, v1),
+                    clockwise=(motion_mode == "arc_cw"),
+                    i=u_off, j=v_off, r_word=r_mm, words=(uw, vw))
         except ArcError as e:
-            issue_indexes.append(self._issue(
-                "ARC_NO_SOLUTION", pl,
+            return fail(
                 f"圆弧几何无解：{e}；整段不执行，本行模态改动全部回滚",
                 {"reason": str(e),
+                 "plane": plane,
                  "start_mm": [round6(v) for v in start_pt],
                  "end_mm": [round6(v) for v in end_pt],
-                 "i_mm": round6(i), "j_mm": round6(j),
-                 "r_mm": round6(r_mm)},
-                self._blocked_normalized(pl)))
-            return None
+                 "i_mm": round6(ijk_words.get("I") and
+                                ijk_words["I"] * factor),
+                 "j_mm": round6(ijk_words.get("J") and
+                                ijk_words["J"] * factor),
+                 "k_mm": round6(ijk_words.get("K") and
+                                ijk_words["K"] * factor),
+                 "r_mm": round6(r_mm)})
 
-        z0, z1 = start_pt[2], end_pt[2]
+        # 垂直当前平面的联动轴：随扫角线性插补（螺旋）
+        p0, p1 = start_pt[pi], end_pt[pi]
+        cu, cv = sol["center"]
+        sweep = sol["sweep"]
+        radius = sol["radius"]
+
+        def to_3d(su, sv, frac):
+            pt = [None, None, None]
+            pt[ui] = su
+            pt[vi] = sv
+            if p0 is not None and p1 is not None:
+                pt[pi] = p0 + (p1 - p0) * frac
+            return pt
+
         n = len(sol["samples"])
         points = []
-        for k, (sx, sy) in enumerate(sol["samples"], start=1):
-            if z0 is not None and z1 is not None:
-                points.append([sx, sy, z0 + (z1 - z0) * (k / n)])
-            else:
-                points.append([sx, sy, None])
+        for k, (su, sv) in enumerate(sol["samples"], start=1):
+            points.append(to_3d(su, sv, k / n))
         points[-1] = list(end_pt)
-        xy_len = sol["length_xy"]
+
+        # 真实弧线的极值点（端点 + 扫过的象限角），用于精确包围盒/行程检查
+        a0 = _angle(cu, cv, u0, v0)
+        check_points = [list(start_pt)]
+        for a in arc_extreme_angles(a0, sweep)[1:]:
+            frac = 0.0 if abs(sweep) < GEOM_TOL else (a - a0) / sweep
+            check_points.append(to_3d(cu + radius * math.cos(a),
+                                      cv + radius * math.sin(a), frac))
+        check_points.append(list(end_pt))  # 终点精确（重复无妨）
+
+        arc_len = sol["length_xy"]
+        perp_change = (p1 - p0) if (p0 is not None and p1 is not None) else None
         length = None
-        if z0 is not None and z1 is not None:
-            length = math.sqrt(xy_len ** 2 + (z1 - z0) ** 2)
+        if perp_change is not None:
+            length = math.sqrt(arc_len ** 2 + perp_change ** 2)
         else:
             self.unknown_length_segments += 1
+        center_3d = [None, None, None]
+        center_3d[ui] = round(cu, 6)
+        center_3d[vi] = round(cv, 6)
+        if p0 is not None:
+            center_3d[pi] = round(p0, 6)  # 螺旋轴线过起点高度，仅供定位
+        full_circle = abs(abs(sweep) - 2 * math.pi) < 1e-6
         return {
             "kind": motion_mode,
             "start": start_pt,
             "end": end_pt,
-            "points": [start_pt] + points,
+            "points": [list(start_pt)] + points,
+            "check_points": check_points,
             "length_mm": length,
             "arc": {
-                "plane": "G17(XY)",
-                "programming": "I/J" if (i is not None or j is not None) else "R",
-                "center_mm": [round(sol["center"][0], 6),
-                              round(sol["center"][1], 6)],
-                "radius_mm": round(sol["radius"], 6),
-                "sweep_deg": round(math.degrees(sol["sweep"]), 6),
-                "helical": (z0 is not None and z1 is not None
-                            and abs(z1 - z0) > MM_EPS),
-                "z_change_mm": (round(z1 - z0, 6)
-                                if z0 is not None and z1 is not None else None),
+                "plane": plane_label,
+                "plane_code": plane,
+                "direction": "CW" if motion_mode == "arc_cw" else "CCW",
+                "programming": ("/".join(plane_center_words(plane))
+                                if center_words else "R"),
+                "center_mm": [round(cu, 6), round(cv, 6)],
+                "center_axes": [u_name, v_name],
+                "center_3d_mm": center_3d,
+                "radius_mm": round(radius, 6),
+                "sweep_deg": round(math.degrees(sweep), 6),
+                "full_circle": full_circle,
+                "helical": (perp_change is not None
+                            and abs(perp_change) > MM_EPS),
+                "perp_axis": perp_name,
+                "perp_change_mm": (round(perp_change, 6)
+                                   if perp_change is not None else None),
+                "arc_length_mm": round(arc_len, 6),
             },
         }
 
@@ -1665,7 +1816,8 @@ class Analyzer:
     def _run_segment_checks(self, pl, motion_mode, segment, issue_indexes,
                             cycle_context: bool = False,
                             line_dedupe: bool = False):
-        points = segment["points"]
+        # 圆弧段用真实弧线的精确极值点做行程/包围盒；其余段用轨迹点
+        points = segment.get("check_points") or segment["points"]
 
         # 行程检查需要工件坐标系
         if self.state.wcs is None:
@@ -1745,6 +1897,17 @@ class Analyzer:
                 self.length_rapid += length
             else:
                 self.length_cutting += length
+        arc = segment.get("arc")
+        if arc is not None:
+            st = self.arc_stats[arc["plane_code"]]
+            st["count"] += 1
+            st["arc_length_mm"] += arc["arc_length_mm"]
+            if length is not None:
+                st["length_3d_mm"] += length
+            if arc["helical"]:
+                st["helical_count"] += 1
+            if arc["full_circle"]:
+                st["full_circle_count"] += 1
 
     def _current_point(self):
         def g(a: Axis):
@@ -1910,6 +2073,31 @@ class Analyzer:
             "groups": groups,
         }
 
+    def _arcs_out(self) -> dict:
+        """分平面弧段统计（仅已执行弧段；阻断弧见 blocked_count）。"""
+        by_plane = {}
+        total = {"count": 0, "arc_length_mm": 0.0, "length_3d_mm": 0.0,
+                 "helical_count": 0, "full_circle_count": 0}
+        for plane, st in self.arc_stats.items():
+            row = {
+                "count": st["count"],
+                "arc_length_mm": round(st["arc_length_mm"], 6),
+                "length_3d_mm": round(st["length_3d_mm"], 6),
+                "helical_count": st["helical_count"],
+                "full_circle_count": st["full_circle_count"],
+            }
+            by_plane[plane] = row
+            total["count"] += st["count"]
+            total["arc_length_mm"] += st["arc_length_mm"]
+            total["length_3d_mm"] += st["length_3d_mm"]
+            total["helical_count"] += st["helical_count"]
+            total["full_circle_count"] += st["full_circle_count"]
+        total["arc_length_mm"] = round(total["arc_length_mm"], 6)
+        total["length_3d_mm"] = round(total["length_3d_mm"], 6)
+        blocked = sum(1 for i in self.issues if i.code == "ARC_NO_SOLUTION")
+        return {"by_plane": by_plane, "total": total,
+                "blocked_count": blocked}
+
     def _build_report(self, physical_lines: int) -> dict:
         counts = {s: 0 for s in SEVERITY_ORDER}
         for iss in self.issues:
@@ -1935,6 +2123,7 @@ class Analyzer:
             "machine": self.cfg.to_dict(),
             "final_state": self.state.snapshot(),
             "drill_cycles": self._drill_cycles_out(),
+            "arcs": self._arcs_out(),
             "bbox_program_mm": self._bbox_out(self.bmin, self.bmax),
             "bbox_machine_mm": (
                 self._bbox_out(self.mbmin, self.mbmax)
@@ -1964,8 +2153,11 @@ class Analyzer:
                          "G20/G21 出现前的物理检查显式报 UNKNOWN_UNITS",
                 "distance": "G90 绝对 / G91 增量；未建立时位置标记未知",
                 "wcs": "仅支持 G54，偏置取自作业配置；G54 前跳过行程检查",
-                "arc": "仅 G17(XY) 平面，I/J 优先于 R（R 负=优弧）；"
-                       "几何无解整段阻断并回滚",
+                "arc": "G17(XY，默认)/G18(XZ)/G19(YZ) 模态平面；圆心词随平面 "
+                       "I/J、I/K、J/K 或 R（R 负=优弧），垂直轴随扫角线性联动"
+                       "（螺旋）；圆心词与 R 混用、圆心词不属于当前平面、"
+                       "R 编程整圆或起终半径不一致均整段阻断并回滚；"
+                       "包围盒/行程按真实弧线极值点计算",
                 "block": "含未支持指令或无法解析的程序段整段阻断，"
                          "不改变任何模态",
                 "safe_z": "安全 Z 按工件(程序)坐标判定",
@@ -1976,8 +2168,9 @@ class Analyzer:
                     "G90 下 Z/R 绝对、L 为同位重复，G91 下 Z 相对 R、R 相对初始"
                     "平面、L 沿 XY 增量展开连续孔；G98 返回初始平面（默认），"
                     "G99 返回 R 平面；首次启用缺 Z/R、G83 的 Q 非正、P/L 非法"
-                    "或孔底高于 R 时阻断对应孔；G83 循环内部排屑快速移动豁免"
-                    "安全 Z 告警，孔间定位仍检查"),
+                    "或孔底高于 R 时阻断对应孔；固定循环仅允许在 G17(XY) 平面"
+                    "展开，G18/G19 下触发阻断对应孔；G83 循环内部排屑快速移动"
+                    "豁免安全 Z 告警，孔间定位仍检查"),
             },
         }
 
@@ -1991,8 +2184,11 @@ def analyze_program(text: str, config: MachineConfig,
 DIALECT = {
     "supported_g": {
         "G0": "快速定位", "G1": "直线插补",
-        "G2": "顺时针圆弧（G17，I/J 或 R）",
-        "G3": "逆时针圆弧（G17，I/J 或 R）",
+        "G2": "顺时针圆弧（当前平面，圆心词随平面 I/J、I/K、J/K 或 R）",
+        "G3": "逆时针圆弧（同 G2，旋向相反）",
+        "G17": "圆弧平面 XY（上电默认），垂直联动轴 Z",
+        "G18": "圆弧平面 XZ，垂直联动轴 Y",
+        "G19": "圆弧平面 YZ，垂直联动轴 X",
         "G20": "英制单位", "G21": "公制单位",
         "G90": "绝对定位", "G91": "增量定位",
         "G54": "工件坐标系 1（偏置由配置提供）",
@@ -2002,6 +2198,25 @@ DIALECT = {
         "G83": "深孔啄钻（按 Q 分步下钻，每步退回 R 排屑）",
         "G98": "固定循环后返回初始平面（默认）",
         "G99": "固定循环后返回 R 平面",
+    },
+    "arcs": {
+        "planes": {
+            "G17": "XY 平面（默认），圆心词 I/J，垂直联动轴 Z",
+            "G18": "XZ 平面，圆心词 I/K，垂直联动轴 Y",
+            "G19": "YZ 平面，圆心词 J/K，垂直联动轴 X",
+        },
+        "direction": "G2 顺圆 / G3 逆圆，按“从垂直轴正向看向平面”判定",
+        "center_programming": "圆心词为起点到圆心的增量；起终点重合时"
+                              "（圆心词编程）为整圆",
+        "r_programming": "R 正=劣弧（扫角<=180°），R 负=优弧；"
+                         "R 不能编程整圆",
+        "helical": "垂直当前平面的轴随扫角线性联动，段长为三维螺旋长度",
+        "block_rules": [
+            "圆心词与 R 混用 -> ARC_NO_SOLUTION，整段阻断并回滚",
+            "圆心词不属于当前平面（如 G17 下给 K）-> 阻断并回滚",
+            "R 编程整圆（起终点重合）-> 阻断并回滚",
+            "圆心词编程时起终半径不一致 -> 阻断并回滚",
+        ],
     },
     "canned_cycles": {
         "G81": {"params": "X Y Z R F L",
@@ -2019,25 +2234,28 @@ DIALECT = {
         "Z_semantics": "G90 绝对孔底坐标；G91 相对 R 平面的孔底增量",
         "Q_semantics": "G83 每步进给深度，恒为正的无符号增量（mm）",
         "P_semantics": "G82 孔底暂停：整数按毫秒、小数按秒；负数非法",
+        "plane_restriction": "固定循环仅允许在 G17(XY) 平面展开；"
+                             "G18/G19 下定义或触发时对应孔阻断"
+                             "（CYCLE_PLANE_NOT_G17），循环模态仍登记",
         "block_rules": [
             "首次启用缺少 Z 或 R（G83 还需正的 Q）-> 阻断对应孔",
             "G83 的 Q<=0、P 为负、L 非正整数 -> 阻断对应孔",
             "孔底高于 R 平面 -> CYCLE_PLANE_CONFLICT，阻断对应孔",
             "后续孔位缺少可继承的 XY/初始平面状态 -> 阻断对应孔",
+            "G18/G19 平面下展开 -> CYCLE_PLANE_NOT_G17，阻断对应孔",
         ],
     },
     "supported_m": {"M3": "主轴正转", "M5": "主轴停止"},
-    "supported_words": ["X", "Y", "Z", "I", "J", "R", "F", "S", "N(忽略)",
+    "supported_words": ["X", "Y", "Z", "I", "J", "K", "R", "F", "S", "N(忽略)",
                         "Q(固定循环步进)", "P(固定循环暂停)",
                         "L(固定循环重复次数)"],
     "comments": ["(圆括号注释)", ";分号注释"],
     "unsupported_policy": "任何未列出的 G/M 指令及其他地址词均显式报告，"
                           "并整段阻断，不猜测执行",
     "unsupported_examples": [
-        "G17/G18/G19 平面选择", "G28/G30 回零",
+        "G28/G30 回零",
         "G40-G43 刀补", "G54.1/G55-G59 其他工件坐标系",
         "G84-G89 其他固定循环（仅支持 G80-G83）",
-        "圆弧 K 参数（仅 G17，用 I/J）",
         "M2/M30 程序结束", "M4 反转", "M6 换刀", "M7-M9 冷却",
         "T 刀号", "H/D 刀补号",
     ],

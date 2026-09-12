@@ -18,12 +18,32 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 | 单位 | `G21` 公制 mm、`G20` 英制 inch（内部 ×25.4 换算 mm） |
 | 定位 | `G90` 绝对、`G91` 增量 |
 | 坐标系 | `G54`（偏置 X/Y/Z 由机床配置提供，叠加后做行程检查） |
-| 运动 | `G0` 快速、`G1` 直线、`G2` 顺圆、`G3` 逆圆（仅 G17/XY 平面） |
-| 固定循环 | `G80` 取消、`G81` 钻孔、`G82` 锪孔（`P` 孔底暂停）、`G83` 深孔啄钻（`Q` 分步）；`G98` 返回初始平面（默认）、`G99` 返回 R 平面；`R` R 平面、`L` 重复孔位 |
-| 圆弧参数 | `I J`（起点相对圆心，优先）或 `R`（负值=优弧）；允许 Z 联动螺旋下刀 |
+| 平面 | `G17` XY（上电默认，联动轴 Z）、`G18` XZ（联动轴 Y）、`G19` YZ（联动轴 X），模态保持 |
+| 运动 | `G0` 快速、`G1` 直线、`G2` 顺圆、`G3` 逆圆（当前平面内插补） |
+| 固定循环 | `G80` 取消、`G81` 钻孔、`G82` 锪孔（`P` 孔底暂停）、`G83` 深孔啄钻（`Q` 分步）；`G98` 返回初始平面（默认）、`G99` 返回 R 平面；`R` R 平面、`L` 重复孔位；**仅允许在 `G17` 平面展开** |
+| 圆弧参数 | `G17` 用 `I J`、`G18` 用 `I K`、`G19` 用 `J K`（起点相对圆心），或 `R`（正=劣弧，负=优弧）；垂直当前平面的轴随扫角线性联动（螺旋插补） |
 | 工艺 | `F` 进给（按当前单位换算 mm/min）、`S` 主轴转速 rpm |
 | 主轴 | `M3` 正转启动、`M5` 停止 |
-| 词 | `X Y Z`、`Q P L`（固定循环）、`N` 行号（忽略）；注释 `(...)` 与 `;...` |
+| 词 | `X Y Z`、`I J K`（圆弧圆心）、`Q P L`（固定循环）、`N` 行号（忽略）；注释 `(...)` 与 `;...` |
+
+### 圆弧与螺旋插补口径
+
+- 平面为**模态**：`G17/G18/G19` 切换后保持，未写过按控制器上电默认 `G17`。
+  旋向按“从垂直轴正向看向平面”判定（右手系：G17 看 XY、G18 看 XZ、G19 看 YZ）。
+- 圆心词为**起点到圆心的增量**（不受 G90/G91 影响）：`G17`→`I/J`、
+  `G18`→`I/K`、`G19`→`J/K`。起终点重合时用圆心词编程即**整圆**。
+- `R` 编程：正值为劣弧（扫角 ≤180°），负值为优弧；**R 不能编程整圆**
+  （起终点重合时阻断）。弦长 > 2R 同样无解。
+- **螺旋**：垂直当前平面的第三轴随扫角线性联动，段长按三维螺旋长度
+  `√(弧长² + 联动位移²)` 计入；整圆也可以带联动（如铣螺纹）。
+- 每段弧在轨迹中记录：平面、旋向、圆心（平面坐标 + 三维坐标）、半径、
+  扫角、联动轴与联动位移、平面弧长与三维长度；包围盒与行程检查按
+  **真实弧线**（端点 + 扫过的象限角极值点）精确计算，不做弦线近似。
+- 以下情况报 `ARC_NO_SOLUTION`，**定位原行、整段阻断**，进入该行前的
+  模态与位置保持不变（含本行写的平面/单位等全部回滚）：
+  圆心词与 `R` 混用；圆心词不属于当前平面（如 `G17` 下给 `K`）；
+  `R` 编程整圆；圆心词编程时起终半径不一致；圆心半径为 0；
+  起终点坐标未知。
 
 ### 固定钻孔循环展开口径
 
@@ -43,13 +63,15 @@ python3 -m gcode_checker --verbose       # 打印访问日志
   首次启用缺 `Z` 或 `R`（G83 还需正的 `Q`）→ `CYCLE_MISSING_PARAMS`；
   `Q<=0`、`P` 为负、`L` 非正整数 → `CYCLE_BAD_PARAM`；
   孔底高于 R 平面 → `CYCLE_PLANE_CONFLICT`；
-  后续孔位缺少可继承的 XY/初始平面 → `CYCLE_NO_INHERITABLE_STATE`。
+  后续孔位缺少可继承的 XY/初始平面 → `CYCLE_NO_INHERITABLE_STATE`；
+  `G18/G19` 平面下定义或触发 → `CYCLE_PLANE_NOT_G17`
+  （固定循环仅允许在 `G17` 平面展开，循环模态仍登记，`G17` 恢复后可继续触发）。
 - 循环展开轨迹复用行程/安全 Z/进给/主轴检查；G83 循环内部排屑快速动作豁免
   安全 Z 告警，孔间定位（尤其 G99 在 R 高度横移）仍报 `RAPID_BELOW_SAFE_Z`。
   主轴未转/无进给等工艺问题按**触发行**去重（一个 G83 孔只报一次）。
 
 **未支持示例**（遇到即 `UNSUPPORTED_INSTRUCTION`，整段不执行、不改模态）：
-`G17/18/19、G28/30、G40-G43、G54.1/G55-G59、G84-G89、M2/M30、M4、M6、M7-M9、T/H/D` 等。
+`G28/30、G40-G43、G54.1/G55-G59、G84-G89、M2/M30、M4、M6、M7-M9、T/H/D` 等。
 无法解析的残片（如 `X-`）报 `MALFORMED_LINE`；若同行还有未支持词（如 `G55 X-`），
 两类问题都会列出。
 
@@ -80,7 +102,7 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 | GET | `/api/dialect` | 支持的指令、问题代码、严重度表 |
 | GET | `/api/docs` | 本文档（Markdown） |
 | GET | `/api/examples` | 内置示例 .nc 清单 |
-| GET | `/api/examples/<name>` | 下载示例（safe_demo/problems_demo/inch_demo/arc_demo/drill_cycle_demo） |
+| GET | `/api/examples/<name>` | 下载示例（safe_demo/problems_demo/inch_demo/arc_demo/plane_arc_demo/drill_cycle_demo） |
 
 ### 机床配置
 
@@ -111,7 +133,10 @@ python3 -m gcode_checker --verbose       # 打印访问日志
   - `line_from=10&line_to=80`
   - `cycle=G81,G83`：只保留指定循环类型的孔/分组/轨迹（G81/G82/G83）
   - `hole_from=3&hole_to=8`：按全程序孔序（阻断孔也占位）筛选
-  - `trajectory=0`：省略逐行轨迹以减小响应；`trajectory=all`：循环筛选时保留完整轨迹
+  - `plane=G17,G18`：按圆弧平面筛选（G17/G18/G19）；只保留带平面信息的
+    问题（圆弧无解、循环平面限制），轨迹中其他平面的弧段条目被剔除，
+    `arcs` 汇总只统计命中平面
+  - `trajectory=0`：省略逐行轨迹以减小响应；`trajectory=all`：循环/平面筛选时保留完整轨迹
 
   指定 `cycle`/`hole_*` 后，报告中的 `drill_cycles`（groups、by_cycle、
   summary 的孔数/钻深/暂停/展开路径）与逐行轨迹的孔及动作（含孔间定位）
@@ -145,7 +170,8 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 `introduced_issues`（新增）、`unchanged_issues`（仍在），以及
 `by_code` 计数变化、风险分/级别变化、路径长度与包围盒变化，
 并在 `drill_cycles` 中汇总孔数/阻断孔/钻深/展开路径的增减
-（总计及按 G81/G82/G83 分类的 `by_cycle`）。
+（总计及按 G81/G82/G83 分类的 `by_cycle`），在 `arcs` 中汇总
+各平面（G17/G18/G19）的弧段数、弧长、螺旋段数与阻断弧数的增减。
 - `GET /api/comparisons` / `GET /api/comparisons/<id>`：读取保存的对比。
 
 ## 5. 报告结构
@@ -158,10 +184,18 @@ python3 -m gcode_checker --verbose       # 打印访问日志
                "drill_holes_total": 9, "drill_cycle_groups": 2 },
   "machine": { …回显配置… },
   "final_state": { "unit": "mm", "distance_mode": "absolute", "wcs": "G54",
-    "motion_mode": "linear", "x/y/z": {"value_mm": …, "known": true},
+    "motion_mode": "linear", "plane": "G17",
+    "x/y/z": {"value_mm": …, "known": true},
     "feed_mm_per_min": {…}, "spindle_rpm": 6000, "spindle_on": true,
     "canned_cycle": { …当前激活循环的参数与来源，无则 null… },
     "cycle_return_plane": "G98" },
+  "arcs": {
+    "by_plane": { "G17": {"count": 2, "arc_length_mm": 125.6,
+        "length_3d_mm": 130.1, "helical_count": 1, "full_circle_count": 1},
+                  "G18": {…}, "G19": {…} },
+    "total": { "count": 4, "arc_length_mm": …, "length_3d_mm": …,
+               "helical_count": 2, "full_circle_count": 1 },
+    "blocked_count": 1 },
   "drill_cycles": {
     "summary": { "cycle_groups": 2, "holes_total": 9, "holes_drilled": 8,
       "holes_blocked": 1, "total_drill_depth_mm": 63.0, "total_dwell_s": 0.5,
@@ -255,9 +289,13 @@ python3 -m gcode_checker --verbose       # 打印访问日志
     "start_mm": [10, 10, -2], "end_mm": [50, 20, -2],
     "length_mm": 32.1,
     "points_mm": [ …离散轨迹（直线取端点，圆弧自动加密）… ],
-    "arc": { "plane": "G17(XY)", "programming": "I/J",
-             "center_mm": [20, 10], "radius_mm": 40,
-             "sweep_deg": -90, "helical": false, "z_change_mm": 0 }
+    "arc": { "plane": "G17(XY)", "plane_code": "G17", "direction": "CW",
+             "programming": "I/J",
+             "center_mm": [20, 10], "center_axes": ["X", "Y"],
+             "center_3d_mm": [20, 10, -2],
+             "radius_mm": 40, "sweep_deg": -90, "full_circle": false,
+             "helical": false, "perp_axis": "Z", "perp_change_mm": 0,
+             "arc_length_mm": 62.8 }
   }
 }
 ```
@@ -268,8 +306,8 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 |---|---|---|
 | `MALFORMED_LINE` | critical | 残片/非法数字（如 `X-`），整段阻断 |
 | `UNSUPPORTED_INSTRUCTION` | error | 不在方言表内的指令/地址词，整段阻断 |
-| `ARC_NO_SOLUTION` | critical | 半径 0、终点不落在圆上、弦长 > 2R 等；整段阻断并回滚本行模态 |
-| `OUT_OF_BOUNDS` | critical | 轨迹上任意点叠加 G54 偏置后越出行程 |
+| `ARC_NO_SOLUTION` | critical | 圆心词与 R 混用、圆心词不属于当前平面、R 编程整圆、起终半径不一致、半径 0、弦长 > 2R 等；整段阻断并回滚本行模态 |
+| `OUT_OF_BOUNDS` | critical | 轨迹上任意点（圆弧取真实弧线极值点）叠加 G54 偏置后越出行程 |
 | `RAPID_BELOW_SAFE_Z` | error | G0 轨迹上任意点 Z < safe_z（工件坐标） |
 | `SPINDLE_NOT_RUNNING` | error | G1/G2/G3 切削时 `spindle_on=false` |
 | `FEED_OVER_LIMIT` | error | F（换算 mm/min）> max_feed_mm_min |
@@ -283,6 +321,7 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 | `CYCLE_BAD_PARAM` | error | G83 的 Q<=0、P 为负、L 非正整数，对应孔阻断 |
 | `CYCLE_PLANE_CONFLICT` | error | 孔底高于 R 平面，对应孔阻断 |
 | `CYCLE_NO_INHERITABLE_STATE` | error | 后续孔位的 XY/初始平面状态未知，对应孔阻断 |
+| `CYCLE_PLANE_NOT_G17` | error | G18/G19 平面下展开固定循环，对应孔阻断（G17 恢复后可继续） |
 
 风险分：critical 25 / error 10 / warning 3 / info 1（封顶 100），
 级别 `none/low(≤10)/medium(≤30)/high(≤60)/critical`。
@@ -290,16 +329,18 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 ## 7. 判定口径（关键约定）
 
 1. **同组模态取同行最后一个**：如 `G20 G21 G90 G91` 离开状态为 mm + 增量，
-   规范化输出 `G21 G91`。
+   规范化输出 `G21 G91`；平面 `G17/G18/G19` 同理（未写过默认 `G17`）。
 2. **阻断即无痕**：含残缺或未支持指令的程序段不执行、不改变任何模态；
-   圆弧无解时连同本行已改模态一起回滚。
+   圆弧无解时连同本行已改模态（含平面）一起回滚。
 3. **位置未知**：单位或定位模式不明时，不按默认值蒙算，相关轴 `known=false`，
    该段不进入包围盒/长度/行程统计，并给出对应 warning。
-4. **路径长度**：仅累计物理已知段；圆弧按弧长（含 Z 联动的螺旋长度），
-   直线按 3D 弦长。`reliable=false` 时报告会标注存在未知段。
-5. **安全 Z 按工件坐标**判定；**行程按机床坐标**（叠加 G54 偏置）判定。
+4. **路径长度**：仅累计物理已知段；圆弧按弧长（含垂直轴联动的三维螺旋
+   长度），直线按 3D 弦长。`reliable=false` 时报告会标注存在未知段。
+5. **安全 Z 按工件坐标**判定；**行程按机床坐标**（叠加 G54 偏置）判定；
+   圆弧的包围盒与行程检查按真实弧线极值点（端点 + 扫过的象限角）计算。
 6. **固定循环**：循环参数非法/缺项只阻断对应孔并写明依据，不产生位移、
-   不改写程序；G83 内部排屑快速动作豁免安全 Z 告警，孔间定位仍检查；
+   不改写程序；固定循环仅允许在 `G17` 平面展开（`G18/G19` 下对应孔阻断）；
+   G83 内部排屑快速动作豁免安全 Z 告警，孔间定位仍检查；
    工艺问题（主轴未转/无进给）按触发行去重。
 7. 服务监听本地回环，数据库为单个 SQLite 文件，全程无任何网络外联。
 
@@ -322,13 +363,17 @@ req=urllib.request.Request('http://localhost:8080/api/jobs',
 print(urllib.request.urlopen(req).read().decode())
 PY
 
-# 3) 查进度 / 筛选严重问题 / 按循环类型与孔序筛选 / 下载
+# 3) 查进度 / 筛选严重问题 / 按循环类型与孔序筛选 / 按圆弧平面筛选 / 下载
 curl -s 'localhost:8080/api/jobs/<id>'
 curl -s 'localhost:8080/api/jobs/<id>/report?severity=critical,error'
 curl -s 'localhost:8080/api/jobs/<id>/report?cycle=G83&hole_from=11&hole_to=13'
+curl -s 'localhost:8080/api/jobs/<id>/report?plane=G18,G19'
 curl -s -OJ 'localhost:8080/api/jobs/<id>/report/download'
 
 # 4) 钻孔循环示例（G81/G82/G83/G98/G99/L，含阻断演示）
 curl -s localhost:8080/api/examples/drill_cycle_demo -o drill.nc
+
+# 5) 多平面圆弧与螺旋插补示例（G17/G18/G19、I/J、I/K、J/K、R、联动轴）
+curl -s localhost:8080/api/examples/plane_arc_demo -o planes.nc
 ```
 """

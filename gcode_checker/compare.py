@@ -19,7 +19,7 @@ def _fingerprint(issue: dict) -> tuple:
     d = issue.get("details", {})
     key = ["axis", "unsupported_tokens", "malformed_tokens", "reason",
            "below_mm", "overshoot_mm", "exceed_mm_per_min", "exceed_rpm",
-           "cycle", "hole_no", "missing", "bad", "unknown"]
+           "cycle", "hole_no", "missing", "bad", "unknown", "plane"]
     detail_fp = tuple((k, str(d.get(k))) for k in key if k in d)
     return (issue["code"], issue.get("normalized", ""), detail_fp)
 
@@ -148,10 +148,55 @@ def compare_reports(baseline: dict, candidate: dict,
         }
     drill_compare["by_cycle"] = by_cycle
 
+    # 按平面（G17/G18/G19）的弧段数与弧长变化
+    def arcs_of(r):
+        return r.get("arcs", {})
+
+    arc_a, arc_b = arcs_of(baseline), arcs_of(candidate)
+    pa = arc_a.get("by_plane", {})
+    pb = arc_b.get("by_plane", {})
+    arc_by_plane = {}
+    for plane in sorted(set(pa) | set(pb)):
+        a, b = pa.get(plane, {}), pb.get(plane, {})
+        arc_by_plane[plane] = {
+            "baseline_count": a.get("count", 0),
+            "candidate_count": b.get("count", 0),
+            "delta_count": b.get("count", 0) - a.get("count", 0),
+            "baseline_arc_length_mm": a.get("arc_length_mm", 0.0),
+            "candidate_arc_length_mm": b.get("arc_length_mm", 0.0),
+            "delta_arc_length_mm": round(
+                b.get("arc_length_mm", 0.0) - a.get("arc_length_mm", 0.0), 6),
+            "baseline_helical_count": a.get("helical_count", 0),
+            "candidate_helical_count": b.get("helical_count", 0),
+            "delta_helical_count": (b.get("helical_count", 0)
+                                    - a.get("helical_count", 0)),
+        }
+    ta, tb = arc_a.get("total", {}), arc_b.get("total", {})
+    arc_compare = {
+        "by_plane": arc_by_plane,
+        "total": {
+            "baseline_count": ta.get("count", 0),
+            "candidate_count": tb.get("count", 0),
+            "delta_count": tb.get("count", 0) - ta.get("count", 0),
+            "baseline_arc_length_mm": ta.get("arc_length_mm", 0.0),
+            "candidate_arc_length_mm": tb.get("arc_length_mm", 0.0),
+            "delta_arc_length_mm": round(
+                tb.get("arc_length_mm", 0.0) - ta.get("arc_length_mm", 0.0),
+                6),
+        },
+        "blocked": {
+            "baseline": arc_a.get("blocked_count", 0),
+            "candidate": arc_b.get("blocked_count", 0),
+            "delta": (arc_b.get("blocked_count", 0)
+                      - arc_a.get("blocked_count", 0)),
+        },
+    }
+
     return {
         "labels": {"baseline": baseline_label, "candidate": candidate_label},
         "machine": candidate["machine"],
         "drill_cycles": drill_compare,
+        "arcs": arc_compare,
         "risk": {
             "baseline": baseline["risk"],
             "candidate": candidate["risk"],

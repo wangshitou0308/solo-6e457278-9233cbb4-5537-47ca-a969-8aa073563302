@@ -64,6 +64,25 @@ G80
 M5
 """
 
+GCODE_PLANES = """G21 G90 G54
+M3 S6000
+G0 Z20
+G0 X40 Y40
+G1 Z-2 F300
+G2 X40 Y40 I20 J0
+G3 X80 Y40 I20 J0 Z-6
+G18
+G2 X82 Z-4 I0 K2
+G3 X122 Z-4 R20 Y80
+G19
+G3 Y82 Z-6 J2 K0
+G3 Y122 Z-6 R20 X160
+G17
+G2 X200 Y122 I10 J0 R15
+G0 Z20
+M5
+"""
+
 
 class ApiTest(unittest.TestCase):
     @classmethod
@@ -131,7 +150,7 @@ class ApiTest(unittest.TestCase):
         names = [e["name"] for e in ex["examples"]]
         self.assertEqual(set(names),
                          {"safe_demo", "problems_demo", "inch_demo",
-                          "arc_demo", "drill_cycle_demo"})
+                          "arc_demo", "plane_arc_demo", "drill_cycle_demo"})
         resp, nc = self.req("GET", "/api/examples/safe_demo", raw=True)
         self.assertIn("attachment", resp.headers["Content-Disposition"])
         self.assertIn(b"G21", nc)
@@ -329,6 +348,72 @@ class ApiTest(unittest.TestCase):
         dc = cmp["drill_cycles"]
         self.assertEqual(dc["delta"]["holes_total"], 1)
         self.assertEqual(dc["by_cycle"]["G81"]["delta_holes"], 1)
+
+    def test_09_plane_filter_and_arcs(self):
+        # 同步分析多平面程序：各平面弧段统计与阻断计数
+        _, r = self.req("POST", "/api/analyze",
+                        {"config": CONFIG, "gcode": GCODE_PLANES})
+        arcs = r["arcs"]
+        self.assertEqual(arcs["by_plane"]["G17"]["count"], 2)
+        self.assertEqual(arcs["by_plane"]["G18"]["count"], 2)
+        self.assertEqual(arcs["by_plane"]["G19"]["count"], 2)
+        self.assertEqual(arcs["total"]["helical_count"], 3)
+        self.assertEqual(arcs["total"]["full_circle_count"], 1)
+        self.assertEqual(arcs["blocked_count"], 1)   # I/J 与 R 混用
+        self.assertEqual(r["final_state"]["plane"], "G17")
+        codes = [i["code"] for i in r["issues"]]
+        self.assertEqual(codes, ["ARC_NO_SOLUTION"])
+
+        # 建作业走 filter_report
+        _, job = self.req("POST", "/api/jobs", {
+            "machine_id": self.machine_id,
+            "program_name": "planes.nc", "gcode": GCODE_PLANES}, expect=202)
+        self.wait_job(job["id"])
+
+        # 按平面筛选 G18：arcs 汇总只剩 G18，轨迹中其他平面弧段被剔除
+        _, f = self.req(
+            "GET", f"/api/jobs/{job['id']}/report?plane=G18")
+        self.assertEqual(list(f["arcs"]["by_plane"]), ["G18"])
+        self.assertEqual(f["arcs"]["total"]["count"], 2)
+        self.assertTrue(f["arcs"]["filtered"])
+        self.assertEqual(f["filter"]["plane"], ["G18"])
+        arc_entries = [e for e in f["trajectory"]
+                       if (e.get("segment") or {}).get("arc")]
+        self.assertEqual(
+            {e["segment"]["arc"]["plane_code"] for e in arc_entries},
+            {"G18"})
+        # 阻断弧的问题带平面信息，随筛选保留（G17 的混用问题被滤掉）
+        self.assertEqual(f["issues"], [])
+
+        # 多平面 + trajectory=all 不裁剪
+        _, f2 = self.req(
+            "GET", f"/api/jobs/{job['id']}/report?plane=G18,G19"
+                   "&trajectory=all")
+        self.assertEqual(set(f2["arcs"]["by_plane"]), {"G18", "G19"})
+        self.assertEqual(len(f2["trajectory"]), len(r["trajectory"]))
+
+        # 非法平面
+        self.req("GET", f"/api/jobs/{job['id']}/report?plane=G20",
+                 expect=400)
+
+        # 对比：候选程序删掉 G18/G19 段，弧段数按平面减少
+        _, cmp = self.req("POST", "/api/compare", {
+            "machine_id": self.machine_id,
+            "label_a": "planes", "gcode_a": GCODE_PLANES,
+            "label_b": "g17only",
+            "gcode_b": GCODE_PLANES.split("G18")[0] + "G0 Z20\nM5\n"})
+        ac = cmp["arcs"]
+        self.assertEqual(ac["by_plane"]["G18"]["delta_count"], -2)
+        self.assertEqual(ac["by_plane"]["G19"]["delta_count"], -2)
+        self.assertEqual(ac["by_plane"]["G17"]["delta_count"], 0)
+        self.assertLess(ac["total"]["delta_arc_length_mm"], 0)
+        self.assertEqual(ac["blocked"]["delta"], -1)
+
+        # 多平面示例可下载
+        resp, nc = self.req("GET", "/api/examples/plane_arc_demo", raw=True)
+        self.assertIn("attachment", resp.headers["Content-Disposition"])
+        self.assertIn(b"G18", nc)
+        self.assertIn(b"G19", nc)
 
 
 if __name__ == "__main__":

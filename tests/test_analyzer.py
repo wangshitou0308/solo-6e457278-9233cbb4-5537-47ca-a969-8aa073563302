@@ -246,6 +246,243 @@ class TestArcs(unittest.TestCase):
                                places=4)
 
 
+class TestPlaneArcs(unittest.TestCase):
+    """G17/G18/G19 多平面圆弧与螺旋插补。"""
+
+    HEADER = "G21 G90 G54\nM3 S1000\n"
+
+    def _arc_entries(self, report):
+        return [t for t in report["trajectory"]
+                if "arc" in (t.get("segment") or {})]
+
+    def test_plane_modal_and_normalized(self):
+        r = analyze_program(
+            self.HEADER + "G0 X30 Y10 Z20\nG18\nG2 X10 Z20 I-10 K0 F500\n",
+            cfg())
+        st = r["final_state"]
+        self.assertEqual(st["plane"], "G18")
+        # 平面行本身为纯设定段
+        plane_line = [t for t in r["trajectory"] if t["line_no"] == 4][0]
+        self.assertEqual(plane_line["type"], "setting")
+        self.assertEqual(plane_line["normalized"], "G18")
+        # 未写平面时默认 G17
+        r2 = analyze_program(self.HEADER + "G0 X0 Y0 Z5\n", cfg())
+        self.assertEqual(r2["final_state"]["plane"], "G17")
+
+    def test_g18_arc_geometry_and_exact_bbox(self):
+        # G18(XZ)：u=Z, v=X；圆心词 I(X)/K(Z)
+        r = analyze_program(
+            self.HEADER + "G0 X30 Y10 Z20\n"
+            "G18 G2 X10 Z20 I-10 K0 F500\n", cfg())
+        self.assertEqual(codes(r), [])
+        arc = self._arc_entries(r)[0]["segment"]["arc"]
+        self.assertEqual(arc["plane"], "G18(XZ)")
+        self.assertEqual(arc["plane_code"], "G18")
+        self.assertEqual(arc["direction"], "CW")
+        self.assertEqual(arc["programming"], "I/K")
+        self.assertEqual(arc["center_axes"], ["Z", "X"])
+        self.assertEqual(arc["center_mm"], [20.0, 20.0])   # (Z, X)
+        self.assertEqual(arc["center_3d_mm"], [20.0, 10.0, 20.0])
+        self.assertEqual(arc["radius_mm"], 10.0)
+        self.assertAlmostEqual(arc["sweep_deg"], -180.0)
+        self.assertEqual(arc["perp_axis"], "Y")
+        self.assertFalse(arc["helical"])
+        seg = self._arc_entries(r)[0]["segment"]
+        self.assertAlmostEqual(seg["length_mm"], 10 * math.pi, places=4)
+        # 真实弧线包围盒：弧顶 Z=30（弦线两端都是 Z=20）
+        self.assertEqual(r["bbox_program_mm"]["z_mm"], [20.0, 30.0])
+        self.assertEqual(r["bbox_program_mm"]["x_mm"], [10.0, 30.0])
+        self.assertEqual(r["bbox_program_mm"]["y_mm"], [10.0, 10.0])
+
+    def test_g18_helical_y(self):
+        r = analyze_program(
+            self.HEADER + "G0 X30 Y10 Z20\n"
+            "G18 G2 X10 Z20 I-10 K0 Y30 F500\n", cfg())
+        self.assertEqual(codes(r), [])
+        seg = self._arc_entries(r)[0]["segment"]
+        arc = seg["arc"]
+        self.assertTrue(arc["helical"])
+        self.assertEqual(arc["perp_axis"], "Y")
+        self.assertEqual(arc["perp_change_mm"], 20.0)
+        self.assertAlmostEqual(
+            seg["length_mm"],
+            math.sqrt((10 * math.pi) ** 2 + 20 ** 2), places=4)
+
+    def test_g19_arc_geometry(self):
+        # G19(YZ)：u=Y, v=Z；圆心词 J(Y)/K(Z)
+        r = analyze_program(
+            self.HEADER + "G0 X10 Y30 Z20\n"
+            "G19 G3 Y10 Z20 J-10 K0 F500\n", cfg())
+        self.assertEqual(codes(r), [])
+        arc = self._arc_entries(r)[0]["segment"]["arc"]
+        self.assertEqual(arc["plane_code"], "G19")
+        self.assertEqual(arc["direction"], "CCW")
+        self.assertEqual(arc["programming"], "J/K")
+        self.assertEqual(arc["center_axes"], ["Y", "Z"])
+        self.assertEqual(arc["center_mm"], [20.0, 20.0])   # (Y, Z)
+        self.assertEqual(arc["center_3d_mm"], [10.0, 20.0, 20.0])
+        self.assertAlmostEqual(arc["sweep_deg"], 180.0)
+        self.assertEqual(arc["perp_axis"], "X")
+        self.assertEqual(r["bbox_program_mm"]["z_mm"], [20.0, 30.0])
+
+    def test_g18_full_circle_with_helical(self):
+        r = analyze_program(
+            self.HEADER + "G0 X30 Y10 Z20\n"
+            "G18 G2 X30 Z20 I-10 K0 Y15 F500\n", cfg())
+        self.assertEqual(codes(r), [])
+        seg = self._arc_entries(r)[0]["segment"]
+        arc = seg["arc"]
+        self.assertTrue(arc["full_circle"])
+        self.assertAlmostEqual(abs(arc["sweep_deg"]), 360.0)
+        self.assertTrue(arc["helical"])
+        self.assertEqual(arc["perp_change_mm"], 5.0)
+        self.assertAlmostEqual(
+            seg["length_mm"],
+            math.sqrt((20 * math.pi) ** 2 + 25), places=4)
+        # 整圆包围盒覆盖整个圆
+        self.assertEqual(r["bbox_program_mm"]["x_mm"], [10.0, 30.0])
+        self.assertEqual(r["bbox_program_mm"]["z_mm"], [10.0, 30.0])
+
+    def test_r_minor_major_in_g18(self):
+        r = analyze_program(
+            self.HEADER + "G0 X10 Y5 Z10\nG18\n"
+            "G3 X20 Z20 R10 F500\n"   # 劣弧
+            "G3 X10 Z10 R-10\n",      # 优弧（回到起点）
+            cfg())
+        arcs = [e["segment"]["arc"] for e in self._arc_entries(r)]
+        self.assertEqual(len(arcs), 2)
+        self.assertAlmostEqual(abs(arcs[0]["sweep_deg"]), 90.0)
+        self.assertAlmostEqual(abs(arcs[1]["sweep_deg"]), 270.0)
+        self.assertAlmostEqual(
+            abs(arcs[0]["sweep_deg"]) + abs(arcs[1]["sweep_deg"]), 360.0)
+        self.assertEqual(arcs[0]["programming"], "R")
+
+    def test_mixed_center_params_blocks_and_rolls_back(self):
+        r = analyze_program(
+            self.HEADER + "G0 X0 Y0 Z20\n"
+            "G18 G2 X10 Z20 I5 K0 R8 F500\n"
+            "G2 X10 Y0 I5 J0 F500\n", cfg())
+        iss = [i for i in r["issues"] if i["code"] == "ARC_NO_SOLUTION"]
+        self.assertEqual(len(iss), 1)
+        self.assertEqual(iss[0]["details"]["reason"], "mixed_center_params")
+        self.assertEqual(iss[0]["details"]["plane"], "G18")
+        self.assertEqual(iss[0]["line_no"], 4)
+        # 回滚：阻断行的 state_out 与进入前一致（平面 G17、位置不动、模态 G0）
+        blocked = [t for t in r["trajectory"]
+                   if t.get("block_reason") == "arc_no_solution"]
+        self.assertEqual(len(blocked), 1)
+        out = blocked[0]["state_out"]
+        self.assertEqual(out["plane"], "G17")
+        self.assertEqual(out["motion_mode"], "rapid")
+        self.assertEqual((out["x"]["value_mm"], out["z"]["value_mm"]), (0, 20))
+        # 阻断行后的 G2 在 G17 下正常解算
+        arcs = self._arc_entries(r)
+        self.assertEqual(len(arcs), 1)
+        self.assertEqual(arcs[0]["segment"]["arc"]["plane_code"], "G17")
+
+    def test_center_word_not_in_plane(self):
+        cases = [
+            ("G2 X10 Y0 K5 F500\n", "G17", ["K"]),
+            ("G18\nG2 X10 Z0 J5 F500\n", "G18", ["J"]),
+            ("G19\nG2 Y10 Z0 I5 F500\n", "G19", ["I"]),
+        ]
+        for body, plane, bad in cases:
+            r = analyze_program(
+                self.HEADER + "G0 X0 Y0 Z20\n" + body, cfg())
+            iss = [i for i in r["issues"] if i["code"] == "ARC_NO_SOLUTION"]
+            self.assertEqual(len(iss), 1, body)
+            d = iss[0]["details"]
+            self.assertEqual(d["reason"], "center_word_not_in_plane")
+            self.assertEqual(d["invalid_words"], bad)
+            self.assertEqual(d["plane"], plane)
+
+    def test_r_full_circle_and_radius_mismatch_blocked(self):
+        r = analyze_program(
+            self.HEADER + "G0 X10 Y10 Z20\nG2 X10 Y10 R5 F500\n", cfg())
+        iss = [i for i in r["issues"] if i["code"] == "ARC_NO_SOLUTION"]
+        self.assertEqual(len(iss), 1)
+        self.assertIn("整圆", iss[0]["details"]["reason"])
+        # 起终半径不一致
+        r2 = analyze_program(
+            self.HEADER + "G0 X0 Y0 Z20\nG19\nG2 Y30 Z20 J10 K0 F500\n",
+            cfg())
+        iss2 = [i for i in r2["issues"] if i["code"] == "ARC_NO_SOLUTION"]
+        self.assertEqual(len(iss2), 1)
+        self.assertIn("不一致", iss2[0]["details"]["reason"])
+        self.assertEqual(iss2[0]["details"]["plane"], "G19")
+
+    def test_true_arc_travel_check(self):
+        # 弦两端都在行程内，但真实弧线鼓出 Y 上限
+        c = MachineConfig.from_dict({
+            "travel_x": [0, 100], "travel_y": [0, 15], "travel_z": [-10, 60],
+            "safe_z": 2, "max_feed_mm_min": 3000, "max_spindle_rpm": 12000})
+        r = analyze_program(
+            self.HEADER + "G0 X40 Y10 Z10\nG2 X60 Y10 I10 J0 F500\n", c)
+        oob = [i for i in r["issues"] if i["code"] == "OUT_OF_BOUNDS"]
+        self.assertTrue(oob)
+        self.assertEqual(oob[0]["details"]["axis"], "Y")
+        self.assertAlmostEqual(oob[0]["details"]["value_mm"], 20.0)
+
+    def test_arcs_summary_and_blocked_count(self):
+        r = analyze_program(
+            self.HEADER + "G0 X0 Y0 Z20\n"
+            "G2 X0 Y0 I10 J0 F500\n"          # G17 整圆
+            "G3 X20 Y0 I10 J0 Z15\n"          # G17 螺旋
+            "G18\nG2 X0 Z15 I-10 K0\n"        # G18
+            "G17\nG2 X50 Y0 I5 J0 R8\n",      # 阻断
+            cfg())
+        a = r["arcs"]
+        self.assertEqual(a["by_plane"]["G17"]["count"], 2)
+        self.assertEqual(a["by_plane"]["G17"]["helical_count"], 1)
+        self.assertEqual(a["by_plane"]["G17"]["full_circle_count"], 1)
+        self.assertEqual(a["by_plane"]["G18"]["count"], 1)
+        self.assertEqual(a["by_plane"]["G19"]["count"], 0)
+        self.assertEqual(a["total"]["count"], 3)
+        self.assertEqual(a["blocked_count"], 1)
+        self.assertAlmostEqual(
+            a["by_plane"]["G17"]["arc_length_mm"],
+            20 * math.pi + 10 * math.pi, places=4)
+
+    def test_cycle_only_expands_in_g17(self):
+        r = analyze_program(
+            self.HEADER + "G0 X0 Y0 Z20\n"
+            "G18\n"
+            "G81 R2 Z-5 F200\n"   # G18 下定义：孔阻断，循环仍登记
+            "G17\n"
+            "X10\nX20\n"          # G17 恢复后正常钻孔
+            "G80\n", cfg())
+        c = codes(r)
+        self.assertEqual(c.count("CYCLE_PLANE_NOT_G17"), 1)
+        s = r["drill_cycles"]["summary"]
+        self.assertEqual((s["holes_total"], s["holes_drilled"],
+                          s["holes_blocked"]), (3, 2, 1))
+        hole = r["drill_cycles"]["groups"][0]["holes"][0]
+        self.assertEqual(hole["status"], "blocked")
+        self.assertEqual(hole["block_codes"], ["CYCLE_PLANE_NOT_G17"])
+        self.assertIn("G17", hole["basis"])
+        # 触发行也阻断
+        r2 = analyze_program(
+            self.HEADER + "G0 X0 Y0 Z20\nG81 R2 Z-5 F200\n"
+            "G19\nX10\nG80\n", cfg())
+        self.assertIn("CYCLE_PLANE_NOT_G17", codes(r2))
+        self.assertEqual(r2["drill_cycles"]["summary"]["holes_drilled"], 1)
+
+    def test_compare_arcs_by_plane(self):
+        a = (self.HEADER + "G0 X0 Y0 Z20\nG2 X10 Y0 I5 J0 F500\n")
+        b = (self.HEADER + "G0 X0 Y0 Z20\nG2 X10 Y0 I5 J0 F500\n"
+             "G18\nG2 X0 Z20 I-5 K0\n")
+        cmp = compare_reports(analyze_program(a, cfg()),
+                              analyze_program(b, cfg()), "a", "b")
+        arcs = cmp["arcs"]
+        self.assertEqual(arcs["by_plane"]["G17"]["delta_count"], 0)
+        self.assertEqual(arcs["by_plane"]["G18"]["baseline_count"], 0)
+        self.assertEqual(arcs["by_plane"]["G18"]["candidate_count"], 1)
+        self.assertEqual(arcs["by_plane"]["G18"]["delta_count"], 1)
+        self.assertGreater(arcs["by_plane"]["G18"]["delta_arc_length_mm"], 0)
+        self.assertEqual(arcs["total"]["delta_count"], 1)
+        self.assertEqual(arcs["blocked"]["delta"], 0)
+
+
 class TestIssueShape(unittest.TestCase):
     def test_issue_carries_states_and_basis(self):
         r = analyze_program("G21 G90 G54\nG1 X10 F9999\n", cfg())

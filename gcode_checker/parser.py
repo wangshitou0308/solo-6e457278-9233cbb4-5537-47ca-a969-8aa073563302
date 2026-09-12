@@ -18,6 +18,9 @@ SUPPORTED_G = {
     "1": "linear",       # 直线插补（切削）
     "2": "arc_cw",       # 顺时针圆弧
     "3": "arc_ccw",      # 逆时针圆弧
+    "17": "plane_xy",    # 圆弧平面 XY（联动轴 Z）
+    "18": "plane_xz",    # 圆弧平面 XZ（联动轴 Y）
+    "19": "plane_yz",    # 圆弧平面 YZ（联动轴 X）
     "20": "inch",        # 英制
     "21": "mm",          # 公制
     "90": "absolute",    # 绝对定位

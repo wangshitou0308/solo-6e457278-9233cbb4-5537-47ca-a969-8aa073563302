@@ -59,7 +59,7 @@ class ApiError(Exception):
 # ---------------------------------------------------------------------------
 
 def filter_report(report: dict, query: dict) -> dict:
-    """按 severity / code / 行范围 / 循环类型 / 孔序筛选问题；
+    """按 severity / code / 行范围 / 循环类型 / 孔序 / 圆弧平面筛选问题；
     其余统计同步重算。"""
     severities = _csv_param(query, "severity")
     codes = _csv_param(query, "code")
@@ -68,6 +68,7 @@ def filter_report(report: dict, query: dict) -> dict:
     cycles = _csv_param(query, "cycle")
     hole_from = _int_param(query, "hole_from")
     hole_to = _int_param(query, "hole_to")
+    planes = _csv_param(query, "plane")
 
     for s in severities:
         if s not in SEVERITY_ORDER:
@@ -85,6 +86,12 @@ def filter_report(report: dict, query: dict) -> dict:
         raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_QUERY",
                        f"未知循环类型 {bad_cycles}",
                        {"allowed": ["G81", "G82", "G83"]})
+    planes_upper = [p.upper() for p in planes]
+    bad_planes = [p for p in planes_upper if p not in ("G17", "G18", "G19")]
+    if bad_planes:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_QUERY",
+                       f"未知圆弧平面 {bad_planes}",
+                       {"allowed": ["G17", "G18", "G19"]})
     for name, v in (("hole_from", hole_from), ("hole_to", hole_to)):
         if v is not None and v < 1:
             raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_QUERY",
@@ -102,6 +109,9 @@ def filter_report(report: dict, query: dict) -> dict:
     if cycles_upper:
         issues = [i for i in issues
                   if i.get("details", {}).get("cycle") in cycles_upper]
+    if planes_upper:
+        issues = [i for i in issues
+                  if i.get("details", {}).get("plane") in planes_upper]
     def _in_hole_range(i):
         no = i.get("details", {}).get("hole_no")
         if no is None:
@@ -121,26 +131,34 @@ def filter_report(report: dict, query: dict) -> dict:
     out["risk"]["total_issues"] = len(issues)
     cycle_filter = bool(cycles_upper or hole_from is not None
                         or hole_to is not None)
+    plane_filter = bool(planes_upper)
     out["filter"] = {
         "severity": severities, "code": codes,
         "line_from": line_from, "line_to": line_to,
         "cycle": cycles_upper,
         "hole_from": hole_from, "hole_to": hole_to,
+        "plane": planes_upper,
         "matched": len(issues),
         "total_in_report": len(report["issues"]),
     }
     if cycle_filter and "drill_cycles" in out:
         out["drill_cycles"] = _filter_drill_cycles(
             report["drill_cycles"], cycles_upper, hole_from, hole_to)
-    # 逐行轨迹：默认随循环筛选裁剪；?trajectory=0 省略，?trajectory=all 不裁剪
+    if plane_filter and "arcs" in out:
+        out["arcs"] = _filter_arcs(report["arcs"], planes_upper, issues)
+    # 逐行轨迹：默认随循环/平面筛选裁剪；?trajectory=0 省略，?trajectory=all 不裁剪
     traj_flag = query.get("trajectory", ["1"])[0]
     if traj_flag in ("0", "false", "no"):
         out.pop("trajectory", None)
     elif traj_flag in ("all", "full"):
         pass
-    elif cycle_filter and "trajectory" in out:
-        out["trajectory"] = _filter_trajectory_cycles(
-            out["trajectory"], cycles_upper, hole_from, hole_to)
+    else:
+        if cycle_filter and "trajectory" in out:
+            out["trajectory"] = _filter_trajectory_cycles(
+                out["trajectory"], cycles_upper, hole_from, hole_to)
+        if plane_filter and "trajectory" in out:
+            out["trajectory"] = _filter_trajectory_planes(
+                out["trajectory"], planes_upper)
     return out
 
 
@@ -230,6 +248,44 @@ def _filter_drill_cycles(dc: dict, cycles, hole_from, hole_to) -> dict:
                              "total": round(rapid + cutting, 6)},
         "filtered": True,
     }
+    return out
+
+
+def _filter_arcs(arcs: dict, planes, issues) -> dict:
+    """按平面筛选弧段汇总：by_plane 只保留命中平面，total 随之重算；
+    blocked_count 按筛选后的问题列表重算。"""
+    by_plane = {p: arcs.get("by_plane", {}).get(
+        p, {"count": 0, "arc_length_mm": 0.0, "length_3d_mm": 0.0,
+            "helical_count": 0, "full_circle_count": 0})
+        for p in planes}
+    total = {
+        "count": sum(v["count"] for v in by_plane.values()),
+        "arc_length_mm": round(sum(v["arc_length_mm"]
+                                   for v in by_plane.values()), 6),
+        "length_3d_mm": round(sum(v["length_3d_mm"]
+                                  for v in by_plane.values()), 6),
+        "helical_count": sum(v["helical_count"] for v in by_plane.values()),
+        "full_circle_count": sum(v["full_circle_count"]
+                                 for v in by_plane.values()),
+    }
+    return {
+        "by_plane": by_plane,
+        "total": total,
+        "blocked_count": sum(1 for i in issues
+                             if i["code"] == "ARC_NO_SOLUTION"),
+        "filtered": True,
+    }
+
+
+def _filter_trajectory_planes(trajectory, planes):
+    """逐行轨迹按圆弧平面裁剪：命中平面外的弧段条目剔除，其余行原样保留。"""
+    out = []
+    for e in trajectory:
+        seg = e.get("segment")
+        arc = (seg or {}).get("arc")
+        if arc is not None and arc.get("plane_code") not in planes:
+            continue
+        out.append(e)
     return out
 
 
