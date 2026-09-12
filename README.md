@@ -46,9 +46,35 @@ python3 -m gcode_checker --port 9000 --db /var/lib/gc.db --verbose
 汇总，可按 `wcs=G54,G55` 筛选。
 
 **未支持的指令显式列出且整段阻断**（不猜测执行、不改模态），例如
-`G28/G40-G43/G54.1/G84-G89、M2/M4/M6/M8/M30、T/H/D` 等；
+`G28/G40-G43/G54.1/G84-G89、M4/M6/M8/T/H/D` 等；
 无法解析的残片（如 `X-`）报 `MALFORMED_LINE`，同行若含未支持指令（如
 `G54.1 X-`）两类问题都会列出。
+（`M98/M99/M2/M30/O` 仅在程序包静态展开中支持，见下。）
+
+## 程序包静态展开（主程序 + O 号子程序集）
+
+`POST /api/packages` 把**主程序**、**带 O 号的子程序集**和机床配置作为一个
+持久化作业：解析 O 号、`M98 P<n> L<k>` 的子程序号与重复次数、`M99` 返回及
+`M2/M30` 结束，先做静态展开，再交给同一套轨迹与安全检查。
+
+- **调用时继承模态**，M99 返回后从调用点下一程序段继续，`L<k>` 重复调用
+  之间不重置状态（连续模态流）；`M2/M30` 结束整个程序。
+- 每个展开块保留**来源程序、原行号/原行、调用栈（含每级调用行与重复序号）、
+  深度与重复序号**；轨迹条目与问题都带这些字段。
+- 展开块分页预览：`GET /api/packages/<id>/blocks?limit=&offset=&source=`。
+- 调用图节点标注 `defined/reachable`，边汇总静态调用点数、执行次数与
+  调用次数（含 L 重复）。
+- **展开阶段整体阻断、不生成部分安全结论**：重复 O 号、M98 目标不存在、
+  主程序中的 M99、子程序末尾缺少 M99、递归调用、调用深度超限（默认 50）、
+  展开量超过 100,000 块（硬上限）；动态 P（`P#100`/`P[..]`）与变量表达式
+  （`#`/`[]`）、M99 P 行号跳转为**未支持**。
+- 报告提供**调用图、调用错误、按来源程序筛选的轨迹**（
+  `?source=O100,main`）以及程序包 JSON 下载。
+- 示例：`GET /api/examples/subprogram_demo`（可直接作请求体模板）、
+  `subprogram_errors_demo`（全部阻断错误）。
+- `POST /api/package-compare` 对比两个程序包，在标准风险对比之外汇总
+  **调用与展开块变化**（子程序数、展开块、调用点/执行/调用次数、最大深度
+  delta，调用图边的新增/删除/调用次数变化）。
 
 ## 检查内容（每个问题附原行、规范化指令、进入/离开状态、判定依据）
 
@@ -96,6 +122,14 @@ GET    /api/jobs/<id>/gcode             下载原始 .nc
 POST   /api/compare            同一机床配置比较两个程序
                                （内联 gcode_a/gcode_b，或 job_a_id/job_b_id）
 GET    /api/comparisons        /api/comparisons/<id>
+
+POST   /api/packages           创建程序包静态展开作业（主程序 + O 号子程序集）
+GET    /api/packages           /api/packages/<id>
+GET    /api/packages/<id>/report       ?source=O100,main 按来源程序筛选轨迹
+GET    /api/packages/<id>/report/download
+GET    /api/packages/<id>/blocks       展开块分页预览（limit/offset/source）
+GET    /api/packages/<id>/package      下载原始程序包 JSON
+POST   /api/package-compare    比较两个程序包（调用图/展开块变化）
 ```
 
 循环报告可按 `cycle=G81,G82,G83` 与 `hole_from/hole_to`（全程序孔序）筛选，
@@ -125,21 +159,24 @@ gcode_checker/
   parser.py     词法解析（保守，不补全）
   cycles.py     固定钻孔循环 G81/G82/G83 逐孔展开
   analyzer.py   模态还原、多平面圆弧/螺旋几何、循环分析、安全检查、报告结构
-  compare.py    双程序风险对比（含循环孔数/钻深/路径与各平面弧段/问题增减）
-  database.py   SQLite 持久化 + 后台作业线程
-  server.py     http.server REST API（含循环类型/孔序/圆弧平面筛选）
-  examples.py   内置 .nc 示例
+  packages.py   程序包静态展开（O/M98/M99/M2/M30、调用图、调用栈、阻断错误）
+  compare.py    双程序/双程序包对比（问题匹配、循环/平面/WCS、调用与展开块）
+  database.py   SQLite 持久化 + 后台作业线程（作业/程序包/展开块分页/对比）
+  server.py     http.server REST API（含循环/孔序/平面/坐标系/来源程序筛选）
+  examples.py   内置 .nc 与程序包 .json 示例
   docs.py       /api/docs 的 Markdown 文本
   __main__.py   命令行入口
 tests/
-  test_analyzer.py   解析/几何/检查/循环/对比单元测试
-  test_api.py        HTTP 端到端测试
+  test_analyzer.py    解析/几何/检查/循环/对比单元测试
+  test_packages.py    程序包展开/阻断/模态继承/程序包对比单元测试
+  test_api.py         HTTP 端到端测试（作业与程序包）
 ```
 
 ## 测试
 
 ```bash
 python3 -m tests.test_analyzer
+python3 -m tests.test_packages
 python3 -m tests.test_api
 ```
 

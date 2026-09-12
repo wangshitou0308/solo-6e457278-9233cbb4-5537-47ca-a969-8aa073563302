@@ -83,6 +83,48 @@ G0 Z20
 M5
 """
 
+PACKAGE_GOOD = {
+    "name": "pkg_good",
+    "main": (
+        "G21 G90 G54\n"
+        "M3 S4000\n"
+        "G0 X0 Y0 Z20\n"
+        "M98 P100 L2\n"
+        "G0 X0 Y60 Z20\n"
+        "M98 P200\n"
+        "G0 Z50\n"
+        "M30\n"),
+    "subprograms": [
+        {"name": "o100.nc",
+         "content": ("O100 (drill row)\n"
+                     "G91 G99 G81 X20 Z-10 R-18 L3 F250\n"
+                     "G90 G80\n"
+                     "M99\n")},
+        {"name": "o200.nc",
+         "content": ("O200 (second station, nested call)\n"
+                     "G0 X100 Y60\n"
+                     "M98 P100\n"
+                     "G0 X0 Y60\n"
+                     "M99\n")},
+    ],
+}
+
+PACKAGE_BAD = {
+    "name": "pkg_bad",
+    "main": (
+        "G21 G90 G54\n"
+        "M99\n"                  # M99 in main
+        "M98 P100\n"
+        "M98 P999\n"             # missing target
+        "M98 P#200\n"            # dynamic P
+        "M30\n"),
+    "subprograms": [
+        {"name": "o100.nc", "content": "O100\nM98 P100\nM99\n"},
+        {"name": "o300a.nc", "content": "O300\nM99\n"},
+        {"name": "o300b.nc", "content": "O300\nM99\n"},
+    ],
+}
+
 
 class ApiTest(unittest.TestCase):
     @classmethod
@@ -153,7 +195,11 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(set(names),
                          {"safe_demo", "problems_demo", "inch_demo",
                           "arc_demo", "plane_arc_demo", "drill_cycle_demo",
-                          "wcs_demo"})
+                          "wcs_demo", "subprogram_demo",
+                          "subprogram_errors_demo"})
+        kinds = {e["name"]: e["kind"] for e in ex["examples"]}
+        self.assertEqual(kinds["subprogram_demo"], "package")
+        self.assertEqual(kinds["safe_demo"], "program")
         resp, nc = self.req("GET", "/api/examples/safe_demo", raw=True)
         self.assertIn("attachment", resp.headers["Content-Disposition"])
         self.assertIn(b"G21", nc)
@@ -590,6 +636,300 @@ class ApiTest(unittest.TestCase):
         resp, nc_text = self.req("GET", "/api/examples/wcs_demo", raw=True)
         self.assertIn("attachment", resp.headers["Content-Disposition"])
         self.assertIn(b"G55", nc_text)
+
+
+class PackageApiTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        db = os.path.join(cls.tmp.name, "test_pkg.db")
+        cls.server = make_server("127.0.0.1", 0, db)
+        cls.port = cls.server.server_address[1]
+        cls.base = f"http://127.0.0.1:{cls.port}"
+        cls.thread = threading.Thread(target=cls.server.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+        _, m = cls.req_static("POST", "/api/machines", CONFIG)
+        cls.machine_id = m["id"]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.tmp.cleanup()
+
+    @staticmethod
+    def _do(method, path, body=None, expect=None, raw=False):
+        data = None
+        hdrs = {}
+        if body is not None:
+            data = json.dumps(body).encode()
+            hdrs["Content-Type"] = "application/json"
+        r = urllib.request.Request(f"http://127.0.0.1:{PackageApiTest.port}"
+                                   + path, data=data, headers=hdrs,
+                                   method=method)
+        try:
+            resp = urllib.request.urlopen(r, timeout=10)
+        except urllib.error.HTTPError as e:
+            payload = e.read().decode()
+            if expect is not None and e.code == expect:
+                return e, (payload if raw else json.loads(payload))
+            raise AssertionError(f"{method} {path} -> {e.code}: {payload}")
+        payload = resp.read()
+        if expect is not None:
+            assert resp.status == expect
+        return resp, (payload if raw else json.loads(payload.decode()))
+
+    @classmethod
+    def req_static(cls, method, path, body=None, expect=None, raw=False):
+        return cls._do(method, path, body, expect, raw)
+
+    def req(self, method, path, body=None, expect=None, raw=False):
+        return self._do(method, path, body, expect, raw)
+
+    def wait_package(self, pid, timeout=10):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            _, pkg = self.req("GET", f"/api/packages/{pid}")
+            if pkg["status"] in ("completed", "failed", "blocked"):
+                return pkg
+            time.sleep(0.02)
+        self.fail("程序包超时未完成")
+
+    def create_package(self, package, machine="id", expect=202):
+        body = {"name": package["name"], "main": package["main"],
+                "subprograms": package["subprograms"]}
+        if machine == "id":
+            body["machine_id"] = self.machine_id
+        elif machine == "inline":
+            body["config"] = CONFIG
+        _, created = self.req("POST", "/api/packages", body, expect=expect)
+        return created
+
+    # -- 测试 --------------------------------------------------------------
+
+    def test_01_dialect_and_examples(self):
+        _, d = self.req("GET", "/api/dialect")
+        self.assertIn("package_dialect", d)
+        self.assertIn("M98", d["package_dialect"]["flow_m"])
+        self.assertIn("PACKAGE_RECURSIVE_CALL", d["expansion_error_titles"])
+        _, ex = self.req("GET", "/api/examples")
+        pkg_ex = [e for e in ex["examples"] if e["kind"] == "package"]
+        self.assertEqual({e["name"] for e in pkg_ex},
+                         {"subprogram_demo", "subprogram_errors_demo"})
+        resp, blob = self.req("GET", "/api/examples/subprogram_demo",
+                              raw=True)
+        self.assertIn("application/json", resp.headers["Content-Type"])
+        parsed = json.loads(blob)
+        self.assertIn("main", parsed)
+        self.assertEqual(len(parsed["subprograms"]), 2)
+
+    def test_02_bad_spec_400(self):
+        _, err = self.req("POST", "/api/packages",
+                          {"name": "x", "machine_id": self.machine_id},
+                          expect=400)
+        self.assertEqual(err["error"]["code"], "BAD_PACKAGE")
+        self.assertTrue(err["error"]["details"]["errors"])
+
+    def test_03_good_package_lifecycle(self):
+        created = self.create_package(PACKAGE_GOOD)
+        self.assertIn(created["status"], ("queued", "running"))
+        pid = created["id"]
+        detail = self.wait_package(pid)
+        self.assertEqual(detail["status"], "completed")
+        self.assertEqual(detail["progress"], 100)
+        exp = detail["expansion"]
+        self.assertEqual(exp["subprograms_defined"], 2)
+        self.assertEqual(exp["call_invocations"], 4)
+        self.assertEqual(exp["max_depth"], 2)
+        # 调用图：main->O100(L2)、main->O200、O200->O100
+        edges = {(e["caller"], e["callee"]): e
+                 for e in detail["call_graph"]["edges"]}
+        self.assertEqual(edges[("main", "O100")]["invocations"], 2)
+        self.assertEqual(edges[("O200", "O100")]["invocations"], 1)
+        self.assertEqual(edges[("main", "O200")]["invocations"], 1)
+
+        # 完整报告
+        _, report = self.req("GET", f"/api/packages/{pid}/report")
+        self.assertFalse(report.get("blocked"))
+        self.assertEqual(report["package"]["name"], "pkg_good")
+        self.assertEqual(report["program"]["expanded_blocks"],
+                         exp["expanded_blocks"])
+        self.assertTrue(report["issues"])
+        # 每个轨迹条目与问题都带来源程序/调用栈
+        for e in report["trajectory"]:
+            self.assertIn("source_program", e)
+            self.assertIn("call_stack", e)
+        # 子程序孔位问题归属到来源程序
+        hole_issues = [i for i in report["issues"]
+                       if i["source_program"].startswith("O")]
+        self.assertTrue(hole_issues)
+
+        # 下载
+        resp, blob = self.req(
+            "GET", f"/api/packages/{pid}/report/download", raw=True)
+        self.assertIn("attachment", resp.headers["Content-Disposition"])
+        dl = json.loads(blob)
+        self.assertEqual(dl["package_id"], pid)
+
+        # 列表
+        _, lst = self.req("GET", "/api/packages")
+        self.assertTrue(any(p["id"] == pid for p in lst["packages"]))
+
+        # 不存在
+        self.req("GET", "/api/packages/nope", expect=404)
+        self.req("GET", "/api/packages/nope/report", expect=404)
+
+        self.__class__.good_pid = pid
+
+    def test_04_blocks_pagination(self):
+        pid = self.good_pid
+        _, page = self.req(
+            "GET", f"/api/packages/{pid}/blocks?limit=10&offset=0")
+        self.assertEqual(len(page["blocks"]), 10)
+        self.assertTrue(page["has_more"])
+        self.assertEqual(page["blocks"][0]["seq"], 0)
+        self.assertIn("call_stack", page["blocks"][0])
+        _, page2 = self.req(
+            "GET", f"/api/packages/{pid}/blocks?limit=10&offset=10")
+        self.assertEqual(page2["blocks"][0]["seq"], 10)
+        # 末页
+        total = page["total"]
+        _, last = self.req(
+            "GET", f"/api/packages/{pid}/blocks?limit=100&offset=0")
+        self.assertEqual(len(last["blocks"]), total)
+        self.assertFalse(last["has_more"])
+        # 按来源筛选
+        _, o100 = self.req(
+            "GET", f"/api/packages/{pid}/blocks?source=O100&limit=1000")
+        self.assertTrue({b["program"] for b in o100["blocks"]} <= {"O100"})
+        self.assertTrue(o100["total"] > 0)
+        # 深度为 2 的块来自 O100（经 O200 调用）
+        deep = [b for b in o100["blocks"] if b["depth"] == 2]
+        self.assertTrue(deep)
+        self.assertEqual(deep[0]["call_stack"][0]["program"], "O200")
+        # 非法分页/来源
+        self.req("GET", f"/api/packages/{pid}/blocks?limit=0", expect=400)
+        self.req("GET", f"/api/packages/{pid}/blocks?limit=99999",
+                 expect=400)
+        self.req("GET", f"/api/packages/{pid}/blocks?offset=-1",
+                 expect=400)
+        self.req("GET", f"/api/packages/{pid}/blocks?source=NOPE",
+                 expect=400)
+
+    def test_05_report_source_filter(self):
+        pid = self.good_pid
+        _, full = self.req("GET", f"/api/packages/{pid}/report")
+        total_blocks = len(full["trajectory"])
+        _, flt = self.req(
+            "GET", f"/api/packages/{pid}/report?source=O100")
+        self.assertTrue({e["source_program"] for e in flt["trajectory"]}
+                        <= {"O100"})
+        self.assertLess(len(flt["trajectory"]), total_blocks)
+        self.assertEqual(flt["filter"]["matched_blocks"],
+                         len(flt["trajectory"]))
+        self.assertEqual(flt["filter"]["total_blocks_in_report"],
+                         total_blocks)
+        # 风险计数随筛选重算
+        self.assertEqual(flt["risk"]["total_issues"], len(flt["issues"]))
+        # 多来源
+        _, two = self.req(
+            "GET", f"/api/packages/{pid}/report?source=main,O200")
+        self.assertTrue({e["source_program"] for e in two["trajectory"]}
+                        <= {"main", "O200"})
+        # 省略轨迹
+        _, notraj = self.req(
+            "GET", f"/api/packages/{pid}/report?trajectory=0")
+        self.assertNotIn("trajectory", notraj)
+        # 顶层 package/call_graph 仍然保留
+        self.assertIn("call_graph", notraj["package"])
+
+    def test_06_blocked_package(self):
+        created = self.create_package(PACKAGE_BAD)
+        pid = created["id"]
+        detail = self.wait_package(pid)
+        self.assertEqual(detail["status"], "blocked")
+        codes = sorted({e["code"] for e in detail["expansion_errors"]})
+        self.assertIn("PACKAGE_M99_IN_MAIN", codes)
+        self.assertIn("PACKAGE_DUPLICATE_O", codes)
+        self.assertIn("PACKAGE_RECURSIVE_CALL", codes)
+        self.assertIn("PACKAGE_SUBPROGRAM_NOT_FOUND", codes)
+        self.assertIn("PACKAGE_DYNAMIC_P", codes)
+        # 阻断报告无安全结论
+        _, report = self.req("GET", f"/api/packages/{pid}/report")
+        self.assertTrue(report["blocked"])
+        self.assertNotIn("risk", report)
+        self.assertNotIn("trajectory", report)
+        self.assertNotIn("issues", report)
+        self.assertTrue(report["expansion_errors"])
+        # 阻断后没有展开块
+        self.req("GET", f"/api/packages/{pid}/blocks", expect=409)
+        # 程序包原文仍可下载
+        resp, blob = self.req(
+            "GET", f"/api/packages/{pid}/package", raw=True)
+        self.assertIn("attachment", resp.headers["Content-Disposition"])
+        self.assertIn(b"M98 P999", blob)
+
+    def test_07_inline_config_package(self):
+        created = self.create_package(PACKAGE_GOOD, machine="inline")
+        detail = self.wait_package(created["id"])
+        self.assertEqual(detail["status"], "completed")
+
+    def test_08_package_compare(self):
+        a = self.create_package(PACKAGE_GOOD)
+        self.wait_package(a["id"])
+        pkg_b = dict(PACKAGE_GOOD, name="pkg_good_v2",
+                     main=PACKAGE_GOOD["main"].replace("M98 P100 L2",
+                                                       "M98 P100"))
+        b = self.create_package(pkg_b)
+        self.wait_package(b["id"])
+
+        # 按 ID 对比
+        _, cmp = self.req("POST", "/api/package-compare", {
+            "package_a_id": a["id"], "package_b_id": b["id"]})
+        self.assertEqual(cmp["compare_type"], "package")
+        self.assertEqual(cmp["expansion"]["delta"]["call_invocations"], -1)
+        self.assertTrue(cmp["call_graph_diff"]["edges_changed"])
+        self.assertIn("risk", cmp)
+        self.assertIn("resolved_issues", cmp)
+
+        # 内联对比
+        _, cmp2 = self.req("POST", "/api/package-compare", {
+            "machine_id": self.machine_id,
+            "package_a": PACKAGE_GOOD, "label_a": "v1",
+            "package_b": pkg_b, "label_b": "v2", "save": True})
+        self.assertEqual(cmp2["expansion"]["delta"]["expanded_blocks"] < 0,
+                         True)
+        cid = cmp2["comparison_id"]
+        _, saved = self.req("GET", f"/api/comparisons/{cid}")
+        self.assertEqual(saved["compare_type"], "package")
+
+        # 阻断程序包不能对比
+        blocked = self.create_package(PACKAGE_BAD)
+        self.wait_package(blocked["id"])
+        _, err = self.req("POST", "/api/package-compare", {
+            "package_a_id": blocked["id"], "package_b_id": a["id"]},
+            expect=409)
+        self.assertEqual(err["error"]["code"], "PACKAGE_NOT_COMPARABLE")
+        # 不存在
+        self.req("POST", "/api/package-compare",
+                 {"package_a_id": "nope", "package_b_id": a["id"]},
+                 expect=404)
+
+    def test_09_depth_limit_and_block_limit(self):
+        nested = [
+            {"name": f"o{i}.nc",
+             "content": f"O{i}\nM98 P{i + 1}\nM99\n"}
+            for i in range(100, 103)]
+        nested.append({"name": "o103.nc", "content": "O103\nM99\n"})
+        body = {"name": "deep", "machine_id": self.machine_id,
+                "main": "M98 P100\nM30\n", "subprograms": nested,
+                "max_depth": 2}
+        _, created = self.req("POST", "/api/packages", body)
+        detail = self.wait_package(created["id"])
+        self.assertEqual(detail["status"], "blocked")
+        self.assertTrue(any(e["code"] == "PACKAGE_DEPTH_LIMIT"
+                            for e in detail["expansion_errors"]))
 
 
 if __name__ == "__main__":

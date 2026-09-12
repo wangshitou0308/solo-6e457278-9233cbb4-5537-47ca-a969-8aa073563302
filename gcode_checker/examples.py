@@ -1,9 +1,12 @@
 """随服务附带的示例 .nc 程序（断网可下载）。
 
 每个示例同时演示一类典型问题，方便首次启动后直接体验接口。
+程序包示例（子程序展开）为 .json，见 PACKAGE_EXAMPLES。
 """
 
 from __future__ import annotations
+
+import json
 
 EXAMPLES: dict[str, dict] = {
     "safe_demo": {
@@ -221,18 +224,114 @@ M5
     },
 }
 
+# 程序包示例（POST /api/packages 请求体格式）。JSON 字符串可直接作为
+# 请求体（仅需补 machine_id 或 config）。
+PACKAGE_EXAMPLES: dict[str, dict] = {
+    "subprogram_demo": {
+        "filename": "subprogram_demo.json",
+        "title": "程序包子程序展开示例（O/M98/M99/L）",
+        "description": "主程序两次调用 O100（G81 排孔子程序，L2 重复展开且不重置"
+                       "模态），并经 O200 嵌套调用；含调用图、调用栈与按来源程序"
+                       "筛选。建议配置：行程 X[0,300] Y[0,200] Z[-50,60]、"
+                       "safe_z=10、F 上限 3000、S 上限 12000。",
+        "package": {
+            "name": "subprogram_demo",
+            "main": """\
+; subprogram_demo 主程序
+G21 G90 G54
+M3 S4000
+G0 X0 Y0 Z20
+M98 P100 L2        ; 连续两次调用 O100（模态不重置）
+G0 X0 Y60 Z20
+M98 P200           ; 经 O200 嵌套调用 O100
+G0 Z50
+M30
+""",
+            "main_file": "main.nc",
+            "subprograms": [
+                {
+                    "name": "o100.nc",
+                    "content": """\
+O100 (排孔子程序：G91 增量 G81，L3 沿 X 展开 3 个孔)
+G91 G99 G81 X20 Z-10 R-18 L3 F250
+G90 G80
+M99
+""",
+                },
+                {
+                    "name": "o200.nc",
+                    "content": """\
+O200 (定位到第二工位后调用 O100)
+G0 X100 Y60
+M98 P100
+G0 X0 Y60
+M99
+""",
+                },
+            ],
+        },
+    },
+    "subprogram_errors_demo": {
+        "filename": "subprogram_errors_demo.json",
+        "title": "程序包展开错误演示（全部在展开阶段阻断）",
+        "description": "重复 O300、主程序 M99、O100 递归、M98 P999 目标不存在、"
+                       "M98 P#.. 动态子程序号：展开阶段阻断，不生成安全结论。",
+        "package": {
+            "name": "subprogram_errors_demo",
+            "main": """\
+G21 G90 G54
+M99                ; 主程序中出现 M99（阻断）
+M98 P100           ; O100 递归（阻断）
+M98 P999           ; 目标不存在（阻断）
+M98 P#200          ; 动态 P（不支持，阻断）
+M30
+""",
+            "main_file": "main.nc",
+            "subprograms": [
+                {"name": "o100.nc",
+                 "content": "O100\nM98 P100\nM99\n"},
+                {"name": "o300a.nc",
+                 "content": "O300\nM99\n"},
+                {"name": "o300b.nc",
+                 "content": "O300\nM99\n"},
+            ],
+        },
+    },
+}
+
+# 合并示例清单（程序包示例的 content 为 JSON 文本）
+_EXAMPLE_PACKAGE_BLOB: dict[str, tuple[str, str]] = {}
+for _name, _meta in PACKAGE_EXAMPLES.items():
+    _EXAMPLE_PACKAGE_BLOB[_name] = (
+        json.dumps(_meta["package"], ensure_ascii=False, indent=2) + "\n",
+        _meta["filename"])
+PACKAGE_EXAMPLE_NAMES = set(PACKAGE_EXAMPLES)
+
 
 def list_examples() -> list[dict]:
-    return [{
+    out = [{
         "name": name,
         "filename": meta["filename"],
         "title": meta["title"],
         "description": meta["description"],
+        "kind": "program",
         "download_url": f"/api/examples/{name}",
     } for name, meta in EXAMPLES.items()]
+    for name, meta in PACKAGE_EXAMPLES.items():
+        out.append({
+            "name": name,
+            "filename": meta["filename"],
+            "title": meta["title"],
+            "description": meta["description"],
+            "kind": "package",
+            "download_url": f"/api/examples/{name}",
+        })
+    return out
 
 
 def get_example(name: str) -> tuple[str, str]:
     """返回 (文件内容, 文件名)。"""
+    if name in _EXAMPLE_PACKAGE_BLOB:
+        return _EXAMPLE_PACKAGE_BLOB[name]
     meta = EXAMPLES[name]
     return meta["content"], meta["filename"]

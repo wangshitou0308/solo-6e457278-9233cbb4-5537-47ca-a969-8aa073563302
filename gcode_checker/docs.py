@@ -92,9 +92,81 @@ python3 -m gcode_checker --verbose       # 打印访问日志
   主轴未转/无进给等工艺问题按**触发行**去重（一个 G83 孔只报一次）。
 
 **未支持示例**（遇到即 `UNSUPPORTED_INSTRUCTION`，整段不执行、不改模态）：
-`G28/30、G40-G43、G54.1、G84-G89、M2/M30、M4、M6、M7-M9、T/H/D` 等。
+`G28/30、G40-G43、G54.1、G84-G89、M4、M6、M7-M9、T/H/D` 等。
 无法解析的残片（如 `X-`）报 `MALFORMED_LINE`；若同行还有未支持词（如 `G54.1 X-`），
 两类问题都会列出。
+
+> 注：`M98/M99/M2/M30` 与子程序号 `O` 只在**程序包静态展开**
+> （`POST /api/packages`）中支持，单独提交给 `/api/analyze` 或 `/api/jobs`
+> 时仍按未支持指令处理。变量/宏表达式（`#`、`[]`）在任何模式下都不支持。
+
+## 2b. 程序包静态展开（主程序 + O 号子程序集）
+
+程序包把**主程序**、**带 O 号的子程序集**和**机床配置**作为一个持久化作业，
+先做静态展开，再交给上面的逐行轨迹与安全检查。
+
+### 展开语义
+
+- 子程序以 `O<n>` 行开头（必须是第一条指令）、以 `M99` 结尾；
+  `M98 P<n> L<k>` 调用子程序 `O<n>` 共 `k` 次（`L` 默认 1，必须为正整数）。
+- **调用时继承模态**：子程序看到的单位/定位/坐标系/平面/运动/进给/主轴/
+  固定循环等全部模态均来自调用点。
+- **返回后从调用点继续**：`M99` 回到 `M98` 的下一程序段。
+- **重复调用不重置状态**：`L<k>` 的 k 次展开共享同一段连续模态流
+  （例如子程序内用 `G91 G81 X.. L3`，连续两次调用沿同一排孔继续）。
+- `M2/M30` 结束整个程序（子程序中出现也终止全部执行）。
+- 每个展开块保留 `source_program`（`main` 或 `O100`）、来源文件、原行号、
+  原行文本、`depth` 与完整 `call_stack`（每级含调用行、`repeat_index`/
+  `repeat_total`）；轨迹条目和问题都带这些字段。
+- 调用图节点含 `defined`（子程序是否提供）与 `reachable`（从主程序是否可达）；
+  边汇总静态调用点数 `sites`、遍历执行次数 `executions` 与展开调用次数
+  `invocations`（含 L 重复）。
+
+### 展开阶段阻断（不生成部分安全结论）
+
+下列情况整体阻断：作业 `status=blocked`，报告只含 `call_graph` 与
+`expansion_errors`，**没有** risk/trajectory/issues，也不生成展开块：
+
+| 代码 | 触发条件 |
+|---|---|
+| `PACKAGE_DUPLICATE_O` | 两个子程序使用同一 O 号 |
+| `PACKAGE_SUBPROGRAM_NOT_FOUND` | `M98 P<n>` 的目标不在程序包中 |
+| `PACKAGE_M99_IN_MAIN` | 主程序中出现 M99 |
+| `PACKAGE_SUBPROGRAM_MISSING_M99` | 子程序最后一条非空指令不是 M99 |
+| `PACKAGE_RECURSIVE_CALL` | 调用图存在递归环（含间接递归） |
+| `PACKAGE_DEPTH_LIMIT` | 调用嵌套深度超过 `max_depth`（默认 50，请求可设 1..1000） |
+| `PACKAGE_BLOCK_LIMIT` | 展开块数超过 100,000（硬上限） |
+| `PACKAGE_DYNAMIC_P` | 动态子程序号：`M98 P#100`、`M98 P[..]` |
+| `PACKAGE_VARIABLE_EXPRESSION` | 任意行含变量 `#` 或方括号表达式 |
+| `PACKAGE_INVALID_P` | M98 无 P / P 非正整数 / 同段多个程序流指令 |
+| `PACKAGE_INVALID_L` | M98 的 L 非正整数或给出多个 |
+| `PACKAGE_O_NUMBER_MISMATCH` | 子程序缺 O 号、多个 O 号、O 号与声明不一致、O 行非首行 |
+| `PACKAGE_MAIN_HAS_O` | 主程序中出现 O 号 |
+| `PACKAGE_UNSUPPORTED_RETURN` | `M99 P<n>` 行号返回跳转 |
+
+每个错误都带 `source_program/source_file/line_no/source_line` 与（遍历时
+错误的）`call_stack`、`repeat_index`；错误清单通过 `GET /api/dialect`
+的 `expansion_error_titles` 获取中文标题。
+
+### 请求体（POST /api/packages）
+
+```json
+{
+  "machine_id": "…",
+  "name": "part_package",
+  "main": "G21 G90 G54\nM3 S4000\nM98 P100 L2\nM30\n",
+  "main_file": "main.nc",
+  "subprograms": [
+    {"name": "o100.nc", "content": "O100\nG91 G99 G81 X20 Z-10 R-18 L3 F250\nG90 G80\nM99\n"}
+  ],
+  "max_depth": 50
+}
+```
+
+也可以用内联 `"config": {…}` 代替 `machine_id`；子程序的 O 号默认从内容
+首行解析，也可显式给 `"o_number": 100`（与内容不一致时阻断）。
+可直接下载 `GET /api/examples/subprogram_demo` 的 JSON 作为请求体模板
+（补上 `machine_id`/`config`）；`subprogram_errors_demo` 演示全部阻断错误。
 
 ## 3. 机床配置字段
 
@@ -131,7 +203,7 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 | GET | `/api/dialect` | 支持的指令、问题代码、严重度表 |
 | GET | `/api/docs` | 本文档（Markdown） |
 | GET | `/api/examples` | 内置示例 .nc 清单 |
-| GET | `/api/examples/<name>` | 下载示例（safe_demo/problems_demo/inch_demo/arc_demo/plane_arc_demo/wcs_demo/drill_cycle_demo） |
+| GET | `/api/examples/<name>` | 下载示例（safe_demo/problems_demo/inch_demo/arc_demo/plane_arc_demo/wcs_demo/drill_cycle_demo；程序包示例 subprogram_demo/subprogram_errors_demo 为 JSON） |
 
 ### 机床配置
 
@@ -175,6 +247,38 @@ python3 -m gcode_checker --verbose       # 打印访问日志
   都只反映命中孔；程序顶层统计保持完整。
 - `GET /api/jobs/<id>/report/download`：以 `attachment` 下载 JSON 报告（筛选参数同上）。
 - `GET /api/jobs/<id>/gcode`：下载作业原始 .nc 文本。
+
+### 程序包静态展开作业（主程序 + O 号子程序集）
+
+- `POST /api/packages`：body 见 2b。返回 `202` 与程序包作业 `id`，后台展开+分析。
+  程序包结构非法（缺主程序、子程序无 content、`max_depth` 越界等）返回
+  `400 BAD_PACKAGE`，错误明细在 `error.details.errors`。
+- `GET /api/packages`：程序包列表（含状态、`expansion` 概要与调用图）。
+- `GET /api/packages/<id>`：状态与进度；`completed` 含 `risk`，`blocked`
+  含 `expansion_errors`（调用错误清单）。
+- `GET /api/packages/<id>/report`：完成后取完整报告（普通分析报告 +
+  `package`/`program` 展开节）；阻断时返回阻断报告（无安全结论）。支持：
+  - `source=main,O100`：**按来源程序筛选轨迹**（可多选逗号分隔）；
+    逐行轨迹与问题只保留命中来源程序，风险计数随之重算；非法来源返回 400。
+  - `trajectory=0`：省略逐行轨迹（顶层 package/call_graph 保留）。
+- `GET /api/packages/<id>/report/download`：以 `attachment` 下载程序包
+  完整 JSON（展开状态、调用图、调用错误、轨迹与分析结果）。
+- `GET /api/packages/<id>/blocks?limit=100&offset=0&source=O100`：
+  **展开块分页预览**。返回 `{total, limit, offset, count, has_more, blocks}`，
+  每块含 `seq/program/file/line_no/source_line/depth/repeat_index/repeat_total/
+  call_stack`（不含状态快照，预览轻量）。`limit` 1..1000；阻断中的程序包
+  返回 `409 PACKAGE_BLOCKED`。
+- `GET /api/packages/<id>/package`：下载原始程序包 JSON（主程序与子程序原文）。
+- `POST /api/package-compare`：程序对比汇总调用与展开块变化（同一机床配置）：
+  - 内联：`{"machine_id":…, "package_a":{…2b 请求体…}, "package_b":{…},
+    "label_a":"v1", "label_b":"v2", "save":true}`
+  - 引用：`{"package_a_id":"…", "package_b_id":"…"}`
+  - 返回标准安全对比（resolved/introduced/unchanged、风险/路径变化）外加：
+    `expansion`（子程序数、展开块、调用点数/执行次数/调用次数/重复次数、
+    最大深度的两侧值与 delta）与 `call_graph_diff`（`programs_added/removed`、
+    `edges_added/removed/changed`，变化边给出调用次数 delta）。
+  - 任一程序包被展开错误阻断时返回 `409 PACKAGE_BLOCKED/PACKAGE_NOT_COMPARABLE`，
+    不产生部分对比结论；配置不一致返回 409。
 
 ### 双程序风险对比（同一机床配置）
 
@@ -439,5 +543,21 @@ curl -s localhost:8080/api/examples/plane_arc_demo -o planes.nc
 # 6) 多工件坐标系示例（G54/G55 切换、G59 未配置），按坐标系筛选报告
 curl -s localhost:8080/api/examples/wcs_demo -o wcs.nc
 curl -s 'localhost:8080/api/jobs/<id>/report?wcs=G55'
+
+# 7) 程序包静态展开（O/M98/M99/L、调用图、调用栈、按来源筛选、分页预览）
+curl -s localhost:8080/api/examples/subprogram_demo -o pkg.json
+python3 - <<'PY'
+import json,urllib.request
+pkg=json.load(open('pkg.json',encoding='utf-8'))
+pkg['machine_id']='<配置id>'
+req=urllib.request.Request('http://localhost:8080/api/packages',
+  data=json.dumps(pkg).encode(),
+  headers={'Content-Type':'application/json'})
+print(urllib.request.urlopen(req).read().decode())
+PY
+curl -s localhost:8080/api/packages/<id>                    # 状态/调用图
+curl -s 'localhost:8080/api/packages/<id>/blocks?limit=20'  # 展开块分页
+curl -s 'localhost:8080/api/packages/<id>/report?source=O100'
+curl -s localhost:8080/api/examples/subprogram_errors_demo  # 全部阻断错误演示
 ```
 """

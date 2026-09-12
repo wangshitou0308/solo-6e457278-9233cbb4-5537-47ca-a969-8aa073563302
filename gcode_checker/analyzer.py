@@ -107,6 +107,12 @@ PLANE_SPEC = {
 PLANE_AXIS_NAMES = ("X", "Y", "Z")
 CENTER_WORD_ORDER = {"I": 0, "J": 1, "K": 2}
 
+# 程序包模式下的程序流指令（见 packages.py；普通单程序分析中它们仍属于
+# 未支持指令，保持旧行为）
+PACKAGE_FLOW_M = {"2", "30", "98", "99"}
+# 程序包模式下允许的额外地址词
+PACKAGE_ALLOWED_LETTERS = ALLOWED_LETTERS | {"O"}
+
 
 def plane_center_words(plane: str) -> list[str]:
     """当前平面接受的圆心词（按 I/J/K 惯例顺序，如 G18 -> ['I', 'K']）。"""
@@ -403,9 +409,17 @@ class Issue:
     state_out: dict | None
     basis: str
     details: dict = field(default_factory=dict)
+    # 程序包模式下的来源信息（单程序分析时为 None）
+    source_program: str | None = None
+    source_file: str | None = None
+    call_stack: list | None = None
+    depth: int | None = None
+    repeat_index: int = 0
+    repeat_total: int = 1
+    block_seq: int | None = None
 
     def to_dict(self) -> dict:
-        return {
+        out = {
             "code": self.code,
             "title": ISSUE_TITLE[self.code],
             "severity": self.severity,
@@ -417,6 +431,16 @@ class Issue:
             "basis": self.basis,
             "details": self.details,
         }
+        if self.source_program is not None:
+            out["source_program"] = self.source_program
+            out["source_file"] = self.source_file
+            out["source_line_no"] = self.line_no
+            out["call_stack"] = self.call_stack
+            out["depth"] = self.depth
+            out["repeat_index"] = self.repeat_index
+            out["repeat_total"] = self.repeat_total
+            out["block_seq"] = self.block_seq
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -564,10 +588,14 @@ def _dist3(a, b) -> float | None:
 
 class Analyzer:
     def __init__(self, config: MachineConfig, program_name: str | None = None,
-                 progress=None):
+                 progress=None, package_mode: bool = False):
         self.cfg = config
         self.program_name = program_name
         self.progress = progress
+        self.package_mode = package_mode
+        # 程序包模式下当前展开块（由 run_blocks 设置），用于给轨迹条目与
+        # 问题附来源程序/调用栈
+        self.current_block = None
         self.state = State()
         self.issues: list[Issue] = []
         self.entries: list[dict] = []
@@ -620,8 +648,12 @@ class Analyzer:
     def _issue(self, code: str, pl: ParsedLine, basis: str,
                details: dict | None = None, normalized: str = "",
                line_dedupe: bool = False) -> int:
+        # 程序包模式下按展开块实例去重：同一源行（如 L 次重复调用的子程序
+        # 行）在不同块中的问题都要分别报告
+        dedup_id = (self.current_block.seq if self.current_block is not None
+                    else None)
         if line_dedupe:
-            key = (pl.line_no, code)
+            key = (dedup_id, pl.line_no, code)
             existing = self._line_dedup.get(key)
             if existing is not None:
                 return existing
@@ -640,11 +672,41 @@ class Analyzer:
             basis=basis,
             details=details,
         )
+        if self.current_block is not None:
+            self._annotate_issue(iss, self.current_block)
         self.issues.append(iss)
         idx = len(self.issues) - 1
         if line_dedupe:
-            self._line_dedup[(pl.line_no, code)] = idx
+            self._line_dedup[key] = idx
         return idx
+
+    @staticmethod
+    def _block_provenance(block) -> dict:
+        return {
+            "source_program": block.program,
+            "source_file": block.file,
+            "source_line_no": block.line.line_no,
+            "source_line": block.line.source,
+            "call_stack": [dict(f) for f in block.call_stack],
+            "depth": block.depth,
+            "repeat_index": block.repeat_index,
+            "repeat_total": block.repeat_total,
+        }
+
+    def _annotate_entry(self, entry: dict, block=None):
+        if block is None:
+            return
+        entry.update(self._block_provenance(block))
+
+    def _annotate_issue(self, iss: Issue, block):
+        p = self._block_provenance(block)
+        iss.source_program = p["source_program"]
+        iss.source_file = p["source_file"]
+        iss.call_stack = p["call_stack"]
+        iss.depth = p["depth"]
+        iss.repeat_index = p["repeat_index"]
+        iss.repeat_total = p["repeat_total"]
+        iss.block_seq = block.seq
 
     # -- 坐标系 / 包围盒 / 行程 -----------------------------------------------
 
@@ -768,14 +830,19 @@ class Analyzer:
                         if w.letter != "N")
 
     @staticmethod
-    def _collect_unsupported(pl: ParsedLine, g_words=None, m_words=None) -> list[str]:
+    def _collect_unsupported(pl: ParsedLine, g_words=None, m_words=None,
+                             package_mode: bool = False) -> list[str]:
         """列出本行全部未支持指令（保持行内出现顺序，去重）。
 
         用于正常段阻断；词法残缺时也调用，以便把残缺片段中恢复出的
         合法词（如 `G55 X-` 中的 G55）一并显式列出。
+        程序包模式下 O/M98/M99/M2/M30 是程序流指令（由展开器解释），
+        不再列为未支持指令。
         """
         g_words = g_words if g_words is not None else pl.g_words
         m_words = m_words if m_words is not None else pl.m_words
+        allowed = (PACKAGE_ALLOWED_LETTERS if package_mode
+                   else ALLOWED_LETTERS)
         out: list[str] = []
         for w in pl.words:
             if w.letter == "G":
@@ -783,10 +850,12 @@ class Analyzer:
                 if g_code_key(w) not in SUPPORTED_G and tok not in out:
                     out.append(tok)
             elif w.letter == "M":
-                tok = "M" + fmt_num(w.value)
-                if g_code_key(w) not in SUPPORTED_M and tok not in out:
-                    out.append(tok)
-            elif w.letter not in ALLOWED_LETTERS:
+                key = g_code_key(w)
+                if (key not in SUPPORTED_M
+                        and not (package_mode and key in PACKAGE_FLOW_M)
+                        and ("M" + fmt_num(w.value)) not in out):
+                    out.append("M" + fmt_num(w.value))
+            elif w.letter not in allowed:
                 tok = f"{w.letter}{fmt_num(w.value)}"
                 if tok not in out:
                     out.append(tok)
@@ -837,6 +906,20 @@ class Analyzer:
             self.progress(100)
         return self._build_report(len(lines))
 
+    def run_blocks(self, blocks: list) -> dict:
+        """程序包模式：按展开块顺序执行分析（块自带来源/调用栈）。"""
+        total = max(len(blocks), 1)
+        for n, block in enumerate(blocks, start=1):
+            self.current_block = block
+            self._process_line(block.line)
+            if self.progress and (n % 2000 == 0 or n == total):
+                self.progress(min(99, int(n / total * 100)))
+        self.current_block = None
+        if self.progress:
+            self.progress(100)
+        physical = sum(1 for b in blocks if not b.line.is_blank)
+        return self._build_report(physical)
+
     def _process_line(self, pl: ParsedLine):
         self._snap_in = self._snapshot()
         # 圆弧无解回滚时需要原样恢复固定循环定义（snapshot 只含可读副本）
@@ -849,7 +932,7 @@ class Analyzer:
 
         if pl.is_blank:
             self.blank_count += 1
-            self.entries.append({
+            entry = {
                 "line_no": pl.line_no,
                 "source_line": pl.source,
                 "normalized": "",
@@ -858,8 +941,17 @@ class Analyzer:
                 "comments": pl.comments,
                 "state_in": self._snap_in,
                 "state_out": self._snap_in,
-            })
+            }
+            self._annotate_entry(entry, self.current_block)
+            self.entries.append(entry)
             return
+
+        # 程序包模式：程序流指令（O/M98/M99/M2/M30）由展开器解释
+        if self.package_mode:
+            flow = self._package_flow_code(pl)
+            if flow is not None:
+                self._process_package_flow(pl, flow)
+                return
 
         # 1) 词法残缺 -> 整段阻断；残缺片段中恢复出的词仍参与
         # “未支持指令”检查，两类问题都要列出
@@ -870,7 +962,8 @@ class Analyzer:
                 f"存在无法识别的片段 {pl.malformed}；按保守策略整段不执行、"
                 "不改变任何模态状态",
                 {"malformed_tokens": pl.malformed}, normalized)]
-            unsupported = self._collect_unsupported(pl)
+            unsupported = self._collect_unsupported(
+                pl, package_mode=self.package_mode)
             if unsupported:
                 issue_indexes.append(self._issue(
                     "UNSUPPORTED_INSTRUCTION", pl,
@@ -887,7 +980,8 @@ class Analyzer:
         m_words = pl.m_words
 
         # 2) 未支持指令 -> 整段阻断
-        unsupported = self._collect_unsupported(pl, g_words, m_words)
+        unsupported = self._collect_unsupported(
+            pl, g_words, m_words, package_mode=self.package_mode)
         if unsupported:
             normalized = self._blocked_normalized(pl)
             idx = self._issue(
@@ -1181,6 +1275,117 @@ class Analyzer:
             physical_known=segment is not None,
             issue_indexes=issue_indexes)
         self.executed_count += 1
+
+    # -- 程序包：程序流指令 -----------------------------------------------
+
+    def _package_flow_code(self, pl: ParsedLine) -> str | None:
+        """识别本行的程序流指令（同段混用在展开预检查阶段已阻断，这里
+        取第一个）；O 行总是按子程序号处理（其余内容照常执行）。"""
+        from .packages import _o_words, _flow_m_codes
+        if _o_words(pl):
+            return "O"
+        codes = _flow_m_codes(pl)
+        if codes:
+            # 展开预检查保证同段不混用；防御性取行内第一个
+            order = {"98": 0, "99": 1, "2": 2, "30": 2}
+            return min(codes, key=lambda c: order.get(c, 9))
+        return None
+
+    def _flow_entry(self, pl: ParsedLine, type_: str, normalized: str,
+                    details: dict | None = None):
+        """登记一条程序流轨迹条目（不改变模态、不产生位移）。"""
+        snap_out = self._snapshot()
+        entry = {
+            "line_no": pl.line_no,
+            "source_line": pl.source,
+            "normalized": normalized,
+            "type": type_,
+            "executed": True,
+            "physical_known": True,
+            "comments": pl.comments,
+            "state_in": self._snap_in,
+            "state_out": snap_out,
+        }
+        if details:
+            entry["flow"] = details
+        self._annotate_entry(entry, self.current_block)
+        self.entries.append(entry)
+
+    @staticmethod
+    def _virtual_line(pl: ParsedLine, drop_letters=(), drop_pred=None):
+        """复制一行并丢弃指定词，得到供常规分析的虚拟行（同一来源行）。"""
+        new = ParsedLine(
+            line_no=pl.line_no, source=pl.source, code_text=pl.code_text,
+            comments=list(pl.comments), malformed=list(pl.malformed),
+            is_blank=False)
+        for w in pl.words:
+            if w.letter in drop_letters:
+                continue
+            if drop_pred is not None and drop_pred(w):
+                continue
+            new.words.append(w)
+        return new
+
+    def _process_package_flow(self, pl: ParsedLine, flow: str):
+        if flow == "O":
+            from .packages import _o_words
+            # O 号行：O 词本身是声明（无模态效果），其余内容照常执行
+            ow = _o_words(pl)[0]
+            rest = self._virtual_line(pl, drop_letters={"O"})
+            if rest.words:
+                self._process_line(rest)
+                entry = self.entries[-1]
+            else:
+                self._flow_entry(
+                    pl, "subprogram_label",
+                    f"O{fmt_num(ow.value)}(子程序号)",
+                    {"kind": "label", "o_number": int(ow.value)})
+                return
+            entry["normalized"] = (
+                entry.get("normalized", "")
+                + (f"  O{fmt_num(ow.value)}(子程序号)")).strip()
+            return
+
+        if flow == "98":
+            # M98：剥离 M98 与本行的 P/L（子程序号/重复次数由展开器解释；
+            # 预检查已确认它们不与固定循环参数语义混用），其余内容先执行，
+            # 再登记调用条目；子程序块随后由展开器内联送入。
+            rest = self._virtual_line(
+                pl, drop_pred=lambda w: (
+                    w.letter in ("P", "L")
+                    or (w.letter == "M" and g_code_key(w) == "98")))
+            if rest.words:
+                self._process_line(rest)
+            p_word = next((w for w in pl.words if w.letter == "P"), None)
+            l_word = next((w for w in pl.words if w.letter == "L"), None)
+            reps = int(l_word.value) if l_word is not None else 1
+            norm = "M98 P" + fmt_num(p_word.value) if p_word else "M98"
+            if reps != 1:
+                norm += f" L{reps}"
+            block = self.current_block
+            self._flow_entry(
+                pl, "subprogram_call", norm,
+                {"kind": "call",
+                 "target_program": f"O{int(p_word.value)}" if p_word else None,
+                 "repeats": reps,
+                 "depth": (block.depth + 1 if block is not None else 1)})
+            return
+
+        if flow == "99":
+            rest = self._virtual_line(
+                pl, drop_pred=lambda w: (
+                    w.letter == "P"
+                    or (w.letter == "M" and g_code_key(w) == "99")))
+            if rest.words:
+                self._process_line(rest)
+            self._flow_entry(pl, "subprogram_return", "M99(返回调用点)",
+                             {"kind": "return"})
+            return
+
+        # M2 / M30：程序结束，其余内容不执行（实际控制器也是停止）
+        code = "M2" if flow == "2" else "M30"
+        self._flow_entry(pl, "program_end", f"{code}(程序结束)",
+                         {"kind": "end", "code": code})
 
     def _rollback_to(self, snapshot: dict):
         """圆弧无解时把状态恢复到进入本行前的快照。"""
@@ -2145,6 +2350,7 @@ class Analyzer:
             entry["segment"] = segment
         if issue_indexes:
             entry["issue_codes"] = [self.issues[i].code for i in issue_indexes]
+        self._annotate_entry(entry, self.current_block)
         self.entries.append(entry)
         for i in issue_indexes or []:
             iss = self.issues[i]
@@ -2384,6 +2590,11 @@ class Analyzer:
                        "包围盒/行程按真实弧线极值点计算",
                 "block": "含未支持指令或无法解析的程序段整段阻断，"
                          "不改变任何模态",
+                "subprogram": ("程序包模式（POST /api/packages）下，"
+                               "O/M98 Pn Lk/M99/M2/M30 由静态展开解释："
+                               "调用继承模态、M99 返回调用点、重复调用不重置"
+                               "状态；展开块保留来源程序、原行、调用栈与重复"
+                               "序号。单程序分析不支持这些指令。"),
                 "safe_z": "安全 Z 按工件(程序)坐标判定",
                 "feed": "F 按出现时的单位换算为 mm/min 后模态保持",
                 "canned_cycle": (
@@ -2487,9 +2698,20 @@ DIALECT = {
         ],
     },
     "supported_m": {"M3": "主轴正转", "M5": "主轴停止"},
+    "package_flow_m": {
+        "O": "子程序号行（仅程序包模式 POST /api/packages）",
+        "M98": "调用子程序：P 子程序号、L 重复次数（仅程序包模式）",
+        "M99": "子程序返回（仅程序包模式）",
+        "M2": "程序结束（仅程序包模式）",
+        "M30": "程序结束（仅程序包模式）",
+    },
+    "package_note": "O/M98/M99/M2/M30 只在程序包静态展开（POST /api/packages）"
+                    "中支持；单独提交给 /api/analyze、/api/jobs 时仍按未支持"
+                    "指令处理。变量/宏表达式（#、[]）在任何模式下均不支持。",
     "supported_words": ["X", "Y", "Z", "I", "J", "K", "R", "F", "S", "N(忽略)",
                         "Q(固定循环步进)", "P(固定循环暂停)",
-                        "L(固定循环重复次数)"],
+                        "L(固定循环重复次数)",
+                        "O(子程序号，仅程序包模式)"],
     "comments": ["(圆括号注释)", ";分号注释"],
     "unsupported_policy": "任何未列出的 G/M 指令及其他地址词均显式报告，"
                           "并整段阻断，不猜测执行",

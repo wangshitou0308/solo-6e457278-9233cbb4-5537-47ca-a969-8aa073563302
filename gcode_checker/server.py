@@ -5,7 +5,7 @@
   GET    /api/dialect                    支持的指令方言 / 严重度定义
   GET    /api/docs                       API 文档（Markdown 文本）
   GET    /api/examples                   示例程序清单
-  GET    /api/examples/<name>            下载示例 .nc 文件
+  GET    /api/examples/<name>            下载示例 .nc/.json 文件
   GET/POST /api/machines                 列出 / 新建机床配置
   GET/PUT/DELETE /api/machines/<id>      查询 / 更新 / 删除配置
   POST   /api/analyze                    同步分析（不落库，立即返回报告）
@@ -15,6 +15,14 @@
   GET    /api/jobs/<id>/report           完整 JSON 报告（可按严重度/代码筛选）
   GET    /api/jobs/<id>/report/download  下载 JSON 报告（attachment）
   GET    /api/jobs/<id>/gcode            取作业原始 .nc 文本
+  POST   /api/packages                   创建程序包静态展开作业
+  GET    /api/packages                   程序包列表
+  GET    /api/packages/<id>              查询展开状态/调用图/错误概要
+  GET    /api/packages/<id>/report       完整报告（?source=O100 按来源筛选轨迹）
+  GET    /api/packages/<id>/report/download  下载完整程序包 JSON
+  GET    /api/packages/<id>/blocks       展开块分页预览
+  GET    /api/packages/<id>/package      下载原始程序包 JSON
+  POST   /api/package-compare            对比两个程序包（内联或两个已完成包）
   POST   /api/compare                    比较两个程序（内联文本或两个已完成作业）
   GET    /api/comparisons                对比记录列表
   GET    /api/comparisons/<id>           读取已保存的对比结果
@@ -40,6 +48,11 @@ from .analyzer import (
 from .database import JobStore
 from .examples import get_example, list_examples
 from .compare import compare_reports
+from .packages import (
+    PACKAGE_DIALECT,
+    PackageSpecError,
+    parse_package_spec,
+)
 
 API_PREFIX = "/api/"
 MAX_BODY_BYTES = 4 * 1024 * 1024  # 单次请求体上限 4 MiB（.nc 文本）
@@ -385,6 +398,49 @@ def _filter_trajectory_cycles(trajectory, cycles, hole_from, hole_to):
     return out
 
 
+def filter_package_report(report: dict, query: dict) -> dict:
+    """程序包报告筛选：?source=O100 按来源程序裁剪逐行轨迹与问题；
+    ?trajectory=0 省略轨迹。顶层统计保持完整（块级统计另给 filter 说明）。"""
+    out = dict(report)
+    traj_flag = query.get("trajectory", ["1"])[0]
+    if traj_flag in ("0", "false", "no"):
+        out.pop("trajectory", None)
+        out["filter"] = {"trajectory": "omitted"}
+        return out
+
+    sources = _csv_param(query, "source")
+    if not sources:
+        return out
+    valid = {"main"} | {s["program"] for s in
+                        report.get("package", {}).get("subprograms", [])
+                        if s.get("program")}
+    bad = [s for s in sources if s not in valid]
+    if bad:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_QUERY",
+                       f"未知来源程序 {bad}", {"allowed": sorted(valid)})
+    wanted = set(sources)
+    issues = [i for i in report["issues"]
+              if i.get("source_program", "main") in wanted]
+    counts = {s: 0 for s in SEVERITY_ORDER}
+    for i in issues:
+        counts[i["severity"]] += 1
+    traj = [e for e in report["trajectory"]
+            if e.get("source_program", "main") in wanted]
+    out["issues"] = issues
+    out["trajectory"] = traj
+    out["risk"] = dict(report["risk"])
+    out["risk"]["counts_by_severity"] = counts
+    out["risk"]["total_issues"] = len(issues)
+    out["filter"] = {
+        "source": sources,
+        "matched_issues": len(issues),
+        "matched_blocks": len(traj),
+        "total_issues_in_report": len(report["issues"]),
+        "total_blocks_in_report": len(report["trajectory"]),
+    }
+    return out
+
+
 def _csv_param(query: dict, name: str) -> list[str]:
     vals = []
     for raw in query.get(name, []):
@@ -515,6 +571,10 @@ class Handler(BaseHTTPRequestHandler):
                 "POST /api/jobs", "GET /api/jobs/<id>",
                 "GET /api/jobs/<id>/report",
                 "GET /api/jobs/<id>/report/download",
+                "POST /api/packages", "GET /api/packages/<id>",
+                "GET /api/packages/<id>/report",
+                "GET /api/packages/<id>/report/download",
+                "GET /api/packages/<id>/blocks",
                 "POST /api/compare", "GET /api/comparisons",
             ],
         })
@@ -528,10 +588,17 @@ class Handler(BaseHTTPRequestHandler):
                              "offline": True})
         elif parts == ["dialect"] and method == "GET":
             from .analyzer import DIALECT, ISSUE_TITLE
+            from .packages import (
+                EXPANSION_ERROR_TITLE,
+                EXPANSION_ERROR_SEVERITY,
+            )
             self._send_json({
                 "dialect": DIALECT,
                 "issue_titles": ISSUE_TITLE,
                 "issue_severity": ISSUE_SEVERITY,
+                "package_dialect": PACKAGE_DIALECT,
+                "expansion_error_titles": EXPANSION_ERROR_TITLE,
+                "expansion_error_severity": EXPANSION_ERROR_SEVERITY,
             })
         elif parts == ["docs"] and method == "GET":
             from .docs import API_DOCS
@@ -545,8 +612,11 @@ class Handler(BaseHTTPRequestHandler):
             except KeyError:
                 raise ApiError(HTTPStatus.NOT_FOUND, "EXAMPLE_NOT_FOUND",
                                f"示例不存在: {name}")
-            self._send_text(content, "text/plain; charset=utf-8",
-                            download_name=filename)
+            if filename.endswith(".json"):
+                ctype = "application/json; charset=utf-8"
+            else:
+                ctype = "text/plain; charset=utf-8"
+            self._send_text(content, ctype, download_name=filename)
 
         elif parts == ["machines"] and method == "GET":
             self._send_json({"machines": store.list_machines()})
@@ -593,6 +663,35 @@ class Handler(BaseHTTPRequestHandler):
               and parts[2] in ("report",) and method != "GET"):
             raise ApiError(HTTPStatus.METHOD_NOT_ALLOWED, "METHOD_NOT_ALLOWED",
                            "仅支持 GET")
+
+        elif parts == ["packages"] and method == "POST":
+            self._create_package()
+        elif parts == ["packages"] and method == "GET":
+            self._send_json({"packages": store.list_packages()})
+        elif len(parts) == 2 and parts[0] == "packages" and method == "GET":
+            self._package_detail(parts[1])
+        elif (len(parts) == 3 and parts[0] == "packages"
+              and parts[2] == "report" and method == "GET"):
+            report = self._completed_package_report(parts[1])
+            self._send_json(filter_package_report(report, query))
+        elif (len(parts) == 4 and parts[0] == "packages"
+              and parts[2] == "report" and parts[3] == "download"
+              and method == "GET"):
+            report = self._completed_package_report(parts[1])
+            payload = filter_package_report(report, query)
+            self._send_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                "application/json; charset=utf-8",
+                download_name=f"package_report_{parts[1]}.json")
+        elif (len(parts) == 3 and parts[0] == "packages"
+              and parts[2] == "blocks" and method == "GET"):
+            self._package_blocks(parts[1], query)
+        elif (len(parts) == 3 and parts[0] == "packages"
+              and parts[2] == "package" and method == "GET"):
+            self._package_download(parts[1])
+
+        elif parts == ["package-compare"] and method == "POST":
+            self._package_compare()
 
         elif parts == ["compare"] and method == "POST":
             self._compare()
@@ -685,6 +784,142 @@ class Handler(BaseHTTPRequestHandler):
                            "报告缺失")
         report["job_id"] = jid
         return report
+
+    # -- 程序包：静态展开 --------------------------------------------------
+
+    def _create_package(self):
+        data = self._read_json()
+        try:
+            spec = parse_package_spec(data)
+        except PackageSpecError as e:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_PACKAGE",
+                           "程序包结构校验失败", {"errors": e.errors})
+        config = self._resolve_body_config(data)
+        job = self.server.store.create_package(
+            spec, config,
+            machine_id=(data.get("machine_id")
+                        if data.get("config") is None else None))
+        self._send_json(job, HTTPStatus.ACCEPTED,
+                        {"Location": f"/api/packages/{job['id']}"})
+
+    def _package_detail(self, pid):
+        pkg = self.server.store.get_package(pid)
+        if pkg is None:
+            raise ApiError(HTTPStatus.NOT_FOUND, "PACKAGE_NOT_FOUND",
+                           f"程序包不存在: {pid}")
+        self._send_json(pkg)
+
+    def _completed_package_report(self, pid):
+        pkg = self.server.store.get_package(pid)
+        if pkg is None:
+            raise ApiError(HTTPStatus.NOT_FOUND, "PACKAGE_NOT_FOUND",
+                           f"程序包不存在: {pid}")
+        if pkg["status"] not in ("completed", "blocked"):
+            raise ApiError(HTTPStatus.CONFLICT, "PACKAGE_NOT_READY",
+                           f"程序包状态为 {pkg['status']}，报告尚不可用",
+                           {"status": pkg["status"],
+                            "progress": pkg["progress"]})
+        report = self.server.store.get_package_report(pid)
+        if report is None:
+            raise ApiError(HTTPStatus.CONFLICT, "PACKAGE_NOT_READY",
+                           "报告缺失")
+        report["package_id"] = pid
+        return report
+
+    def _package_blocks(self, pid, query):
+        pkg = self.server.store.get_package(pid)
+        if pkg is None:
+            raise ApiError(HTTPStatus.NOT_FOUND, "PACKAGE_NOT_FOUND",
+                           f"程序包不存在: {pid}")
+        if pkg["status"] != "completed":
+            if pkg["status"] == "blocked":
+                code, msg = "PACKAGE_BLOCKED", "程序包被展开错误阻断，无展开块"
+            else:
+                code, msg = "PACKAGE_NOT_READY", (
+                    f"程序包状态为 {pkg['status']}，展开块尚不可用")
+            raise ApiError(HTTPStatus.CONFLICT, code, msg,
+                           {"status": pkg["status"]})
+        limit = _int_param(query, "limit")
+        limit = 100 if limit is None else limit
+        offset = _int_param(query, "offset")
+        offset = 0 if offset is None else offset
+        if not (1 <= limit <= 1000):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_QUERY",
+                           "limit 必须为 1..1000")
+        if offset < 0:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_QUERY",
+                           "offset 必须 >= 0")
+        source = query.get("source", [None])[0]
+        if source:
+            report = self.server.store.get_package_report(pid)
+            valid = {"main"} | {
+                s["program"]
+                for s in report.get("package", {}).get("subprograms", [])
+                if s.get("program")}
+            if source not in valid:
+                raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_QUERY",
+                               f"未知来源程序 {source!r}",
+                               {"allowed": sorted(valid)})
+        result = self.server.store.get_package_blocks(
+            pid, limit, offset, source)
+        result["package_id"] = pid
+        result["source"] = source
+        self._send_json(result)
+
+    def _package_download(self, pid):
+        spec = self.server.store.get_package_spec_json(pid)
+        if spec is None:
+            raise ApiError(HTTPStatus.NOT_FOUND, "PACKAGE_NOT_FOUND",
+                           f"程序包不存在: {pid}")
+        self._send_text(
+            json.dumps(spec, ensure_ascii=False, indent=2),
+            "application/json; charset=utf-8",
+            download_name=f"package_{pid}.json")
+
+    def _package_compare(self):
+        data = self._read_json()
+        store = self.server.store
+        if "package_a_id" in data or "package_b_id" in data:
+            pa, pb = data.get("package_a_id"), data.get("package_b_id")
+            if not pa or not pb:
+                raise ApiError(
+                    HTTPStatus.BAD_REQUEST, "BAD_REQUEST",
+                    "按程序包对比需要同时提供 package_a_id 与 package_b_id")
+            try:
+                result = store.compare_packages(pa, pb)
+            except KeyError as e:
+                raise ApiError(HTTPStatus.NOT_FOUND, "PACKAGE_NOT_FOUND",
+                               str(e))
+            except ValueError as e:
+                raise ApiError(HTTPStatus.CONFLICT, "PACKAGE_NOT_COMPARABLE",
+                               str(e))
+        else:
+            if not isinstance(data.get("package_a"), dict) or \
+                    not isinstance(data.get("package_b"), dict):
+                raise ApiError(
+                    HTTPStatus.BAD_REQUEST, "MISSING_PACKAGE",
+                    "需要 package_a 与 package_b 两个程序包对象，"
+                    "或 package_a_id/package_b_id")
+            config = self._resolve_body_config(data)
+            try:
+                spec_a = parse_package_spec(data["package_a"])
+                spec_b = parse_package_spec(data["package_b"])
+            except PackageSpecError as e:
+                raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_PACKAGE",
+                               "程序包结构校验失败", {"errors": e.errors})
+            la = data.get("label_a", spec_a.name)
+            lb = data.get("label_b", spec_b.name)
+            try:
+                result = store.compare_packages_inline(
+                    spec_a, spec_b, config, la, lb)
+            except ValueError as e:
+                raise ApiError(HTTPStatus.CONFLICT, "PACKAGE_BLOCKED",
+                               str(e))
+            if data.get("save", False):
+                cid = store.save_comparison(
+                    None, None, la, lb, result, compare_type="package")
+                result["comparison_id"] = cid
+        self._send_json(result)
 
     # -- 对比 --------------------------------------------------------------
 

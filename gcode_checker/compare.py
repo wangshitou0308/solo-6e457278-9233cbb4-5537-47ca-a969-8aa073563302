@@ -327,3 +327,110 @@ def _sev_of(code: str, r1: dict, r2: dict) -> str:
             if i["code"] == code:
                 return i["severity"]
     return "info"
+
+
+# ---------------------------------------------------------------------------
+# 程序包对比（展开调用图 + 展开块变化，外加标准报告对比）
+# ---------------------------------------------------------------------------
+
+def _expansion_of(report: dict) -> dict:
+    return report.get("package", {}).get("expansion", {})
+
+
+def _call_edges(report: dict) -> dict:
+    """(caller, callee) -> 边汇总（含调用次数与展开中的调用执行次数）。"""
+    graph = report.get("package", {}).get("call_graph", {})
+    return {(e["caller"], e["callee"]): e for e in graph.get("edges", [])}
+
+
+def compare_package_reports(baseline: dict, candidate: dict,
+                            baseline_label: str = "baseline",
+                            candidate_label: str = "candidate") -> dict:
+    """两个程序包报告的对比：标准安全对比 + 调用与展开块变化。"""
+    result = compare_reports(baseline, candidate,
+                             baseline_label, candidate_label)
+    ea, eb = _expansion_of(baseline), _expansion_of(candidate)
+
+    def _num(d, key, default=0):
+        return d.get(key, default)
+
+    result["compare_type"] = "package"
+    result["expansion"] = {
+        "baseline": {
+            "subprograms_defined": _num(ea, "subprograms_defined"),
+            "source_programs": _num(ea, "source_programs"),
+            "expanded_blocks": _num(ea, "expanded_blocks"),
+            "original_physical_lines": _num(ea, "original_physical_lines"),
+            "call_sites": _num(ea, "call_sites"),
+            "call_executions": _num(ea, "call_executions"),
+            "call_invocations": _num(ea, "call_invocations"),
+            "repeat_invocations": _num(ea, "repeat_invocations"),
+            "max_depth": _num(ea, "max_depth"),
+        },
+        "candidate": {
+            "subprograms_defined": _num(eb, "subprograms_defined"),
+            "source_programs": _num(eb, "source_programs"),
+            "expanded_blocks": _num(eb, "expanded_blocks"),
+            "original_physical_lines": _num(eb, "original_physical_lines"),
+            "call_sites": _num(eb, "call_sites"),
+            "call_executions": _num(eb, "call_executions"),
+            "call_invocations": _num(eb, "call_invocations"),
+            "repeat_invocations": _num(eb, "repeat_invocations"),
+            "max_depth": _num(eb, "max_depth"),
+        },
+    }
+    b, c = result["expansion"]["baseline"], result["expansion"]["candidate"]
+    result["expansion"]["delta"] = {
+        "subprograms_defined": c["subprograms_defined"] - b["subprograms_defined"],
+        "source_programs": c["source_programs"] - b["source_programs"],
+        "expanded_blocks": c["expanded_blocks"] - b["expanded_blocks"],
+        "original_physical_lines": (c["original_physical_lines"]
+                                    - b["original_physical_lines"]),
+        "call_sites": c["call_sites"] - b["call_sites"],
+        "call_executions": c["call_executions"] - b["call_executions"],
+        "call_invocations": c["call_invocations"] - b["call_invocations"],
+        "repeat_invocations": c["repeat_invocations"] - b["repeat_invocations"],
+        "max_depth": c["max_depth"] - b["max_depth"],
+    }
+
+    # 调用图边的新增 / 删除 / 调用次数变化
+    ga = baseline.get("package", {}).get("call_graph", {})
+    gb = candidate.get("package", {}).get("call_graph", {})
+    ea_map, eb_map = _call_edges(baseline), _call_edges(candidate)
+    nodes_a = {n["program"]: n for n in ga.get("nodes", [])}
+    nodes_b = {n["program"]: n for n in gb.get("nodes", [])}
+    edges_added, edges_removed, edges_changed = [], [], []
+    for key in sorted(set(ea_map) | set(eb_map)):
+        e0, e1 = ea_map.get(key), eb_map.get(key)
+        if e0 is None:
+            edges_added.append({
+                "caller": key[0], "callee": key[1],
+                "o_number": e1["o_number"],
+                "sites": e1["sites"], "invocations": e1["invocations"]})
+        elif e1 is None:
+            edges_removed.append({
+                "caller": key[0], "callee": key[1],
+                "o_number": e0["o_number"],
+                "sites": e0["sites"], "invocations": e0["invocations"]})
+        elif (e0["invocations"] != e1["invocations"]
+              or e0["executions"] != e1["executions"]
+              or e0["sites"] != e1["sites"]):
+            edges_changed.append({
+                "caller": key[0], "callee": key[1],
+                "o_number": e1["o_number"],
+                "baseline_sites": e0["sites"],
+                "candidate_sites": e1["sites"],
+                "baseline_invocations": e0["invocations"],
+                "candidate_invocations": e1["invocations"],
+                "delta_invocations": e1["invocations"] - e0["invocations"],
+                "baseline_executions": e0["executions"],
+                "candidate_executions": e1["executions"],
+            })
+    result["call_graph_diff"] = {
+        "programs_added": sorted(set(nodes_b) - set(nodes_a)),
+        "programs_removed": sorted(set(nodes_a) - set(nodes_b)),
+        "edges_added": edges_added,
+        "edges_removed": edges_removed,
+        "edges_changed": edges_changed,
+    }
+    return result
