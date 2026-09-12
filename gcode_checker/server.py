@@ -132,10 +132,12 @@ def filter_report(report: dict, query: dict) -> dict:
     if cycle_filter and "drill_cycles" in out:
         out["drill_cycles"] = _filter_drill_cycles(
             report["drill_cycles"], cycles_upper, hole_from, hole_to)
-    if "trajectory" in query:
-        # 默认携带逐行轨迹，体量较大；?trajectory=0 可省略
-        if query.get("trajectory", ["1"])[0] in ("0", "false", "no"):
-            out.pop("trajectory", None)
+    # 逐行轨迹：默认随循环筛选裁剪；?trajectory=0 省略，?trajectory=all 不裁剪
+    traj_flag = query.get("trajectory", ["1"])[0]
+    if traj_flag in ("0", "false", "no"):
+        out.pop("trajectory", None)
+    elif traj_flag in ("all", "full"):
+        pass
     elif cycle_filter and "trajectory" in out:
         out["trajectory"] = _filter_trajectory_cycles(
             out["trajectory"], cycles_upper, hole_from, hole_to)
@@ -147,51 +149,76 @@ def _hole_in(no, hole_from, hole_to) -> bool:
             and (hole_to is None or no <= hole_to))
 
 
+def _summarize_holes(holes):
+    """从命中孔记录重算孔数/钻深/暂停/展开路径（含孔间定位段）。"""
+    drilled = [h for h in holes if h.get("status") == "drilled"]
+    blocked = len(holes) - len(drilled)
+    depth = round(sum(h.get("drill_depth_mm") or 0.0 for h in drilled), 6)
+    dwell = round(sum(h.get("dwell_s") or 0.0 for h in drilled), 6)
+    rapid = round(sum((h.get("expanded_path_mm") or {}).get("rapid", 0.0)
+                      for h in drilled), 6)
+    cutting = round(sum((h.get("expanded_path_mm") or {}).get("cutting", 0.0)
+                        for h in drilled), 6)
+    return {
+        "holes": len(holes), "drilled": len(drilled), "blocked": blocked,
+        "depth": depth, "dwell": dwell,
+        "rapid": rapid, "cutting": cutting,
+        "total": round(rapid + cutting, 6),
+    }
+
+
 def _filter_drill_cycles(dc: dict, cycles, hole_from, hole_to) -> dict:
-    """按循环类型/孔序筛选固定循环段与孔记录。"""
+    """按循环类型/孔序筛选固定循环段与孔记录；所有分组/明细/汇总
+    只反映命中孔。"""
     groups = []
     for g in dc.get("groups", []):
         if cycles and g["cycle"] not in cycles:
             continue
         holes = [h for h in g.get("holes", [])
                  if _hole_in(h["hole_no"], hole_from, hole_to)]
+        if not holes:
+            continue  # 整组无命中孔，直接剔除
+        s = _summarize_holes(holes)
         ng = dict(g)
         ng["holes"] = holes
-        ng["hole_count"] = len(holes)
-        ng["executed_holes"] = sum(1 for h in holes
-                                   if h.get("status") == "drilled")
-        ng["blocked_holes"] = sum(1 for h in holes
-                                  if h.get("status") == "blocked")
-        ng["total_drill_depth_mm"] = round(
-            sum(h.get("drill_depth_mm") or 0.0 for h in holes), 6)
-        ng["total_dwell_s"] = round(
-            sum(h.get("dwell_s") or 0.0 for h in holes), 6)
-        rapid = sum((h.get("expanded_path_mm") or {}).get("rapid", 0.0)
-                    for h in holes if h.get("status") == "drilled")
-        cutting = sum((h.get("expanded_path_mm") or {}).get("cutting", 0.0)
-                      for h in holes if h.get("status") == "drilled")
-        ng["expanded_path_mm"] = {"rapid": round(rapid, 6),
-                                  "cutting": round(cutting, 6),
-                                  "total": round(rapid + cutting, 6)}
+        ng["hole_count"] = s["holes"]
+        ng["executed_holes"] = s["drilled"]
+        ng["blocked_holes"] = s["blocked"]
+        ng["total_drill_depth_mm"] = s["depth"]
+        ng["total_dwell_s"] = s["dwell"]
+        ng["expanded_path_mm"] = {"rapid": s["rapid"],
+                                  "cutting": s["cutting"],
+                                  "total": s["total"]}
         groups.append(ng)
 
-    def holes_of(status=None):
-        n = 0
-        for g in groups:
-            for h in g["holes"]:
-                if status is None or h.get("status") == status:
-                    n += 1
-        return n
+    # 按循环类型重算（只含命中孔与保留分组）
+    by_cycle: dict = {}
+    for g in groups:
+        d = by_cycle.setdefault(g["cycle"], {
+            "groups": 0, "holes": 0, "drilled": 0, "blocked": 0,
+            "drill_depth_mm": 0.0, "expanded_rapid_mm": 0.0,
+            "expanded_cutting_mm": 0.0})
+        d["groups"] += 1
+        d["holes"] += g["hole_count"]
+        d["drilled"] += g["executed_holes"]
+        d["blocked"] += g["blocked_holes"]
+        d["drill_depth_mm"] = round(
+            d["drill_depth_mm"] + g["total_drill_depth_mm"], 6)
+        d["expanded_rapid_mm"] = round(
+            d["expanded_rapid_mm"] + g["expanded_path_mm"]["rapid"], 6)
+        d["expanded_cutting_mm"] = round(
+            d["expanded_cutting_mm"] + g["expanded_path_mm"]["cutting"], 6)
 
-    total = holes_of()
-    drilled = holes_of("drilled")
-    blocked = holes_of("blocked")
+    total = sum(g["hole_count"] for g in groups)
+    drilled = sum(g["executed_holes"] for g in groups)
+    blocked = sum(g["blocked_holes"] for g in groups)
     depth = round(sum(g["total_drill_depth_mm"] for g in groups), 6)
     dwell = round(sum(g["total_dwell_s"] for g in groups), 6)
     rapid = round(sum(g["expanded_path_mm"]["rapid"] for g in groups), 6)
     cutting = round(sum(g["expanded_path_mm"]["cutting"] for g in groups), 6)
     out = dict(dc)
     out["groups"] = groups
+    out["by_cycle"] = by_cycle
     out["summary"] = {
         "cycle_groups": len(groups),
         "holes_total": total,
@@ -203,14 +230,15 @@ def _filter_drill_cycles(dc: dict, cycles, hole_from, hole_to) -> dict:
                              "total": round(rapid + cutting, 6)},
         "filtered": True,
     }
-    if cycles:
-        out["by_cycle"] = {k: v for k, v in dc.get("by_cycle", {}).items()
-                           if k in cycles}
     return out
 
 
 def _filter_trajectory_cycles(trajectory, cycles, hole_from, hole_to):
-    """同步裁剪逐行轨迹中固定循环段的孔/动作明细。"""
+    """同步裁剪逐行轨迹中固定循环段的孔/动作明细。
+
+    每个动作都带 hole_no（含孔间定位段 position），按命中孔过滤；
+    段的孔数/长度/钻深按保留孔重算。非循环行原样保留。
+    """
     out = []
     for e in trajectory:
         seg = e.get("segment")
@@ -224,12 +252,20 @@ def _filter_trajectory_cycles(trajectory, cycles, hole_from, hole_to):
         if not holes:
             continue
         keep_nos = {h["hole_no"] for h in holes}
+        # 动作明细只保留命中孔（position/approach/peck/retract 均带 hole_no）
+        moves = [m for m in seg.get("moves_mm", [])
+                 if m.get("hole_no") in keep_nos]
+        s = _summarize_holes(holes)
         ne = dict(e)
         ns = dict(seg)
         ns["holes"] = holes
         ns["hole_nos"] = [n for n in ns.get("hole_nos", []) if n in keep_nos]
-        ns["moves_mm"] = [m for m in ns.get("moves_mm", [])
-                          if "hole_no" not in m]
+        ns["moves_mm"] = moves
+        ns["length_mm"] = s["total"]
+        ns["rapid_length_mm"] = s["rapid"]
+        ns["cutting_length_mm"] = s["cutting"]
+        ns["drill_depth_mm"] = s["depth"]
+        ns["dwell_s"] = s["dwell"]
         ne["segment"] = ns
         out.append(ne)
     return out

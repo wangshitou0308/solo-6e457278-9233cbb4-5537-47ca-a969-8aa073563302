@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass, field
 
 # 循环 G 代码 -> 键
@@ -25,6 +26,12 @@ RETURN_G = {"98": "initial", "99": "r"}
 RETURN_CN = {"initial": "初始平面", "r": "R 平面"}
 # G83 排屑后重新快速下钻时，距上次孔底的接近预留量（mm）
 PECK_APPROACH_MM = 0.1
+
+_cycle_uid_seq = itertools.count(1)
+
+
+def _next_uid() -> int:
+    return next(_cycle_uid_seq)
 
 
 @dataclass
@@ -77,6 +84,7 @@ class CycleDef:
     def_line_no: int
     def_source_line: str
     initial_z: float                 # 初始平面（mm，循环建立时锁定）
+    uid: int = field(default_factory=_next_uid)  # 分组稳定主键
     z: CycleParam | None = None      # 孔底 Z
     r: CycleParam | None = None      # R 平面 Z
     q: CycleParam | None = None      # G83 每步深度（mm）
@@ -92,6 +100,7 @@ class CycleDef:
             def_line_no=self.def_line_no,
             def_source_line=self.def_source_line,
             initial_z=self.initial_z,
+            uid=self.uid,
             z=self.z, r=self.r, q=self.q, p=self.p,
             return_mode=self.return_mode,
             return_mode_line=self.return_mode_line,
@@ -208,11 +217,16 @@ def expand_hole(definition: CycleDef, hole_xy: tuple[float, float],
     moves: list[dict] = []
 
     # 标准展开（孔间定位段由 analyzer 追加）：
-    # A. 快速到 R 平面（若当前 Z < R 则先抬初始平面再下，保守按直接快速到 R）
+    # A. 快速到 R 平面；已在 R 平面（G99 连续孔）也记录一个零长度动作，
+    #    保证逐孔轨迹始终包含“定位 -> 到 R -> 进刀 -> … -> 回退”完整链路
     if abs(entry_z - r_z) > 1e-9:
         moves.append(_move(
             "approach_r", [x, y, entry_z], [x, y, r_z], rapid=True,
             note=f"快速接近 R 平面 Z={round(r_z, 6)}"))
+    else:
+        moves.append(_move(
+            "approach_r", [x, y, r_z], [x, y, r_z], rapid=True,
+            note=f"已在 R 平面 Z={round(r_z, 6)}（G99 连续孔，无垂直接近）"))
     cur_z = r_z
 
     dwell = cd.p.value if (cd.p is not None and cd.cycle == "G82") else 0.0

@@ -19,13 +19,37 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 | 定位 | `G90` 绝对、`G91` 增量 |
 | 坐标系 | `G54`（偏置 X/Y/Z 由机床配置提供，叠加后做行程检查） |
 | 运动 | `G0` 快速、`G1` 直线、`G2` 顺圆、`G3` 逆圆（仅 G17/XY 平面） |
+| 固定循环 | `G80` 取消、`G81` 钻孔、`G82` 锪孔（`P` 孔底暂停）、`G83` 深孔啄钻（`Q` 分步）；`G98` 返回初始平面（默认）、`G99` 返回 R 平面；`R` R 平面、`L` 重复孔位 |
 | 圆弧参数 | `I J`（起点相对圆心，优先）或 `R`（负值=优弧）；允许 Z 联动螺旋下刀 |
 | 工艺 | `F` 进给（按当前单位换算 mm/min）、`S` 主轴转速 rpm |
 | 主轴 | `M3` 正转启动、`M5` 停止 |
-| 词 | `X Y Z`、`N` 行号（忽略）；注释 `(...)` 与 `;...` |
+| 词 | `X Y Z`、`Q P L`（固定循环）、`N` 行号（忽略）；注释 `(...)` 与 `;...` |
+
+### 固定钻孔循环展开口径
+
+- 循环为**模态**：`G81/G82/G83` 定义后，后续含 `X/Y`（或本行 `L`）的程序段
+  连续触发孔加工；`G80` 或任意 `G0-G3` 取消循环。`Z/R/Q/P` 模态继承，
+  可在定义时或后续段逐步给出。
+- `L` 为孔位重复次数，默认 1，必须为**正整数**：`G90` 下在同一位置重复；
+  `G91` 下按本行 XY 增量逐次平移，展开为连续孔。
+- 坐标语义：`G90` 下 `R/Z` 为绝对坐标；`G91` 下 `R` 相对循环建立时锁定的
+  **初始平面**，`Z` 相对 **R 平面**；`Q` 恒为正的无符号步进深度（mm）。
+  `P` 为孔底暂停：整数按毫秒、小数按秒（`P500` = `P0.5` = 0.5 s）。
+- 每个孔记录完整展开轨迹：孔间 `position` 快速定位 → 快速到 R（G99 连续孔
+  可能是零长度）→ 进给下钻（G83 为 `Q` 分步 + 退回 R 排屑 + 快速接近 +
+  进给走完预留量）→ G82 孔底 `dwell` → 快速返回初始平面/R 平面。
+  每个动作带 `hole_no`，定位动作长度计入对应孔的 `expanded_path_mm`。
+- 阻断规则（**只阻断对应孔**，登记孔记录与依据，原程序不变、后续模态可继承）：
+  首次启用缺 `Z` 或 `R`（G83 还需正的 `Q`）→ `CYCLE_MISSING_PARAMS`；
+  `Q<=0`、`P` 为负、`L` 非正整数 → `CYCLE_BAD_PARAM`；
+  孔底高于 R 平面 → `CYCLE_PLANE_CONFLICT`；
+  后续孔位缺少可继承的 XY/初始平面 → `CYCLE_NO_INHERITABLE_STATE`。
+- 循环展开轨迹复用行程/安全 Z/进给/主轴检查；G83 循环内部排屑快速动作豁免
+  安全 Z 告警，孔间定位（尤其 G99 在 R 高度横移）仍报 `RAPID_BELOW_SAFE_Z`。
+  主轴未转/无进给等工艺问题按**触发行**去重（一个 G83 孔只报一次）。
 
 **未支持示例**（遇到即 `UNSUPPORTED_INSTRUCTION`，整段不执行、不改模态）：
-`G17/18/19、G28/30、G40-G43、G54.1/G55-G59、G80-G89、M2/M30、M4、M6、M7-M9、T/H/D/P/Q/L` 等。
+`G17/18/19、G28/30、G40-G43、G54.1/G55-G59、G84-G89、M2/M30、M4、M6、M7-M9、T/H/D` 等。
 无法解析的残片（如 `X-`）报 `MALFORMED_LINE`；若同行还有未支持词（如 `G55 X-`），
 两类问题都会列出。
 
@@ -56,7 +80,7 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 | GET | `/api/dialect` | 支持的指令、问题代码、严重度表 |
 | GET | `/api/docs` | 本文档（Markdown） |
 | GET | `/api/examples` | 内置示例 .nc 清单 |
-| GET | `/api/examples/<name>` | 下载示例（safe_demo/problems_demo/inch_demo/arc_demo） |
+| GET | `/api/examples/<name>` | 下载示例（safe_demo/problems_demo/inch_demo/arc_demo/drill_cycle_demo） |
 
 ### 机床配置
 
@@ -85,7 +109,13 @@ python3 -m gcode_checker --verbose       # 打印访问日志
   - `severity=critical,error`（多选逗号分隔；级别 critical/error/warning/info）
   - `code=OUT_OF_BOUNDS,ARC_NO_SOLUTION`
   - `line_from=10&line_to=80`
-  - `trajectory=0`：省略逐行轨迹以减小响应
+  - `cycle=G81,G83`：只保留指定循环类型的孔/分组/轨迹（G81/G82/G83）
+  - `hole_from=3&hole_to=8`：按全程序孔序（阻断孔也占位）筛选
+  - `trajectory=0`：省略逐行轨迹以减小响应；`trajectory=all`：循环筛选时保留完整轨迹
+
+  指定 `cycle`/`hole_*` 后，报告中的 `drill_cycles`（groups、by_cycle、
+  summary 的孔数/钻深/暂停/展开路径）与逐行轨迹的孔及动作（含孔间定位）
+  都只反映命中孔；程序顶层统计保持完整。
 - `GET /api/jobs/<id>/report/download`：以 `attachment` 下载 JSON 报告（筛选参数同上）。
 - `GET /api/jobs/<id>/gcode`：下载作业原始 .nc 文本。
 
@@ -113,7 +143,9 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 两个作业必须使用相同配置（否则 `409 CONFIG_MISMATCH`）。
 结果按问题指纹多重集匹配，给出 `resolved_issues`（旧有新无）、
 `introduced_issues`（新增）、`unchanged_issues`（仍在），以及
-`by_code` 计数变化、风险分/级别变化、路径长度与包围盒变化。
+`by_code` 计数变化、风险分/级别变化、路径长度与包围盒变化，
+并在 `drill_cycles` 中汇总孔数/阻断孔/钻深/展开路径的增减
+（总计及按 G81/G82/G83 分类的 `by_cycle`）。
 - `GET /api/comparisons` / `GET /api/comparisons/<id>`：读取保存的对比。
 
 ## 5. 报告结构
@@ -121,22 +153,70 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 ```jsonc
 {
   "program": { "physical_lines": 12, "executed_lines": 9,
-               "blocked_lines": 2, "blank_or_comment_lines": 1 },
+               "blocked_lines": 2, "blank_or_comment_lines": 1,
+               "drill_holes": 8, "drill_holes_blocked": 1,
+               "drill_holes_total": 9, "drill_cycle_groups": 2 },
   "machine": { …回显配置… },
   "final_state": { "unit": "mm", "distance_mode": "absolute", "wcs": "G54",
     "motion_mode": "linear", "x/y/z": {"value_mm": …, "known": true},
-    "feed_mm_per_min": {…}, "spindle_rpm": 6000, "spindle_on": true },
+    "feed_mm_per_min": {…}, "spindle_rpm": 6000, "spindle_on": true,
+    "canned_cycle": { …当前激活循环的参数与来源，无则 null… },
+    "cycle_return_plane": "G98" },
+  "drill_cycles": {
+    "summary": { "cycle_groups": 2, "holes_total": 9, "holes_drilled": 8,
+      "holes_blocked": 1, "total_drill_depth_mm": 63.0, "total_dwell_s": 0.5,
+      "expanded_path_mm": {"rapid": …, "cutting": …, "total": …} },
+    "by_cycle": { "G81": {"groups":1,"holes":6,…}, "G83": {"groups":1,"holes":3,…} },
+    "groups": [ { "cycle":"G83", "definition_line_no":4, "cancel_line_no":9,
+      "initial_plane_z_mm":20, "parameters":{ …Z/R/Q/P 及来源行历史… },
+      "hole_count":3, "executed_holes":3, "blocked_holes":0,
+      "total_drill_depth_mm":33, "expanded_path_mm":{…},
+      "holes":[ …逐孔（含定位动作）… ] } ]
+  },
   "bbox_program_mm": { "x_mm": [0, 90], "y_mm": […], "z_mm": […],
                        "size_mm": [90, 20, 52] },
   "bbox_machine_mm": { …叠加偏置后的机床坐标包围盒… },
   "path_length_mm": { "rapid": 123.4, "cutting": 88.1,
-                      "total": 211.5, "reliable": true, "unknown_segments": 0 },
+                      "total": 211.5, "reliable": true, "unknown_segments": 0,
+                      "canned_cycle_rapid": 40.2, "canned_cycle_cutting": 33.0 },
   "risk": { "score": 35, "level": "high",
             "counts_by_severity": {"critical": 1, "error": 1, …},
             "total_issues": 6 },
   "issues": [ …见下… ],
-  "trajectory": [ …逐行… ],
+  "trajectory": [ …逐行（循环段含逐孔展开动作）… ],
   "policies": { …各判定口径的文字说明… }
+}
+```
+
+固定循环每个孔的记录：
+
+```jsonc
+{
+  "hole_no": 2, "cycle": "G83", "repeat_index": 1, "l_repeat": 1,
+  "status": "drilled",                 // drilled | blocked
+  "trigger_line_no": 5, "trigger_source_line": "X20 Y0",
+  "definition_line_no": 4,
+  "x_mm": 20, "y_mm": 0,
+  "initial_plane_z_mm": 20, "r_plane_z_mm": 2, "z_bottom_mm": -11,
+  "return_plane": "G99", "retract_z_mm": 2,
+  "drill_depth_mm": 13, "dwell_s": 0,
+  "expanded_path_mm": {"rapid": 25.0, "cutting": 13.2, "total": 38.2},
+  "parameter_sources": {               // 每个参数的取值行/触发行/默认
+    "Z_bottom": {"value_mm":-11,"line_no":4,"source_line":"…"},
+    "R_plane":  {…}, "Q_peck": {…}, "P_dwell_s": null,
+    "return_plane": {"code":"G99","line_no":5,"default":false} },
+  "moves": [                           // 首段为孔间定位 position
+    {"action":"position","motion":"rapid","hole_no":2,
+     "start_mm":[0,0,2],"end_mm":[20,0,2],"length_mm":20,…},
+    {"action":"approach_r","motion":"rapid", …},
+    {"action":"peck_drill_1","motion":"feed", …},
+    {"action":"peck_retract_1","motion":"rapid","internal_cycle":true, …},
+    {"action":"peck_reapproach_1","motion":"rapid","internal_cycle":true, …},
+    {"action":"peck_feed_approach_1","motion":"feed", …},
+    {"action":"retract_r","motion":"rapid", …}
+  ],
+  "block_codes": ["CYCLE_MISSING_PARAMS"],   // 阻断孔
+  "basis": "首次启用缺少 Z/R（G83 还需 Q）"
 }
 ```
 
@@ -199,6 +279,10 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 | `UNKNOWN_UNITS` | warning | G20/G21 建立前出现 F 或运动，位置标记未知 |
 | `UNKNOWN_DISTANCE_MODE` | warning | G90/G91 建立前出现轴坐标，位置标记未知 |
 | `UNKNOWN_WCS` | warning | G54 建立前运动：跳过行程检查，机床包围盒不可用 |
+| `CYCLE_MISSING_PARAMS` | error | 循环首次启用缺 Z/R（G83 还需正 Q），对应孔阻断、模态可补齐 |
+| `CYCLE_BAD_PARAM` | error | G83 的 Q<=0、P 为负、L 非正整数，对应孔阻断 |
+| `CYCLE_PLANE_CONFLICT` | error | 孔底高于 R 平面，对应孔阻断 |
+| `CYCLE_NO_INHERITABLE_STATE` | error | 后续孔位的 XY/初始平面状态未知，对应孔阻断 |
 
 风险分：critical 25 / error 10 / warning 3 / info 1（封顶 100），
 级别 `none/low(≤10)/medium(≤30)/high(≤60)/critical`。
@@ -214,7 +298,10 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 4. **路径长度**：仅累计物理已知段；圆弧按弧长（含 Z 联动的螺旋长度），
    直线按 3D 弦长。`reliable=false` 时报告会标注存在未知段。
 5. **安全 Z 按工件坐标**判定；**行程按机床坐标**（叠加 G54 偏置）判定。
-6. 服务监听本地回环，数据库为单个 SQLite 文件，全程无任何网络外联。
+6. **固定循环**：循环参数非法/缺项只阻断对应孔并写明依据，不产生位移、
+   不改写程序；G83 内部排屑快速动作豁免安全 Z 告警，孔间定位仍检查；
+   工艺问题（主轴未转/无进给）按触发行去重。
+7. 服务监听本地回环，数据库为单个 SQLite 文件，全程无任何网络外联。
 
 ## 8. curl 快速上手
 
@@ -224,7 +311,7 @@ curl -s localhost:8080/api/machines -H 'Content-Type: application/json' -d '{
   "name":"demo", "travel_x":[0,300], "travel_y":[0,200], "travel_z":[-100,0],
   "safe_z":10, "max_feed_mm_min":3000, "max_spindle_rpm":12000}'
 
-# 2) 下载示例并建作业
+# 2) 下载示例并建作业（含钻孔循环示例 drill_cycle_demo）
 curl -s localhost:8080/api/examples/problems_demo -o problems.nc
 python3 - <<'PY'
 import json,urllib.request
@@ -235,9 +322,13 @@ req=urllib.request.Request('http://localhost:8080/api/jobs',
 print(urllib.request.urlopen(req).read().decode())
 PY
 
-# 3) 查进度 / 筛选严重问题 / 下载
+# 3) 查进度 / 筛选严重问题 / 按循环类型与孔序筛选 / 下载
 curl -s 'localhost:8080/api/jobs/<id>'
 curl -s 'localhost:8080/api/jobs/<id>/report?severity=critical,error'
+curl -s 'localhost:8080/api/jobs/<id>/report?cycle=G83&hole_from=11&hole_to=13'
 curl -s -OJ 'localhost:8080/api/jobs/<id>/report/download'
+
+# 4) 钻孔循环示例（G81/G82/G83/G98/G99/L，含阻断演示）
+curl -s localhost:8080/api/examples/drill_cycle_demo -o drill.nc
 ```
 """

@@ -50,6 +50,20 @@ G0 Z20
 M5
 """
 
+GCODE_DRILL = """G21 G90 G54
+M3 S4000
+G0 X0 Y0 Z20
+G99 G81 R2 Z-8 F250
+X20 Y0
+X40 Y0
+G80
+G0 X0 Y40 Z20
+G83 R2 Z-11 Q3 F180
+X40 Y40
+G80
+M5
+"""
+
 
 class ApiTest(unittest.TestCase):
     @classmethod
@@ -117,7 +131,7 @@ class ApiTest(unittest.TestCase):
         names = [e["name"] for e in ex["examples"]]
         self.assertEqual(set(names),
                          {"safe_demo", "problems_demo", "inch_demo",
-                          "arc_demo"})
+                          "arc_demo", "drill_cycle_demo"})
         resp, nc = self.req("GET", "/api/examples/safe_demo", raw=True)
         self.assertIn("attachment", resp.headers["Content-Disposition"])
         self.assertIn(b"G21", nc)
@@ -241,6 +255,80 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(st["distance_mode"], "absolute")
         self.assertEqual(r["trajectory"][0]["normalized"], "G21 G91 G54")
         self.assertAlmostEqual(st["x"]["value_mm"], 10.0)
+
+    def test_07_drill_cycle_filter_and_example(self):
+        # 同步分析钻孔程序
+        _, r = self.req("POST", "/api/analyze",
+                        {"config": CONFIG, "gcode": GCODE_DRILL})
+        dc = r["drill_cycles"]
+        self.assertEqual(dc["summary"]["holes_total"], 5)
+        self.assertEqual(len(dc["groups"]), 2)
+        # 定位动作归入孔
+        h2 = dc["groups"][0]["holes"][1]
+        self.assertEqual(h2["moves"][0]["action"], "position")
+        self.assertEqual(h2["moves"][0]["hole_no"], h2["hole_no"])
+
+        # 建作业以便走 filter_report
+        _, job = self.req("POST", "/api/jobs", {
+            "machine_id": self.machine_id,
+            "program_name": "drill.nc", "gcode": GCODE_DRILL}, expect=202)
+        self.wait_job(job["id"])
+
+        # 按孔序筛选 2..3（都在 G81 组）
+        _, f = self.req(
+            "GET", f"/api/jobs/{job['id']}/report?hole_from=2&hole_to=3")
+        s = f["drill_cycles"]["summary"]
+        self.assertEqual(s["holes_total"], 2)
+        self.assertEqual(s["cycle_groups"], 1)   # G83 组无命中，已剔除
+        self.assertEqual(set(f["drill_cycles"]["by_cycle"]), {"G81"})
+        g = f["drill_cycles"]["groups"][0]
+        self.assertEqual([h["hole_no"] for h in g["holes"]], [2, 3])
+        # 汇总钻深 = 2 孔 * 10
+        self.assertAlmostEqual(s["total_drill_depth_mm"], 20.0)
+        # 轨迹只含孔 2/3 的行与动作
+        cyc_entries = [e for e in f["trajectory"]
+                       if (e.get("segment") or {}).get("kind")
+                       == "canned_cycle"]
+        nos = {n for e in cyc_entries
+               for n in e["segment"]["hole_nos"]}
+        self.assertEqual(nos, {2, 3})
+        for e in cyc_entries:
+            seg = e["segment"]
+            self.assertTrue(all(m.get("hole_no") in {2, 3}
+                                for m in seg["moves_mm"]))
+            for h in seg["holes"]:
+                self.assertTrue(any(m["action"] == "position"
+                                    for m in h["moves"]))
+
+        # 按循环类型筛选 G83
+        _, fg = self.req(
+            "GET", f"/api/jobs/{job['id']}/report?cycle=G83&trajectory=0")
+        self.assertEqual(
+            [g["cycle"] for g in fg["drill_cycles"]["groups"]], ["G83"])
+        self.assertNotIn("trajectory", fg)
+
+        # 非法筛选值
+        self.req("GET", f"/api/jobs/{job['id']}/report?cycle=G99",
+                 expect=400)
+        self.req("GET", f"/api/jobs/{job['id']}/report?hole_from=0",
+                 expect=400)
+
+        # 钻孔示例可下载，含固定循环
+        resp, nc = self.req("GET", "/api/examples/drill_cycle_demo",
+                            raw=True)
+        self.assertIn("attachment", resp.headers["Content-Disposition"])
+        self.assertIn(b"G83", nc)
+
+    def test_08_drill_compare(self):
+        _, cmp = self.req("POST", "/api/compare", {
+            "machine_id": self.machine_id,
+            "label_a": "d1", "gcode_a": GCODE_DRILL,
+            "label_b": "d2",
+            "gcode_b": GCODE_DRILL.replace("X40 Y0", "X40 Y0\nX60 Y0")})
+        self.assertIn("drill_cycles", cmp)
+        dc = cmp["drill_cycles"]
+        self.assertEqual(dc["delta"]["holes_total"], 1)
+        self.assertEqual(dc["by_cycle"]["G81"]["delta_holes"], 1)
 
 
 if __name__ == "__main__":

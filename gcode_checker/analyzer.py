@@ -468,7 +468,7 @@ class Analyzer:
         self.blocked_count = 0
         # 固定循环统计
         self.cycle_groups: list[dict] = []
-        self._cycle_group_map: dict[str, dict] = {}
+        self._cycle_group_map: dict[int, dict] = {}
         self.hole_seq = 0          # 全程序孔序（从 1 开始，阻断孔也占位）
         self.hole_ok = 0
         self.hole_blocked = 0
@@ -490,11 +490,23 @@ class Analyzer:
         self._snap_in_return_line: int | None = None
         self._snap_in_return_source: str | None = None
         self._snap_in_return_default = True
+        # (line_no, code) -> 已登记问题索引：循环展开动作的工艺问题按行去重
+        self._line_dedup: dict[tuple[int, str], int] = {}
 
     # -- 问题记录 ----------------------------------------------------------
 
+    # 同一触发行内按代码去重的工艺问题：G83 一个孔有多次进给动作，
+    # 主轴未转/无进给只报一次（以触发行而非每个展开动作计）
+    LINE_DEDUPE_CODES = {"SPINDLE_NOT_RUNNING", "FEED_UNSET"}
+
     def _issue(self, code: str, pl: ParsedLine, basis: str,
-               details: dict | None = None, normalized: str = "") -> int:
+               details: dict | None = None, normalized: str = "",
+               line_dedupe: bool = False) -> int:
+        if line_dedupe:
+            key = (pl.line_no, code)
+            existing = self._line_dedup.get(key)
+            if existing is not None:
+                return existing
         iss = Issue(
             code=code,
             severity=ISSUE_SEVERITY[code],
@@ -507,7 +519,10 @@ class Analyzer:
             details=details or {},
         )
         self.issues.append(iss)
-        return len(self.issues) - 1
+        idx = len(self.issues) - 1
+        if line_dedupe:
+            self._line_dedup[(pl.line_no, code)] = idx
+        return idx
 
     # -- 包围盒 / 行程 -----------------------------------------------------
 
@@ -810,12 +825,14 @@ class Analyzer:
                                        "P", "L")]
 
         # 5) 固定循环处理（本行定义/重定义循环，或在激活循环上给出触发词）
-        # 触发词：X/Y（新孔位）或 L（重复孔位）；单独的 Z/R/Q/P 只是
-        # 模态参数更新，不立即钻孔（循环定义行即使无 X/Y 也在当前位置执行）
+        # 触发词：X/Y（新孔位）或 L（重复孔位，即使没有轴词）；单独的
+        # Z/R/Q/P 只是模态参数更新，不立即钻孔
+        # （循环定义行即使无 X/Y/L 也在当前位置执行）
         cycle_trigger_words = {"X", "Y", "L"}
         is_definition = line_cycle_key is not None
-        has_trigger = self.state.cycle is not None and any(
-            w.letter in cycle_trigger_words for w in pl.words)
+        has_l_trigger = l_word is not None
+        has_trigger = self.state.cycle is not None and (
+            any(w.letter in ("X", "Y") for w in pl.words) or has_l_trigger)
         if is_definition or has_trigger:
             if line_motion_key is not None:
                 # G81 G0 X.. 这类混合段以运动组最后者为准；
@@ -986,10 +1003,15 @@ class Analyzer:
     # -- 固定钻孔循环 ------------------------------------------------------
 
     def _group_for(self, cd: CycleDef) -> dict:
-        """取循环定义对应的组记录（同一 def 生命周期共享）。"""
-        g = self._cycle_group_map.get(id(cd))
+        """取循环定义对应的组记录（同一 def 生命周期共享）。
+
+        以 CycleDef.uid 为稳定主键：不能用 id(cd)，旧定义被 GC 后
+        id 会被新定义复用，导致 300 次交替定义时分组串组。
+        """
+        g = self._cycle_group_map.get(cd.uid)
         if g is None:
             g = {
+                "uid": cd.uid,
                 "cycle": cd.cycle,
                 "definition_line_no": cd.def_line_no,
                 "definition_source_line": cd.def_source_line,
@@ -1006,7 +1028,7 @@ class Analyzer:
                 "expanded_path_mm": {"rapid": 0.0, "cutting": 0.0,
                                      "total": 0.0},
             }
-            self._cycle_group_map[id(cd)] = g
+            self._cycle_group_map[cd.uid] = g
             self.cycle_groups.append(g)
         return g
 
@@ -1232,13 +1254,12 @@ class Analyzer:
         blocked = trigger and (
             bool(block_codes) or unknown_unit or unknown_mode)
 
-        # 展开孔位（即便阻断也登记孔记录，写明依据；阻断不产生位移）
+        # 展开孔位（即便阻断也登记孔记录，写明依据；阻断不产生位移）。
+        # 工艺问题（主轴未转/无进给）在 _issue 层按触发行去重，
+        # G83 多次进给动作不会重复报告。
         holes_info = self._expand_trigger_holes(
             pl, cd, reps, axis_words, blocked, block_codes, issue_indexes,
             normalized, l_word, do_holes=trigger)
-
-        # 同一触发行可能在多个展开动作上重复产生同类工艺问题，按代码去重
-        self._dedupe_cycle_issues(pl, issue_indexes)
 
         entry_type = "setting"
         if trigger:
@@ -1256,20 +1277,6 @@ class Analyzer:
             self.blocked_count += 1
         else:
             self.executed_count += 1
-
-    def _dedupe_cycle_issues(self, pl: ParsedLine, issue_indexes: list[int]):
-        """同一循环触发行的同类工艺问题只保留首个（如每啄一步都报
-        主轴未转/无进给）。"""
-        seen: set[str] = set()
-        kept: list[int] = []
-        for idx in issue_indexes:
-            code = self.issues[idx].code
-            if code in ("SPINDLE_NOT_RUNNING", "FEED_UNSET", "UNKNOWN_WCS",
-                        "RAPID_BELOW_SAFE_Z") and code in seen:
-                continue
-            seen.add(code)
-            kept.append(idx)
-        issue_indexes[:] = kept
 
     def _expand_trigger_holes(self, pl, cd: CycleDef, reps: int, axis_words,
                               blocked, block_codes, issue_indexes,
@@ -1345,27 +1352,36 @@ class Analyzer:
                 g["holes"].append(hole)
                 continue
 
-            # 孔间定位段（从上个孔返回高度到新孔位 XY）
+            # 孔间定位段（从上个孔返回高度到新孔位 XY），归入本孔
             entry_z = last_z
+            hole_moves: list[dict] = []
+            pos_len = 0.0
             if last_xy is not None:
                 pm = positioning_move(last_xy, (tgt_xy[0], tgt_xy[1]), entry_z)
+                pm["hole_no"] = no
                 self._check_cycle_move(pl, pm, issue_indexes, no,
                                        internal=False)
                 all_moves.append(pm)
-                rapid_len += pm["length_mm"]
+                hole_moves.append(pm)
+                pos_len = pm["length_mm"]
+                rapid_len += pos_len
 
             exp = expand_hole(cd, (tgt_xy[0], tgt_xy[1]), entry_z)
             for mv in exp["moves"]:
+                mv["hole_no"] = no
                 internal = bool(mv.get("internal_cycle"))
                 self._check_cycle_move(pl, mv, issue_indexes, no,
                                        internal=internal)
             all_moves.extend(exp["moves"])
+            hole_moves.extend(exp["moves"])
             rapid_len += exp["rapid_len_mm"]
             cut_len += exp["cutting_len_mm"]
             depth_sum += exp["drill_depth_mm"]
             dwell_sum += exp["dwell_s"]
 
-            hole["moves"] = exp["moves"]
+            # 定位动作计入本孔轨迹与展开路径（单孔轨迹完整）
+            hole_rapid = round(exp["rapid_len_mm"] + pos_len, 6)
+            hole["moves"] = hole_moves
             hole["initial_plane_z_mm"] = round6(cd.initial_z)
             hole["r_plane_z_mm"] = round6(cd.r.value)
             hole["z_bottom_mm"] = round6(cd.z.value)
@@ -1375,9 +1391,9 @@ class Analyzer:
             hole["dwell_s"] = exp["dwell_s"]
             hole["retract_z_mm"] = round6(exp["retract_z"])
             hole["expanded_path_mm"] = {
-                "rapid": exp["rapid_len_mm"],
+                "rapid": hole_rapid,
                 "cutting": exp["cutting_len_mm"],
-                "total": round(exp["rapid_len_mm"] + exp["cutting_len_mm"], 6)}
+                "total": round(hole_rapid + exp["cutting_len_mm"], 6)}
             holes.append(hole)
             g["holes"].append(hole)
             self.hole_ok += 1
@@ -1429,7 +1445,11 @@ class Analyzer:
 
     def _check_cycle_move(self, pl, mv: dict, issue_indexes, hole_no: int,
                           internal: bool):
-        """对一个展开动作复用行程/包围盒/安全Z/进给/主轴检查。"""
+        """对一个展开动作复用行程/包围盒/安全Z/进给/主轴检查。
+
+        切削动作的主轴/进给工艺问题按触发行去重（G83 一孔多次进给）；
+        越界等几何问题仍逐动作报告。
+        """
         pts = [tuple(mv["start_mm"]), tuple(mv["end_mm"])]
         kind = "rapid" if mv["motion"] == "rapid" else "linear"
         seg = {
@@ -1442,13 +1462,18 @@ class Analyzer:
         # 安全 Z 告警，但仍做行程/包围盒检查；切削动作做主轴/进给检查。
         self._run_segment_checks(
             pl, kind, seg, issue_indexes,
-            cycle_context=(internal or kind == "rapid"))
+            cycle_context=(internal or kind == "rapid"),
+            line_dedupe=True)
         # 孔间定位段（非内部快速）补充安全 Z 检查
         # （G99 在 R 平面横移可能低于安全 Z）
         if not internal and kind == "rapid":
             self._rapid_safe_z_check(pl, seg, issue_indexes, hole_no)
-        # 给本次移动产生的问题补上孔序/动作
-        for idx in issue_indexes[before:]:
+        # 去重可能返回已登记问题索引（同触发行的其他孔已报告）：
+        # 去掉重复索引，再给问题补孔序/动作（仅首次）
+        tail = list(dict.fromkeys(issue_indexes[before:]))
+        del issue_indexes[before:]
+        issue_indexes.extend(tail)
+        for idx in tail:
             iss = self.issues[idx]
             iss.details.setdefault(
                 "cycle", self.state.cycle.cycle if self.state.cycle else None)
@@ -1638,7 +1663,8 @@ class Analyzer:
     # -- 段级检查 ----------------------------------------------------------
 
     def _run_segment_checks(self, pl, motion_mode, segment, issue_indexes,
-                            cycle_context: bool = False):
+                            cycle_context: bool = False,
+                            line_dedupe: bool = False):
         points = segment["points"]
 
         # 行程检查需要工件坐标系
@@ -1693,18 +1719,22 @@ class Analyzer:
 
         if motion_mode in ("linear", "arc_cw", "arc_ccw"):
             if not self.state.spindle_on:
-                issue_indexes.append(self._issue(
+                idx = self._issue(
                     "SPINDLE_NOT_RUNNING", pl,
                     f"{MOTION_CN[motion_mode]}切削发生时主轴处于停止状态"
                     f"（spindle_on=false，最近 S={self.state.spindle_rpm}）",
                     {"spindle_on": False,
-                     "last_s_rpm": self.state.spindle_rpm}))
+                     "last_s_rpm": self.state.spindle_rpm},
+                    line_dedupe=line_dedupe)
+                issue_indexes.append(idx)
             if not self.state.feed.known:
-                issue_indexes.append(self._issue(
+                idx = self._issue(
                     "FEED_UNSET", pl,
                     f"{MOTION_CN[motion_mode]}切削前未建立有效进给 F"
                     "（单位不明或从未给定）",
-                    {"feed_known": False}))
+                    {"feed_known": False},
+                    line_dedupe=line_dedupe)
+                issue_indexes.append(idx)
 
     # -- 累计与输出 --------------------------------------------------------
 
@@ -1775,6 +1805,7 @@ class Analyzer:
                 "motion": mv.get("motion"),
                 "internal_cycle": bool(mv.get("internal_cycle")),
                 "note": mv.get("note"),
+                "hole_no": mv.get("hole_no"),
                 "start_mm": list(mv["start_mm"]),
                 "end_mm": list(mv["end_mm"]),
                 "points_mm": [list(p) for p in mv["points_mm"]],

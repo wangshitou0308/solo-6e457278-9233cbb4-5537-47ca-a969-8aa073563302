@@ -24,21 +24,34 @@ python3 -m gcode_checker --port 9000 --db /var/lib/gc.db --verbose
 | 定位 | `G90` 绝对 / `G91` 增量 |
 | 坐标系 | `G54`（X/Y/Z 偏置由机床配置提供，叠加后做行程检查） |
 | 运动 | `G0` 快速、`G1` 直线、`G2/G3` 顺/逆圆弧（G17 XY，`I/J` 或 `R`，允许 Z 联动） |
+| 固定循环 | `G80` 取消、`G81` 钻孔、`G82` 锪孔（`P` 暂停）、`G83` 深孔啄钻（`Q` 分步），`G98`/`G99` 返回初始/R 平面，`R`、`L` 重复孔位 |
 | 工艺 | `F` 进给（换算 mm/min）、`S` 主轴转速 |
 | 主轴 | `M3` 正转、`M5` 停止 |
 | 注释 | `(…)` 与 `;…`；行号 `N` 忽略 |
 
+**固定循环展开口径**：循环为模态，`G80` 或 `G0-G3` 取消；`Z/R/Q/P` 模态继承，
+`L` 为孔位重复次数（默认 1，正整数）。`G90` 下 `Z/R` 为绝对坐标、`L` 在同位
+重复；`G91` 下 `R` 相对循环初始平面、`Z` 相对 R 平面，`L` 沿 XY 增量展开连续孔。
+逐孔记录定位、到 R、进刀、孔底暂停、G83 分步下钻/排屑回退以及返回初始平面
+或 R 平面的完整轨迹，并保留循环定义行、触发行与每个参数的来源行。
+首次启用缺 `Z`/`R`、G83 的 `Q<=0`、`P` 为负、`L` 非正整数、孔底高于 R 平面、
+或后续孔位缺少可继承的 XY/初始平面状态时，**阻断对应孔并写明依据，原程序不变**。
+
 **未支持的指令显式列出且整段阻断**（不猜测执行、不改模态），例如
-`G17/G28/G40-G43/G55-G59/G80-G89、M2/M4/M6/M8/M30、T/H/D/P/Q/L` 等；
+`G17/G28/G40-G43/G55-G59/G84-G89、M2/M4/M6/M8/M30、T/H/D` 等；
 无法解析的残片（如 `X-`）报 `MALFORMED_LINE`，同行若含未支持指令（如
 `G55 X-`）两类问题都会列出。
 
 ## 检查内容（每个问题附原行、规范化指令、进入/离开状态、判定依据）
 
 - 加工包围盒（程序坐标 + 叠加 G54 偏置的机床坐标）
-- 路径长度估算（快速 / 切削分开；圆弧按弧长，含螺旋 Z 联动）
+- 路径长度估算（快速 / 切削分开；圆弧按弧长，含螺旋 Z 联动；
+  固定循环展开后的定位/接近/下钻/排屑/回退动作计入）
 - 逐行轨迹（含圆弧加密采样点、圆心、半径、扫角）
+- 固定钻孔循环逐孔展开轨迹（G81/G82/G83，含 G90/G91、L 连续/重复孔位）
 - 越界 `OUT_OF_BOUNDS`（critical）
+- 循环阻断 `CYCLE_MISSING_PARAMS` / `CYCLE_BAD_PARAM` /
+  `CYCLE_PLANE_CONFLICT` / `CYCLE_NO_INHERITABLE_STATE`（error，仅阻断对应孔）
 - 单位 / 定位模式 / WCS 不明（warning；位置标记未知，不按默认值蒙算）
 - 圆弧几何无解 `ARC_NO_SOLUTION`（半径为 0、终点不落圆、弦长 > 2R；
   整段阻断并回滚本行全部模态改动）
@@ -64,6 +77,7 @@ GET    /api/jobs               作业列表
 GET    /api/jobs/<id>          状态与进度 0-100
 GET    /api/jobs/<id>/report   完整报告；?severity=critical,error
                                &code=OUT_OF_BOUNDS&line_from=&line_to=&trajectory=0
+                               &cycle=G81,G83&hole_from=&hole_to=
 GET    /api/jobs/<id>/report/download   下载 JSON 报告
 GET    /api/jobs/<id>/gcode             下载原始 .nc
 
@@ -72,8 +86,13 @@ POST   /api/compare            同一机床配置比较两个程序
 GET    /api/comparisons        /api/comparisons/<id>
 ```
 
+循环报告可按 `cycle=G81,G82,G83` 与 `hole_from/hole_to`（全程序孔序）筛选，
+筛选后的孔明细、分组、`by_cycle` 与汇总（孔数/钻深/展开路径）只反映命中孔，
+逐行轨迹中的孔与动作（含孔间定位）同步裁剪；`trajectory=all` 可保留完整轨迹。
+
 对比结果把问题按指纹多重集匹配为 `resolved / introduced / unchanged`，
-并给出按代码计数变化、风险分/级别变化、路径长度与包围盒变化。
+并给出按代码计数变化、风险分/级别变化、路径长度与包围盒变化，
+以及固定循环的孔数/阻断孔/钻深/展开路径（总计与按 G81/G82/G83 分类）增减。
 两个作业的机床配置不一致时返回 `409 CONFIG_MISMATCH`。
 
 ## 目录结构
@@ -81,16 +100,17 @@ GET    /api/comparisons        /api/comparisons/<id>
 ```text
 gcode_checker/
   parser.py     词法解析（保守，不补全）
-  analyzer.py   模态还原、圆弧几何、安全检查、报告结构
-  compare.py    双程序风险对比
+  cycles.py     固定钻孔循环 G81/G82/G83 逐孔展开
+  analyzer.py   模态还原、圆弧几何、循环分析、安全检查、报告结构
+  compare.py    双程序风险对比（含循环孔数/钻深/路径增减）
   database.py   SQLite 持久化 + 后台作业线程
-  server.py     http.server REST API
+  server.py     http.server REST API（含循环类型/孔序筛选）
   examples.py   内置 .nc 示例
   docs.py       /api/docs 的 Markdown 文本
   __main__.py   命令行入口
 tests/
-  test_analyzer.py   解析/几何/检查/对比单元测试（25 项）
-  test_api.py        HTTP 端到端测试（6 项）
+  test_analyzer.py   解析/几何/检查/循环/对比单元测试
+  test_api.py        HTTP 端到端测试
 ```
 
 ## 测试
@@ -107,4 +127,6 @@ python3 -m tests.test_api
 3. 单位或定位模式不明时，位置 `known=false`，不进入包围盒/长度/行程统计，
    并给出对应 warning；路径长度在存在未知段时标记 `reliable=false`。
 4. 安全 Z 按**工件（程序）坐标**判定；行程按**机床坐标**（叠加 G54 偏置）判定。
-5. 无任何网络外联；监听默认仅本机回环。
+5. 固定循环参数非法或缺项时只阻断对应孔（登记孔记录与依据，不产生位移、
+   不改后续模态）；循环内部 G83 排屑快速动作豁免安全 Z 告警，孔间定位仍检查。
+6. 无任何网络外联；监听默认仅本机回环。

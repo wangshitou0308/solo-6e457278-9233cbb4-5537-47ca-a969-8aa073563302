@@ -280,6 +280,159 @@ class TestCompare(unittest.TestCase):
         self.assertEqual(cmp["issue_counts"]["introduced"], 0)
         self.assertLess(cmp["risk"]["score_delta"], 0)
 
+    def test_drill_compare_summary(self):
+        a = ("G21 G90 G54\nM3 S1000\nG0 X0 Y0 Z20\n"
+             "G81 R2 Z-5 F200\nX10\nX20\nG80\n")
+        b = ("G21 G90 G54\nM3 S1000\nG0 X0 Y0 Z20\n"
+             "G81 R2 Z-5 F200\nX10\nG80\n"
+             "G0 X20 Y0 Z20\nG83 R2 Z-8 Q0\nG80\n")
+        cmp = compare_reports(analyze_program(a, cfg()),
+                              analyze_program(b, cfg()), "a", "b")
+        dc = cmp["drill_cycles"]
+        self.assertEqual(dc["delta"]["holes_total"], 0)      # 3 -> 3
+        self.assertEqual(dc["delta"]["holes_blocked"], 1)    # 0 -> 1
+        self.assertIn("G83", dc["by_cycle"])
+        self.assertEqual(dc["by_cycle"]["G83"]["candidate_blocked"], 1)
+        self.assertIn("total_drill_depth_mm", dc["delta"])
+        self.assertIn("expanded_path_total_mm", dc["delta"])
+
+
+class TestCannedCycles(unittest.TestCase):
+    DRILL_HEADER = ("G21 G90 G54\nM3 S3000 F250\n"
+                    "G0 X0 Y0 Z20\n")
+
+    def _drill(self, body):
+        return analyze_program(self.DRILL_HEADER + body + "\nG80\n", cfg())
+
+    def test_g81_basic_expansion_and_counts(self):
+        r = self._drill("G98 G81 R2 Z-5\nX20 Y0\nX40 Y0")
+        s = r["drill_cycles"]["summary"]
+        self.assertEqual(s["holes_total"], 3)
+        self.assertEqual(s["holes_blocked"], 0)
+        g = r["drill_cycles"]["groups"][0]
+        self.assertEqual(g["cycle"], "G81")
+        h1, h2 = g["holes"][0], g["holes"][1]
+        # 每孔含定位（首孔为零长度）/到R/进给/回退
+        self.assertEqual([m["action"] for m in h1["moves"]],
+                         ["position", "approach_r", "drill_feed",
+                          "retract_initial"])
+        self.assertEqual(h1["moves"][0]["length_mm"], 0.0)
+        # 孔间定位长度归入对应孔：孔2 有 20mm 水平定位
+        self.assertEqual(h2["moves"][0]["action"], "position")
+        self.assertAlmostEqual(h2["moves"][0]["length_mm"], 20.0)
+        # G98 下快速 = 定位20 + 孔2在初始20到R2(18) + Z-5回初始20(25)
+        self.assertAlmostEqual(h2["expanded_path_mm"]["rapid"],
+                               20.0 + 18.0 + 25.0, places=5)
+        self.assertEqual(s["total_drill_depth_mm"], 21.0)
+        # 所有动作都带 hole_no
+        for h in g["holes"]:
+            self.assertTrue(all(m.get("hole_no") == h["hole_no"]
+                                for m in h["moves"]))
+
+    def test_g82_dwell_and_g83_peck(self):
+        r = self._drill("G82 R2 Z-5 P500\nX10\n")
+        h = r["drill_cycles"]["groups"][0]["holes"][0]
+        self.assertAlmostEqual(h["dwell_s"], 0.5)
+        self.assertIn("dwell_bottom", [m["action"] for m in h["moves"]])
+
+        r2 = self._drill("G83 R2 Z-8 Q3\nX10\n")
+        h2 = r2["drill_cycles"]["groups"][0]["holes"][0]
+        actions = [m["action"] for m in h2["moves"]]
+        self.assertEqual(actions.count("peck_drill_1"), 1)
+        self.assertIn("peck_retract_1", actions)
+        # 进给长度 = 钻深 + 每步 0.1mm 预留补回
+        self.assertGreater(h2["expanded_path_mm"]["cutting"], 10.0)
+
+    def test_g91_l_repeats_and_g90_l_same_position(self):
+        r = self._drill("G91 G99 G81 X20 L3 R-18 Z-7")
+        holes = r["drill_cycles"]["groups"][0]["holes"]
+        self.assertEqual([h["x_mm"] for h in holes], [20.0, 40.0, 60.0])
+        self.assertTrue(all(h["return_plane"] == "G99" for h in holes))
+
+        r2 = self._drill("G90 G98 G81 R2 Z-5 L2")
+        holes2 = r2["drill_cycles"]["groups"][0]["holes"]
+        self.assertEqual([(h["x_mm"], h["y_mm"]) for h in holes2],
+                         [(0.0, 0.0), (0.0, 0.0)])
+
+    def test_g99_positioning_below_safe_z_flagged_once_per_hole(self):
+        c = MachineConfig.from_dict({
+            "name": "t", "travel_x": [0, 300], "travel_y": [0, 200],
+            "travel_z": [-50, 60], "safe_z": 10,
+            "max_feed_mm_min": 3000, "max_spindle_rpm": 12000})
+        r = analyze_program(
+            self.DRILL_HEADER + "G99 G81 R2 Z-5\nX20 Y0\nX40 Y0\nG80\n", c)
+        codes = [i["code"] for i in r["issues"]]
+        # 孔2、孔3 在 R=2 横移各报一次，孔1无横移不报
+        self.assertEqual(codes.count("RAPID_BELOW_SAFE_Z"), 2)
+        self.assertTrue(all(i["details"].get("in_canned_cycle")
+                            for i in r["issues"]
+                            if i["code"] == "RAPID_BELOW_SAFE_Z"))
+
+    def test_blocking_missing_params_q_p_l_plane(self):
+        cases = [
+            ("G81 Z-5\n", "CYCLE_MISSING_PARAMS"),
+            ("G83 R2 Z-8 Q0\n", "CYCLE_BAD_PARAM"),
+            ("G82 R2 Z-5 P-1\n", "CYCLE_BAD_PARAM"),
+            ("G81 R2 Z-5 L0\n", "CYCLE_BAD_PARAM"),
+            ("G81 R-8 Z-5\n", "CYCLE_PLANE_CONFLICT"),
+        ]
+        for body, code in cases:
+            r = analyze_program(
+                self.DRILL_HEADER + body + "G80\n", cfg())
+            self.assertIn(code, [i["code"] for i in r["issues"]], body)
+            self.assertEqual(r["drill_cycles"]["summary"]["holes_drilled"], 0)
+
+    def test_params_completed_later_and_l_without_xy_triggers(self):
+        r = self._drill("G81\nR2\nZ-5\nX10\nX20 L0")
+        # 定义行缺 Z/R 阻断 1 孔；纯 R/Z 参数行不钻孔；补齐后 X10 钻 1 孔；
+        # L0 无 XY 也触发并阻断
+        s = r["drill_cycles"]["summary"]
+        self.assertEqual((s["holes_total"], s["holes_drilled"],
+                          s["holes_blocked"]), (3, 1, 2))
+
+    def test_no_inheritable_state(self):
+        r = analyze_program(
+            "G21 G90 G54\nM3 S2000\nG0 Z20\n"
+            "G81 R2 Z-5 F200\nG80\n", cfg())  # XY 从未建立
+        self.assertIn("CYCLE_NO_INHERITABLE_STATE",
+                      [i["code"] for i in r["issues"]])
+
+    def test_cycle_process_issues_deduped_per_trigger_line(self):
+        # 不给 M3/F：一个 G83 孔多个进给动作，只报 1 条主轴 + 1 条进给
+        r = analyze_program(
+            "G21 G90 G54\nG0 X0 Y0 Z20\nG83 R2 Z-11 Q2\nG91 X10 L2\nG80\n",
+            cfg())
+        codes = [i["code"] for i in r["issues"]]
+        # 定义行孔1 + 触发行孔2：每条触发行各 1 次，不因啄钻步数翻倍
+        self.assertEqual(codes.count("SPINDLE_NOT_RUNNING"), 2)
+        self.assertEqual(codes.count("FEED_UNSET"), 2)
+
+    def test_300_alternating_definitions_stable_groups(self):
+        lines = ["G21 G90 G54", "M3 S2000 F200", "G0 X0 Y0 Z20"]
+        for i in range(300):
+            cyc = "G81" if i % 2 == 0 else "G83"
+            lines.append(f"{cyc} R2 Z-5 Q2 X{i} Y0")
+            lines.append("G80")
+        r = analyze_program("\n".join(lines) + "\nM5\n", cfg())
+        groups = r["drill_cycles"]["groups"]
+        self.assertEqual(len(groups), 300)
+        self.assertEqual(r["drill_cycles"]["summary"]["holes_total"], 300)
+        # 每组 cycle 与组内孔一致，不串组
+        for g in groups:
+            self.assertTrue(all(h["cycle"] == g["cycle"] for h in g["holes"]))
+
+    def test_cancel_with_g80_and_motion_g(self):
+        r = analyze_program(
+            self.DRILL_HEADER + "G81 R2 Z-5\nX10\n"
+            "G0 X30\nG1 X40 F100\n", cfg())
+        self.assertIsNone(r["final_state"]["canned_cycle"])
+        self.assertEqual(r["final_state"]["motion_mode"], "linear")
+        # G80 显式取消
+        r2 = analyze_program(
+            self.DRILL_HEADER + "G81 R2 Z-5\nX10\nG80\n", cfg())
+        self.assertIsNone(r2["final_state"]["canned_cycle"])
+        self.assertIsNone(r2["final_state"]["motion_mode"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
