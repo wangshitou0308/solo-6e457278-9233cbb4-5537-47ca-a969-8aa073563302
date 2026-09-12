@@ -34,6 +34,7 @@ from .analyzer import (
     MachineConfig,
     SEVERITY_ORDER,
     ISSUE_SEVERITY,
+    WCS_NAMES,
     analyze_program,
 )
 from .database import JobStore
@@ -59,8 +60,8 @@ class ApiError(Exception):
 # ---------------------------------------------------------------------------
 
 def filter_report(report: dict, query: dict) -> dict:
-    """按 severity / code / 行范围 / 循环类型 / 孔序 / 圆弧平面筛选问题；
-    其余统计同步重算。"""
+    """按 severity / code / 行范围 / 循环类型 / 孔序 / 圆弧平面 / 坐标系
+    筛选问题；其余统计同步重算。"""
     severities = _csv_param(query, "severity")
     codes = _csv_param(query, "code")
     line_from = _int_param(query, "line_from")
@@ -69,6 +70,7 @@ def filter_report(report: dict, query: dict) -> dict:
     hole_from = _int_param(query, "hole_from")
     hole_to = _int_param(query, "hole_to")
     planes = _csv_param(query, "plane")
+    wcs_list = _csv_param(query, "wcs")
 
     for s in severities:
         if s not in SEVERITY_ORDER:
@@ -92,6 +94,12 @@ def filter_report(report: dict, query: dict) -> dict:
         raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_QUERY",
                        f"未知圆弧平面 {bad_planes}",
                        {"allowed": ["G17", "G18", "G19"]})
+    wcs_upper = [w.upper() for w in wcs_list]
+    bad_wcs = [w for w in wcs_upper if w not in WCS_NAMES]
+    if bad_wcs:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_QUERY",
+                       f"未知工件坐标系 {bad_wcs}",
+                       {"allowed": list(WCS_NAMES)})
     for name, v in (("hole_from", hole_from), ("hole_to", hole_to)):
         if v is not None and v < 1:
             raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_QUERY",
@@ -112,6 +120,9 @@ def filter_report(report: dict, query: dict) -> dict:
     if planes_upper:
         issues = [i for i in issues
                   if i.get("details", {}).get("plane") in planes_upper]
+    if wcs_upper:
+        issues = [i for i in issues
+                  if i.get("details", {}).get("wcs") in wcs_upper]
     def _in_hole_range(i):
         no = i.get("details", {}).get("hole_no")
         if no is None:
@@ -132,21 +143,27 @@ def filter_report(report: dict, query: dict) -> dict:
     cycle_filter = bool(cycles_upper or hole_from is not None
                         or hole_to is not None)
     plane_filter = bool(planes_upper)
+    wcs_filter = bool(wcs_upper)
     out["filter"] = {
         "severity": severities, "code": codes,
         "line_from": line_from, "line_to": line_to,
         "cycle": cycles_upper,
         "hole_from": hole_from, "hole_to": hole_to,
         "plane": planes_upper,
+        "wcs": wcs_upper,
         "matched": len(issues),
         "total_in_report": len(report["issues"]),
     }
-    if cycle_filter and "drill_cycles" in out:
+    if (cycle_filter or wcs_filter) and "drill_cycles" in out:
         out["drill_cycles"] = _filter_drill_cycles(
-            report["drill_cycles"], cycles_upper, hole_from, hole_to)
+            report["drill_cycles"], cycles_upper, hole_from, hole_to,
+            wcs_upper)
     if plane_filter and "arcs" in out:
         out["arcs"] = _filter_arcs(report["arcs"], planes_upper, issues)
-    # 逐行轨迹：默认随循环/平面筛选裁剪；?trajectory=0 省略，?trajectory=all 不裁剪
+    if wcs_filter and "wcs" in out:
+        out["wcs"] = _filter_wcs(report["wcs"], wcs_upper)
+    # 逐行轨迹：默认随循环/平面/坐标系筛选裁剪；?trajectory=0 省略，
+    # ?trajectory=all 不裁剪
     traj_flag = query.get("trajectory", ["1"])[0]
     if traj_flag in ("0", "false", "no"):
         out.pop("trajectory", None)
@@ -159,6 +176,9 @@ def filter_report(report: dict, query: dict) -> dict:
         if plane_filter and "trajectory" in out:
             out["trajectory"] = _filter_trajectory_planes(
                 out["trajectory"], planes_upper)
+        if wcs_filter and "trajectory" in out:
+            out["trajectory"] = _filter_trajectory_wcs(
+                out["trajectory"], wcs_upper)
     return out
 
 
@@ -185,15 +205,17 @@ def _summarize_holes(holes):
     }
 
 
-def _filter_drill_cycles(dc: dict, cycles, hole_from, hole_to) -> dict:
-    """按循环类型/孔序筛选固定循环段与孔记录；所有分组/明细/汇总
+def _filter_drill_cycles(dc: dict, cycles, hole_from, hole_to,
+                         wcs=None) -> dict:
+    """按循环类型/孔序/坐标系筛选固定循环段与孔记录；所有分组/明细/汇总
     只反映命中孔。"""
     groups = []
     for g in dc.get("groups", []):
         if cycles and g["cycle"] not in cycles:
             continue
         holes = [h for h in g.get("holes", [])
-                 if _hole_in(h["hole_no"], hole_from, hole_to)]
+                 if _hole_in(h["hole_no"], hole_from, hole_to)
+                 and (not wcs or h.get("wcs") in wcs)]
         if not holes:
             continue  # 整组无命中孔，直接剔除
         s = _summarize_holes(holes)
@@ -275,6 +297,42 @@ def _filter_arcs(arcs: dict, planes, issues) -> dict:
                              if i["code"] == "ARC_NO_SOLUTION"),
         "filtered": True,
     }
+
+
+def _filter_wcs(wcs_section: dict, wcs) -> dict:
+    """按坐标系筛选 wcs 汇总节：by_wcs 只保留命中坐标系（未使用的坐标系
+    补零值行，偏置信息取自配置），used 同步裁剪。"""
+    by_wcs = {}
+    for w in wcs:
+        row = wcs_section.get("by_wcs", {}).get(w)
+        if row is None:
+            off = wcs_section.get("offsets_mm", {}).get(w)
+            row = {
+                "configured": off is not None,
+                "offset_mm": off,
+                "path_length_mm": {"rapid": 0.0, "cutting": 0.0,
+                                   "total": 0.0, "unknown_segments": 0},
+                "machine_bbox_mm": None,
+                "issues": 0,
+            }
+        by_wcs[w] = row
+    out = dict(wcs_section)
+    out["by_wcs"] = by_wcs
+    out["used"] = [w for w in wcs_section.get("used", []) if w in wcs]
+    out["filtered"] = True
+    return out
+
+
+def _filter_trajectory_wcs(trajectory, wcs):
+    """逐行轨迹按坐标系裁剪：轨迹段属于其他坐标系的条目剔除，
+    无轨迹段的设定/注释行原样保留。"""
+    out = []
+    for e in trajectory:
+        seg = e.get("segment")
+        if seg is not None and seg.get("wcs") not in wcs:
+            continue
+        out.append(e)
+    return out
 
 
 def _filter_trajectory_planes(trajectory, planes):

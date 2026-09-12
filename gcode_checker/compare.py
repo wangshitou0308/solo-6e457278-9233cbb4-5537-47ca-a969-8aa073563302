@@ -19,7 +19,7 @@ def _fingerprint(issue: dict) -> tuple:
     d = issue.get("details", {})
     key = ["axis", "unsupported_tokens", "malformed_tokens", "reason",
            "below_mm", "overshoot_mm", "exceed_mm_per_min", "exceed_rpm",
-           "cycle", "hole_no", "missing", "bad", "unknown", "plane"]
+           "cycle", "hole_no", "missing", "bad", "unknown", "plane", "wcs"]
     detail_fp = tuple((k, str(d.get(k))) for k in key if k in d)
     return (issue["code"], issue.get("normalized", ""), detail_fp)
 
@@ -217,11 +217,71 @@ def compare_reports(baseline: dict, candidate: dict,
         },
     }
 
+    # 按工件坐标系（G54-G59）的路径、机床行程（包围盒）与问题增减
+    def wcs_of(r):
+        return r.get("wcs", {}).get("by_wcs", {})
+
+    def _wcs_of(issue):
+        return issue.get("details", {}).get("wcs")
+
+    wcs_issues_a = Counter(
+        w for w in (_wcs_of(i) for i in baseline["issues"]) if w)
+    wcs_issues_b = Counter(
+        w for w in (_wcs_of(i) for i in candidate["issues"]) if w)
+    wcs_resolved = Counter(
+        w for w in (_wcs_of(i) for i in resolved) if w)
+    wcs_introduced = Counter(
+        w for w in (_wcs_of(i) for i in introduced) if w)
+
+    wa, wb = wcs_of(baseline), wcs_of(candidate)
+    wcs_by_wcs = {}
+    for w in sorted(set(wa) | set(wb) | set(wcs_issues_a)
+                    | set(wcs_issues_b)):
+        a, b = wa.get(w, {}), wb.get(w, {})
+        pa = a.get("path_length_mm", {})
+        pb = b.get("path_length_mm", {})
+
+        def _path(p):
+            return {"rapid": p.get("rapid", 0.0),
+                    "cutting": p.get("cutting", 0.0),
+                    "total": p.get("total", 0.0)}
+
+        p_a, p_b = _path(pa), _path(pb)
+        na, nb = wcs_issues_a.get(w, 0), wcs_issues_b.get(w, 0)
+        wcs_by_wcs[w] = {
+            "baseline_path_mm": p_a,
+            "candidate_path_mm": p_b,
+            "delta_path_mm": {
+                "rapid": round(p_b["rapid"] - p_a["rapid"], 6),
+                "cutting": round(p_b["cutting"] - p_a["cutting"], 6),
+                "total": round(p_b["total"] - p_a["total"], 6),
+            },
+            "baseline_machine_bbox_mm": a.get("machine_bbox_mm"),
+            "candidate_machine_bbox_mm": b.get("machine_bbox_mm"),
+            "baseline_issues": na,
+            "candidate_issues": nb,
+            "delta_issues": nb - na,
+            "resolved_issues": wcs_resolved.get(w, 0),
+            "introduced_issues": wcs_introduced.get(w, 0),
+        }
+    wcs_compare = {
+        "by_wcs": wcs_by_wcs,
+        "total": {
+            "baseline_issues": sum(wcs_issues_a.values()),
+            "candidate_issues": sum(wcs_issues_b.values()),
+            "delta_issues": (sum(wcs_issues_b.values())
+                             - sum(wcs_issues_a.values())),
+            "resolved_issues": sum(wcs_resolved.values()),
+            "introduced_issues": sum(wcs_introduced.values()),
+        },
+    }
+
     return {
         "labels": {"baseline": baseline_label, "candidate": candidate_label},
         "machine": candidate["machine"],
         "drill_cycles": drill_compare,
         "arcs": arc_compare,
+        "wcs": wcs_compare,
         "risk": {
             "baseline": baseline["risk"],
             "candidate": candidate["risk"],

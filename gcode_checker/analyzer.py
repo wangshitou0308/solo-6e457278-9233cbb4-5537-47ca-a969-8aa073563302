@@ -49,7 +49,7 @@ ISSUE_SEVERITY = {
     "NO_MOTION_MODE": "warning",           # 有轴坐标词但没有模态 G0-G3
     "UNKNOWN_UNITS": "warning",            # G20/G21 未建立
     "UNKNOWN_DISTANCE_MODE": "warning",    # G90/G91 未建立
-    "UNKNOWN_WCS": "warning",              # G54 未建立，无法做行程检查
+    "UNKNOWN_WCS": "warning",              # G54-G59 未建立或偏置未配置，无法做行程检查
     "ARC_NO_SOLUTION": "critical",         # 圆弧几何无解（整段阻断）
     "OUT_OF_BOUNDS": "critical",           # 越出机床行程
     "FEED_OVER_LIMIT": "error",            # 进给超限
@@ -70,7 +70,7 @@ ISSUE_TITLE = {
     "NO_MOTION_MODE": "缺少模态运动指令",
     "UNKNOWN_UNITS": "单位模式不明（未见 G20/G21）",
     "UNKNOWN_DISTANCE_MODE": "定位模式不明（未见 G90/G91）",
-    "UNKNOWN_WCS": "工件坐标系不明（未见 G54）",
+    "UNKNOWN_WCS": "工件坐标系不明或未配置（G54-G59）",
     "ARC_NO_SOLUTION": "圆弧几何无解（已阻断该段）",
     "OUT_OF_BOUNDS": "越出机床行程",
     "FEED_OVER_LIMIT": "进给速度超过机床上限",
@@ -92,6 +92,9 @@ MOTION_CN = {"rapid": "快速", "linear": "直线",
              "arc_cw": "顺时针圆弧", "arc_ccw": "逆时针圆弧"}
 SETTING_G_UNIT = {"20": "inch", "21": "mm"}
 SETTING_G_MODE = {"90": "absolute", "91": "relative"}
+# 工件坐标系模态 G54-G59（偏置由机床配置 wcs_offsets 给出）
+WCS_G = {str(n): f"G{n}" for n in range(54, 60)}
+WCS_NAMES = tuple(WCS_G.values())
 # 圆弧平面选择模态 G17/G18/G19
 PLANE_G = {"17": "G17", "18": "G18", "19": "G19"}
 # 平面 -> (平面轴 u 下标, 平面轴 v 下标, 垂直轴下标, u 圆心词, v 圆心词, 标签)
@@ -164,9 +167,13 @@ class MachineConfig:
     safe_z: float = 0.0
     max_feed_mm_min: float = 0.0
     max_spindle_rpm: float = 0.0
+    # 旧字段：G54 的 X/Y/Z 偏置（与 wcs_offsets["G54"] 保持一致）
     offset_x: float = 0.0
     offset_y: float = 0.0
     offset_z: float = 0.0
+    # G54-G59 各自的工件坐标偏置 {"G54": {"x":..,"y":..,"z":..}, ...}
+    # 未出现在表中的坐标系视为“未配置”：程序引用时机床坐标结论标为未知
+    wcs_offsets: dict = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: dict) -> "MachineConfig":
@@ -203,6 +210,50 @@ class MachineConfig:
         ox, oy, oz = num("offset_x"), num("offset_y"), num("offset_z")
         name = str(d.get("name") or "未命名机床")
 
+        # 多工件坐标系偏置：wcs_offsets={"G55": {"x":..,"y":..,"z":..}}；
+        # 非法值报错时定位到坐标系与字段（如 wcs_offsets.G55.x）
+        wcs_offsets: dict[str, dict[str, float]] = {}
+        raw_wcs = d.get("wcs_offsets")
+        if raw_wcs is not None:
+            if not isinstance(raw_wcs, dict):
+                errors.append(
+                    "wcs_offsets 必须是对象，形如 "
+                    '{"G55": {"x": 0, "y": 0, "z": 0}}')
+            else:
+                for wname, off in raw_wcs.items():
+                    wcs = str(wname).upper()
+                    if wcs not in WCS_NAMES:
+                        errors.append(
+                            f"wcs_offsets.{wname} 不是支持的工件坐标系"
+                            f"（仅支持 {'/'.join(WCS_NAMES)}）")
+                        continue
+                    if not isinstance(off, dict):
+                        errors.append(
+                            f"wcs_offsets.{wcs} 必须是对象 "
+                            '{"x":..,"y":..,"z":..}')
+                        continue
+                    extra = sorted(set(off) - {"x", "y", "z"})
+                    if extra:
+                        errors.append(
+                            f"wcs_offsets.{wcs} 含未知字段 {extra}"
+                            "（仅支持 x/y/z）")
+                    entry = {}
+                    for ax in ("x", "y", "z"):
+                        v = off.get(ax, 0.0)
+                        try:
+                            entry[ax] = float(v)
+                        except (TypeError, ValueError):
+                            errors.append(
+                                f"wcs_offsets.{wcs}.{ax} 必须是数值"
+                                f"（坐标系 {wcs} 的 {ax.upper()} 轴偏置）")
+                            entry[ax] = 0.0
+                    wcs_offsets[wcs] = entry
+        # 旧配置中的 offset_x/offset_y/offset_z 归入 G54；
+        # 显式 wcs_offsets.G54 优先于旧字段
+        if "G54" not in wcs_offsets:
+            wcs_offsets["G54"] = {"x": ox, "y": oy, "z": oz}
+        g54 = wcs_offsets["G54"]
+
         for lo, hi, ax in ((x_min, x_max, "X"), (y_min, y_max, "Y"),
                            (z_min, z_max, "Z")):
             if hi <= lo:
@@ -222,8 +273,18 @@ class MachineConfig:
             safe_z=safe_z,
             max_feed_mm_min=max_feed,
             max_spindle_rpm=max_rpm,
-            offset_x=ox, offset_y=oy, offset_z=oz,
+            offset_x=g54["x"], offset_y=g54["y"], offset_z=g54["z"],
+            wcs_offsets=wcs_offsets,
         )
+
+    def offset_for(self, wcs: str | None):
+        """取坐标系的 (x, y, z) 偏置；未建立/未配置返回 None。"""
+        if not wcs:
+            return None
+        off = self.wcs_offsets.get(wcs)
+        if off is None:
+            return None
+        return (off["x"], off["y"], off["z"])
 
     def to_dict(self) -> dict:
         return {
@@ -237,6 +298,8 @@ class MachineConfig:
             "offset_x": self.offset_x,
             "offset_y": self.offset_y,
             "offset_z": self.offset_z,
+            "wcs_offsets": {w: dict(off)
+                            for w, off in sorted(self.wcs_offsets.items())},
             "travel_x": [self.x_min, self.x_max],
             "travel_y": [self.y_min, self.y_max],
             "travel_z": [self.z_min, self.z_max],
@@ -258,7 +321,7 @@ class Axis:
 class State:
     unit: str | None = None            # 'mm' | 'inch' | None
     distance_mode: str | None = None   # 'absolute' | 'relative' | None
-    wcs: str | None = None             # 'G54' | None
+    wcs: str | None = None             # 'G54'..'G59' | None
     motion_mode: str | None = None     # rapid/linear/arc_cw/arc_ccw
     plane: str = "G17"                 # G17/G18/G19（上电默认 G17）
     x: Axis = field(default_factory=Axis)
@@ -524,6 +587,10 @@ class Analyzer:
         self.mbmin = [math.inf] * 3
         self.mbmax = [-math.inf] * 3
         self.all_moves_wcs_known = True
+        # 多坐标系统计：程序引用过的坐标系、分坐标系路径长度与机床包围盒
+        self.wcs_used: set[str] = set()
+        self.wcs_path: dict[str, dict] = {}
+        self.wcs_mbbox: dict[str, list] = {}
         self.length_rapid = 0.0
         self.length_cutting = 0.0
         self.unknown_length_segments = 0
@@ -558,6 +625,10 @@ class Analyzer:
             existing = self._line_dedup.get(key)
             if existing is not None:
                 return existing
+        details = dict(details or {})
+        # 每个问题都归属到触发时的工件坐标系（未建立则为 None），
+        # 报告可按 wcs=G54..G59 筛选
+        details.setdefault("wcs", self.state.wcs)
         iss = Issue(
             code=code,
             severity=ISSUE_SEVERITY[code],
@@ -567,7 +638,7 @@ class Analyzer:
             state_in=self._snap_in,
             state_out=None,
             basis=basis,
-            details=details or {},
+            details=details,
         )
         self.issues.append(iss)
         idx = len(self.issues) - 1
@@ -575,26 +646,93 @@ class Analyzer:
             self._line_dedup[(pl.line_no, code)] = idx
         return idx
 
-    # -- 包围盒 / 行程 -----------------------------------------------------
+    # -- 坐标系 / 包围盒 / 行程 -----------------------------------------------
 
-    def _machine_point(self, p):
-        c = self.cfg
-        return [p[0] + c.offset_x if p[0] is not None else None,
-                p[1] + c.offset_y if p[1] is not None else None,
-                p[2] + c.offset_z if p[2] is not None else None]
+    def _current_offset(self):
+        """当前坐标系的 (x, y, z) 偏置；未建立/未配置返回 None。"""
+        return self.cfg.offset_for(self.state.wcs)
+
+    def _switch_wcs(self, new_wcs: str):
+        """切换工件坐标系：刀具的机床位置不动，工件坐标随新偏置重新换算。
+
+        旧坐标系未建立/未配置或新坐标系未配置时，无法确定新工件坐标，
+        位置标记为未知（不沿用上一偏置蒙算）。
+        """
+        self.wcs_used.add(new_wcs)
+        if self.state.wcs == new_wcs:
+            return
+        old_off = self.cfg.offset_for(self.state.wcs)
+        new_off = self.cfg.offset_for(new_wcs)
+        for i, letter in enumerate("XYZ"):
+            ax = getattr(self.state, letter.lower())
+            if (ax.known and ax.value is not None
+                    and old_off is not None and new_off is not None):
+                machine = ax.value + old_off[i]
+                setattr(self.state, letter.lower(),
+                        Axis(machine - new_off[i], True))
+            else:
+                setattr(self.state, letter.lower(), Axis(None, False))
+        self.state.wcs = new_wcs
+
+    def _snapshot(self) -> dict:
+        """模态快照（附当前坐标系偏置，便于逐行轨迹直接读取）。"""
+        snap = self.state.snapshot()
+        off = self._current_offset()
+        snap["wcs_configured"] = self.state.wcs is not None and off is not None
+        snap["wcs_offset_mm"] = self._offset_out(off)
+        return snap
+
+    @staticmethod
+    def _offset_out(off):
+        if off is None:
+            return None
+        return {"x": round6(off[0]), "y": round6(off[1]), "z": round6(off[2])}
+
+    def _machine_point(self, p, off=None):
+        """工件坐标 -> 机床坐标（叠加当前坐标系偏置）；偏置未知返回全 None。"""
+        off = self._current_offset() if off is None else off
+        if off is None:
+            return [None, None, None]
+        return [p[0] + off[0] if p[0] is not None else None,
+                p[1] + off[1] if p[1] is not None else None,
+                p[2] + off[2] if p[2] is not None else None]
+
+    def _machine_out(self, p, off):
+        """轨迹输出用机床坐标点；偏置未知时整体为 None。"""
+        if off is None:
+            return None
+        return [round6(p[i] + off[i]) if p[i] is not None else None
+                for i in range(3)]
 
     def _grow_bbox(self, pts, machine: bool):
-        lo = self.mbmin if machine else self.bmin
-        hi = self.mbmax if machine else self.bmax
+        if machine:
+            off = self._current_offset()
+            if off is None:
+                return
+            wbox = self.wcs_mbbox.setdefault(
+                self.state.wcs, [[math.inf] * 3, [-math.inf] * 3])
+            for p in pts:
+                mp = self._machine_point(p, off)
+                for i, v in enumerate(mp):
+                    if v is None:
+                        continue
+                    if v < self.mbmin[i]:
+                        self.mbmin[i] = v
+                    if v > self.mbmax[i]:
+                        self.mbmax[i] = v
+                    if v < wbox[0][i]:
+                        wbox[0][i] = v
+                    if v > wbox[1][i]:
+                        wbox[1][i] = v
+            return
         for p in pts:
-            mp = self._machine_point(p) if machine else p
-            for i, v in enumerate(mp):
+            for i, v in enumerate(p):
                 if v is None:
                     continue
-                if v < lo[i]:
-                    lo[i] = v
-                if v > hi[i]:
-                    hi[i] = v
+                if v < self.bmin[i]:
+                    self.bmin[i] = v
+                if v > self.bmax[i]:
+                    self.bmax[i] = v
 
     def _bounds_violations(self, pts) -> list[dict]:
         c = self.cfg
@@ -665,14 +803,15 @@ class Analyzer:
         unit_g = next((g for g in applied_g if g in SETTING_G_UNIT), None)
         mode_g = next((g for g in applied_g if g in SETTING_G_MODE), None)
         plane_g = next((g for g in applied_g if g in PLANE_G), None)
+        wcs_g = next((g for g in applied_g if g in WCS_G), None)
         if unit_g:
             out.append(f"G{unit_g}")
         if mode_g:
             out.append(f"G{mode_g}")
         if plane_g:
             out.append(f"G{plane_g}")
-        if "54" in applied_g:
-            out.append("G54")
+        if wcs_g:
+            out.append(f"G{wcs_g}")
         if motion_g is not None:
             out.append(f"G{motion_g}" + ("(模态)" if motion_is_modal else ""))
         for w in m_words:
@@ -699,7 +838,7 @@ class Analyzer:
         return self._build_report(len(lines))
 
     def _process_line(self, pl: ParsedLine):
-        self._snap_in = self.state.clone().snapshot()
+        self._snap_in = self._snapshot()
         # 圆弧无解回滚时需要原样恢复固定循环定义（snapshot 只含可读副本）
         self._snap_in_cycle = (self.state.cycle.clone()
                                if self.state.cycle is not None else None)
@@ -764,8 +903,7 @@ class Analyzer:
 
         # 3) 应用模态设定（同组多个取同行最后一个，如 G20 G21 -> mm）
         applied_g: list[str] = []
-        last_unit = last_mode = last_plane = None
-        wcs_g = False
+        last_unit = last_mode = last_plane = last_wcs = None
         for w in g_words:
             key = g_code_key(w)
             if key in SETTING_G_UNIT:
@@ -777,11 +915,11 @@ class Analyzer:
             elif key in PLANE_G:
                 self.state.plane = PLANE_G[key]
                 last_plane = key
-            elif key == "54":
-                self.state.wcs = "G54"
-                wcs_g = True
-        applied_g = [g for g in (last_unit, last_mode, last_plane,
-                                 "54" if wcs_g else None)
+            elif key in WCS_G:
+                # 换系：机床位置不动，工件坐标按新偏置重新换算
+                self._switch_wcs(WCS_G[key])
+                last_wcs = key
+        applied_g = [g for g in (last_unit, last_mode, last_plane, last_wcs)
                      if g is not None]
 
         issue_indexes: list[int] = []
@@ -989,7 +1127,7 @@ class Analyzer:
             # 位置整体退化为未知，只保留主轴/进给等模态检查
             for letter in axis_words:
                 self._set_axis(letter, Axis(None, False))
-            self.unknown_length_segments += 1
+            self._note_unknown_length()
         else:
             # 解算目标坐标（G91 下若起点轴未知，该轴目标未知）
             factor = self.state.unit_factor()
@@ -1022,7 +1160,7 @@ class Analyzer:
             else:
                 length = _dist3(start_pt, end_pt)
                 if length is None:
-                    self.unknown_length_segments += 1
+                    self._note_unknown_length()
                 segment = {
                     "kind": motion_mode,
                     "start": start_pt,
@@ -1407,6 +1545,7 @@ class Analyzer:
 
             pos_known = (not blocked and tgt_xy[0] is not None
                          and tgt_xy[1] is not None and last_z is not None)
+            wcs_off = self._current_offset()
             hole = {
                 "hole_no": no,
                 "cycle": cd.cycle,
@@ -1414,8 +1553,15 @@ class Analyzer:
                 "trigger_line_no": pl.line_no,
                 "trigger_source_line": pl.source,
                 "definition_line_no": cd.def_line_no,
+                "wcs": self.state.wcs,
                 "x_mm": round6(tgt_xy[0]) if not blocked else None,
                 "y_mm": round6(tgt_xy[1]) if not blocked else None,
+                "machine_x_mm": (round6(tgt_xy[0] + wcs_off[0])
+                                 if not blocked and wcs_off is not None
+                                 and tgt_xy[0] is not None else None),
+                "machine_y_mm": (round6(tgt_xy[1] + wcs_off[1])
+                                 if not blocked and wcs_off is not None
+                                 and tgt_xy[1] is not None else None),
                 "l_repeat": (int(round(l_word)) if l_word is not None else 1),
                 "status": "blocked" if blocked else "drilled",
                 "block_codes": block_codes if blocked else [],
@@ -1499,13 +1645,26 @@ class Analyzer:
         if not blocked:
             self.length_cycle_rapid += rapid_len
             self.length_cycle_cutting += cut_len
-            # 展开轨迹并入全局路径长度（行程/包围盒在逐动作检查时已累计）
+            # 展开轨迹并入全局与分坐标系路径长度
+            # （行程/包围盒在逐动作检查时已累计）
             self.length_rapid += rapid_len
             self.length_cutting += cut_len
+            wst = self._wcs_path_stat()
+            if wst is not None:
+                wst["rapid"] += rapid_len
+                wst["cutting"] += cut_len
 
+        # 循环段与每个展开动作都记录坐标系、偏置与机床坐标
+        wcs_off = self._current_offset()
+        for mv in all_moves:
+            mv["start_machine_mm"] = self._machine_out(mv["start_mm"], wcs_off)
+            mv["end_machine_mm"] = self._machine_out(mv["end_mm"], wcs_off)
         segment = {
             "kind": "canned_cycle",
             "cycle": cd.cycle,
+            "wcs": self.state.wcs,
+            "wcs_configured": wcs_off is not None,
+            "offset_mm": self._offset_out(wcs_off),
             "hole_nos": hole_nos,
             "start_mm": ([round6(v) for v in
                           (start_xy[0], start_xy[1],
@@ -1785,7 +1944,7 @@ class Analyzer:
         if perp_change is not None:
             length = math.sqrt(arc_len ** 2 + perp_change ** 2)
         else:
-            self.unknown_length_segments += 1
+            self._note_unknown_length()
         center_3d = [None, None, None]
         center_3d[ui] = round(cu, 6)
         center_3d[vi] = round(cv, 6)
@@ -1835,13 +1994,25 @@ class Analyzer:
                 return {**d, "plane": arc_plane}
             return d
 
-        # 行程检查需要工件坐标系
+        # 行程检查需要已配置偏置的工件坐标系
         if self.state.wcs is None:
             self.all_moves_wcs_known = False
             issue_indexes.append(self._issue(
                 "UNKNOWN_WCS", pl,
-                "运动发生在 G54 建立之前，缺少工件坐标偏置映射，跳过行程检查",
-                _details({})))
+                "运动发生在 G54-G59 建立之前，缺少工件坐标偏置映射，"
+                "跳过行程检查",
+                _details({"reason": "wcs_not_established"})))
+        elif self._current_offset() is None:
+            # 引用了未配置偏置的坐标系：不沿用上一坐标系偏置，
+            # 相关机床坐标、行程及包围盒结论标为未知
+            self.all_moves_wcs_known = False
+            issue_indexes.append(self._issue(
+                "UNKNOWN_WCS", pl,
+                f"坐标系 {self.state.wcs} 未在机床配置 wcs_offsets 中设置"
+                "偏置；不沿用上一坐标系偏置，跳过行程检查，本段的机床坐标、"
+                "行程与包围盒结论标记为未知",
+                _details({"reason": "wcs_not_configured",
+                          "wcs": self.state.wcs})))
         else:
             for v in self._bounds_violations(points):
                 c = self.cfg
@@ -1852,7 +2023,8 @@ class Analyzer:
                     "OUT_OF_BOUNDS", pl,
                     f"{v['axis']} 轴机床坐标 {fmt_num(v['value_mm'])} mm 越出行程"
                     f"边界 {fmt_num(v['bound_mm'])} mm（超程 "
-                    f"{fmt_num(v['overshoot_mm'])} mm；已叠加 G54 偏置）",
+                    f"{fmt_num(v['overshoot_mm'])} mm；已叠加 "
+                    f"{self.state.wcs} 偏置）",
                     _details(v)))
             self._grow_bbox(points, machine=True)
 
@@ -1906,13 +2078,32 @@ class Analyzer:
 
     # -- 累计与输出 --------------------------------------------------------
 
+    def _wcs_path_stat(self) -> dict | None:
+        """当前坐标系的路径统计桶（未建立坐标系时不计）。"""
+        w = self.state.wcs
+        if w is None:
+            return None
+        return self.wcs_path.setdefault(
+            w, {"rapid": 0.0, "cutting": 0.0, "unknown_segments": 0})
+
+    def _note_unknown_length(self):
+        self.unknown_length_segments += 1
+        st = self._wcs_path_stat()
+        if st is not None:
+            st["unknown_segments"] += 1
+
     def _accumulate(self, motion_mode, segment):
         length = segment["length_mm"]
+        st = self._wcs_path_stat()
         if length is not None:
             if motion_mode == "rapid":
                 self.length_rapid += length
+                if st is not None:
+                    st["rapid"] += length
             else:
                 self.length_cutting += length
+                if st is not None:
+                    st["cutting"] += length
         arc = segment.get("arc")
         if arc is not None:
             st = self.arc_stats[arc["plane_code"]]
@@ -1936,7 +2127,7 @@ class Analyzer:
     def _finish_line(self, pl, type_, normalized, executed, segment=None,
                      physical_known=True, block_reason=None,
                      issue_indexes=None):
-        snap_out = self.state.snapshot()
+        snap_out = self._snapshot()
         entry = {
             "line_no": pl.line_no,
             "source_line": pl.source,
@@ -1964,47 +2155,25 @@ class Analyzer:
     def _segment_out(self, segment):
         if segment is None:
             return None
-        if segment.get("kind") == "canned_cycle":
-            return self._cycle_segment_out(segment)
+        off = self._current_offset()
         out = {
             "kind": segment["kind"],
+            "wcs": self.state.wcs,
+            "wcs_configured": off is not None,
+            "offset_mm": self._offset_out(off),
             "start_mm": [round6(v) for v in segment["start"]],
             "end_mm": [round6(v) for v in segment["end"]],
+            "start_machine_mm": self._machine_out(segment["start"], off),
+            "end_machine_mm": self._machine_out(segment["end"], off),
             "length_mm": round6(segment["length_mm"]),
             "points_mm": [[round6(c) for c in p] for p in segment["points"]],
+            "points_machine_mm": (
+                [self._machine_out(p, off) for p in segment["points"]]
+                if off is not None else None),
         }
         if "arc" in segment:
             out["arc"] = segment["arc"]
         return out
-
-    def _cycle_segment_out(self, segment) -> dict:
-        def move_out(mv):
-            return {
-                "action": mv.get("action"),
-                "motion": mv.get("motion"),
-                "internal_cycle": bool(mv.get("internal_cycle")),
-                "note": mv.get("note"),
-                "hole_no": mv.get("hole_no"),
-                "start_mm": list(mv["start_mm"]),
-                "end_mm": list(mv["end_mm"]),
-                "points_mm": [list(p) for p in mv["points_mm"]],
-                "length_mm": mv["length_mm"],
-                "dwell_s": mv.get("dwell_s"),
-            }
-
-        return {
-            "kind": "canned_cycle",
-            "cycle": segment["cycle"],
-            "hole_nos": segment["hole_nos"],
-            "start_mm": segment["start_mm"],
-            "length_mm": segment["length_mm"],
-            "rapid_length_mm": segment["rapid_length_mm"],
-            "cutting_length_mm": segment["cutting_length_mm"],
-            "drill_depth_mm": segment["drill_depth_mm"],
-            "dwell_s": segment["dwell_s"],
-            "holes": segment["holes"],
-            "moves_mm": [move_out(m) for m in segment["moves_mm"]],
-        }
 
     def _bbox_out(self, bmin, bmax):
         if any(math.isinf(v) for v in bmin):
@@ -2114,6 +2283,39 @@ class Analyzer:
         return {"by_plane": by_plane, "total": total,
                 "blocked_count": blocked}
 
+    def _wcs_out(self) -> dict:
+        """分工件坐标系汇总：偏置、路径长度、机床坐标包围盒与问题数。"""
+        issue_counts: dict[str, int] = {}
+        for iss in self.issues:
+            w = iss.details.get("wcs")
+            if w is not None:
+                issue_counts[w] = issue_counts.get(w, 0) + 1
+        by_wcs = {}
+        for w in sorted(self.wcs_used):
+            off = self.cfg.offset_for(w)
+            path = self.wcs_path.get(
+                w, {"rapid": 0.0, "cutting": 0.0, "unknown_segments": 0})
+            mb = self.wcs_mbbox.get(w)
+            by_wcs[w] = {
+                "configured": off is not None,
+                "offset_mm": self._offset_out(off),
+                "path_length_mm": {
+                    "rapid": round(path["rapid"], 6),
+                    "cutting": round(path["cutting"], 6),
+                    "total": round(path["rapid"] + path["cutting"], 6),
+                    "unknown_segments": path["unknown_segments"],
+                },
+                "machine_bbox_mm": (
+                    self._bbox_out(mb[0], mb[1]) if mb is not None else None),
+                "issues": issue_counts.get(w, 0),
+            }
+        return {
+            "offsets_mm": {w: dict(off) for w, off
+                           in sorted(self.cfg.wcs_offsets.items())},
+            "used": sorted(self.wcs_used),
+            "by_wcs": by_wcs,
+        }
+
     def _build_report(self, physical_lines: int) -> dict:
         counts = {s: 0 for s in SEVERITY_ORDER}
         for iss in self.issues:
@@ -2137,16 +2339,18 @@ class Analyzer:
                 "drill_cycle_groups": len(self.cycle_groups),
             },
             "machine": self.cfg.to_dict(),
-            "final_state": self.state.snapshot(),
+            "final_state": self._snapshot(),
             "drill_cycles": self._drill_cycles_out(),
             "arcs": self._arcs_out(),
+            "wcs": self._wcs_out(),
             "bbox_program_mm": self._bbox_out(self.bmin, self.bmax),
             "bbox_machine_mm": (
                 self._bbox_out(self.mbmin, self.mbmax)
                 if self.all_moves_wcs_known else None),
             "machine_bbox_note": (
                 None if self.all_moves_wcs_known
-                else "存在 G54 建立之前的运动，无法给出完整机床坐标包围盒"),
+                else "存在坐标系未建立或未配置偏置的运动，"
+                     "无法给出完整机床坐标包围盒"),
             "path_length_mm": {
                 "rapid": round(self.length_rapid, 6),
                 "cutting": round(self.length_cutting, 6),
@@ -2168,7 +2372,11 @@ class Analyzer:
                 "units": "G21=mm，G20=inch（内部乘 25.4 换算 mm）；"
                          "G20/G21 出现前的物理检查显式报 UNKNOWN_UNITS",
                 "distance": "G90 绝对 / G91 增量；未建立时位置标记未知",
-                "wcs": "仅支持 G54，偏置取自作业配置；G54 前跳过行程检查",
+                "wcs": "支持 G54-G59 模态切换，偏置取自机床配置 wcs_offsets"
+                       "（旧字段 offset_x/y/z 归入 G54）；换系时机床位置不动、"
+                       "工件坐标按新偏置重新换算；引用未配置偏置的坐标系时"
+                       "不沿用上一偏置，相关机床坐标/行程/包围盒结论标为未知；"
+                       "安全 Z 按当前工件坐标判定",
                 "arc": "G17(XY，默认)/G18(XZ)/G19(YZ) 模态平面；圆心词随平面 "
                        "I/J、I/K、J/K 或 R（R 负=优弧），垂直轴随扫角线性联动"
                        "（螺旋）；圆心词与 R 混用、圆心词不属于当前平面、"
@@ -2207,7 +2415,12 @@ DIALECT = {
         "G19": "圆弧平面 YZ，垂直联动轴 X",
         "G20": "英制单位", "G21": "公制单位",
         "G90": "绝对定位", "G91": "增量定位",
-        "G54": "工件坐标系 1（偏置由配置提供）",
+        "G54": "工件坐标系 1（偏置由配置 wcs_offsets 提供）",
+        "G55": "工件坐标系 2（偏置由配置 wcs_offsets 提供）",
+        "G56": "工件坐标系 3（同上）",
+        "G57": "工件坐标系 4（同上）",
+        "G58": "工件坐标系 5（同上）",
+        "G59": "工件坐标系 6（同上）",
         "G80": "取消固定钻孔循环",
         "G81": "钻孔循环（快速到 R，进给到孔底，快速退回）",
         "G82": "锪孔循环（同 G81，孔底暂停 P）",
@@ -2215,8 +2428,19 @@ DIALECT = {
         "G98": "固定循环后返回初始平面（默认）",
         "G99": "固定循环后返回 R 平面",
     },
-    "arcs": {
-        "planes": {
+    "wcs": {
+        "systems": list(WCS_NAMES),
+        "offsets": "每个坐标系的 X/Y/Z 偏置由机床配置 wcs_offsets 提供；"
+                   "旧字段 offset_x/offset_y/offset_z 归入 G54",
+        "switching": "G54-G59 为模态切换：换系时刀具的机床位置不动，"
+                     "工件坐标随新偏置重新换算；后续直线/圆弧/螺旋/固定"
+                     "钻孔循环都按当前坐标系生成机床轨迹",
+        "unconfigured": "程序引用未在 wcs_offsets 中设置偏置的坐标系时，"
+                        "不沿用上一坐标系偏置：报 UNKNOWN_WCS，跳过行程"
+                        "检查，相关机床坐标、行程及包围盒结论标为未知",
+        "safe_z": "安全 Z 始终按当前工件（程序）坐标判定",
+    },
+    "arcs": {        "planes": {
             "G17": "XY 平面（默认），圆心词 I/J，垂直联动轴 Z",
             "G18": "XZ 平面，圆心词 I/K，垂直联动轴 Y",
             "G19": "YZ 平面，圆心词 J/K，垂直联动轴 X",
@@ -2271,7 +2495,7 @@ DIALECT = {
                           "并整段阻断，不猜测执行",
     "unsupported_examples": [
         "G28/G30 回零",
-        "G40-G43 刀补", "G54.1/G55-G59 其他工件坐标系",
+        "G40-G43 刀补", "G54.1 附加工件坐标系",
         "G84-G89 其他固定循环（仅支持 G80-G83）",
         "M2/M30 程序结束", "M4 反转", "M6 换刀", "M7-M9 冷却",
         "T 刀号", "H/D 刀补号",

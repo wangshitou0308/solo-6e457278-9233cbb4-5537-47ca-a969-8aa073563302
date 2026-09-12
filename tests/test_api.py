@@ -37,7 +37,7 @@ M5
 G1 X10 Y10 F9000
 G2 X30 Y30 I0 J0
 G0 Z-5
-G55 X-
+G54.1 X-
 """
 
 GCODE_GOOD = """G21 G90 G54
@@ -143,6 +143,8 @@ class ApiTest(unittest.TestCase):
         self.assertTrue(h["offline"])
         _, d = self.req("GET", "/api/dialect")
         self.assertIn("G21", d["dialect"]["supported_g"])
+        self.assertIn("G55", d["dialect"]["supported_g"])
+        self.assertIn("G59", d["dialect"]["supported_g"])
         resp, text = self.req("GET", "/api/docs", raw=True)
         self.assertIn("text/markdown", resp.headers["Content-Type"])
         self.assertIn("G-code", text.decode())
@@ -150,7 +152,8 @@ class ApiTest(unittest.TestCase):
         names = [e["name"] for e in ex["examples"]]
         self.assertEqual(set(names),
                          {"safe_demo", "problems_demo", "inch_demo",
-                          "arc_demo", "plane_arc_demo", "drill_cycle_demo"})
+                          "arc_demo", "plane_arc_demo", "drill_cycle_demo",
+                          "wcs_demo"})
         resp, nc = self.req("GET", "/api/examples/safe_demo", raw=True)
         self.assertIn("attachment", resp.headers["Content-Disposition"])
         self.assertIn(b"G21", nc)
@@ -179,7 +182,7 @@ class ApiTest(unittest.TestCase):
         self.assertIn("SPINDLE_NOT_RUNNING", codes)
         self.assertIn("FEED_OVER_LIMIT", codes)
         self.assertIn("RAPID_BELOW_SAFE_Z", codes)
-        # G55 X-：残缺 + 未支持 同时出现
+        # G54.1 X-：残缺 + 未支持 同时出现
         self.assertIn("MALFORMED_LINE", codes)
         self.assertIn("UNSUPPORTED_INSTRUCTION", codes)
         line = [i for i in r["issues"] if i["code"] == "MALFORMED_LINE"][0]
@@ -233,7 +236,7 @@ class ApiTest(unittest.TestCase):
 
         # 原始 gcode
         resp, nc = self.req("GET", f"/api/jobs/{jid}/gcode", raw=True)
-        self.assertIn(b"G55", nc)
+        self.assertIn(b"G54.1", nc)
 
         # 未就绪 / 不存在
         self.req("GET", "/api/jobs/nope/report", expect=404)
@@ -468,6 +471,125 @@ class ApiTest(unittest.TestCase):
             "label_b": "bad", "gcode_b": bad})
         self.assertEqual(cmp2["arcs"]["by_plane"]["G18"]["introduced_issues"],
                          1)
+
+    def test_11_multi_wcs(self):
+        cfg = {"name": "wcs", "travel_x": [0, 300], "travel_y": [0, 200],
+               "travel_z": [-50, 60], "safe_z": 10,
+               "max_feed_mm_min": 3000, "max_spindle_rpm": 12000,
+               "wcs_offsets": {"G54": {"x": 0, "y": 0, "z": 0},
+                               "G55": {"x": 100, "y": 50, "z": 0}}}
+        nc = ("G21 G90 G54\nM3 S5000\nG0 Z20\nG0 X10 Y10\n"
+              "G1 Z-2 F300\nG1 X30 Y30 F600\nG0 Z20\n"
+              "G55\nG0 X10 Y10\nG1 Z-2 F300\nG1 X30 Y30 F600\n"
+              "G0 Z-1\nG0 Z20\n"
+              "G59\nG0 X0 Y0\nG1 Z-2 F300\nG1 X20 Y20 F600\nG0 Z20\n"
+              "G54\nG0 X0 Y0 Z50\nM5\n")
+        # 同步分析：分系统计、未配置坐标系、段级坐标系/偏置/机床坐标
+        _, r = self.req("POST", "/api/analyze", {"config": cfg, "gcode": nc})
+        self.assertEqual(r["wcs"]["used"], ["G54", "G55", "G59"])
+        self.assertEqual(r["wcs"]["offsets_mm"]["G55"],
+                         {"x": 100, "y": 50, "z": 0})
+        self.assertFalse(r["wcs"]["by_wcs"]["G59"]["configured"])
+        self.assertIsNone(r["wcs"]["by_wcs"]["G59"]["machine_bbox_mm"])
+        self.assertIsNone(r["bbox_machine_mm"])   # G59 未配置 -> 整体未知
+        self.assertIn("未配置", r["machine_bbox_note"])
+        unk = [i for i in r["issues"] if i["code"] == "UNKNOWN_WCS"]
+        self.assertTrue(unk)
+        self.assertTrue(all(i["details"]["wcs"] == "G59" for i in unk))
+        self.assertTrue(all(i["details"]["reason"] == "wcs_not_configured"
+                            for i in unk))
+        # G55 段带偏置与机床坐标；安全 Z 按工件坐标判定（G0 Z-1 告警）
+        seg55 = [t["segment"] for t in r["trajectory"]
+                 if (t.get("segment") or {}).get("wcs") == "G55"]
+        self.assertTrue(seg55)
+        self.assertTrue(all(s["offset_mm"] == {"x": 100, "y": 50, "z": 0}
+                            for s in seg55))
+        self.assertTrue(all(s["end_machine_mm"] is not None for s in seg55))
+        rsz = [i for i in r["issues"] if i["code"] == "RAPID_BELOW_SAFE_Z"]
+        self.assertEqual(len(rsz), 1)
+        self.assertEqual(rsz[0]["details"]["wcs"], "G55")
+        self.assertAlmostEqual(rsz[0]["details"]["ref_z_mm"], -1.0)
+
+        # 建作业走 filter_report：按坐标系筛选
+        _, job = self.req("POST", "/api/jobs", {"config": cfg, "gcode": nc},
+                          expect=202)
+        self.wait_job(job["id"])
+        _, f = self.req("GET", f"/api/jobs/{job['id']}/report?wcs=G55")
+        self.assertEqual(f["filter"]["wcs"], ["G55"])
+        self.assertEqual(list(f["wcs"]["by_wcs"]), ["G55"])
+        self.assertTrue(f["wcs"]["filtered"])
+        self.assertEqual([i["code"] for i in f["issues"]],
+                         ["RAPID_BELOW_SAFE_Z"])
+        segs = [t["segment"] for t in f["trajectory"] if t.get("segment")]
+        self.assertTrue(segs)
+        self.assertTrue(all(s["wcs"] == "G55" for s in segs))
+        # 未使用的坐标系补零值行；非法坐标系 400
+        _, f2 = self.req("GET", f"/api/jobs/{job['id']}/report?wcs=G56")
+        self.assertEqual(f2["wcs"]["by_wcs"]["G56"]["issues"], 0)
+        self.assertFalse(f2["wcs"]["by_wcs"]["G56"]["configured"])
+        self.req("GET", f"/api/jobs/{job['id']}/report?wcs=G60", expect=400)
+
+        # 固定循环分组按孔的坐标系裁剪
+        drill = ("G21 G90 G54\nM3 S3000\nG0 X0 Y0 Z20\n"
+                 "G81 R2 Z-5 F200\nX10\n"
+                 "G55\nX10\nX20\nG80\n")
+        _, jr = self.req("POST", "/api/analyze",
+                         {"config": cfg, "gcode": drill})
+        holes = [h["wcs"] for g in jr["drill_cycles"]["groups"]
+                 for h in g["holes"]]
+        self.assertEqual(holes, ["G54", "G54", "G55", "G55"])
+        _, jjob = self.req("POST", "/api/jobs",
+                           {"config": cfg, "gcode": drill}, expect=202)
+        self.wait_job(jjob["id"])
+        _, fd = self.req("GET", f"/api/jobs/{jjob['id']}/report?wcs=G55")
+        self.assertEqual(fd["drill_cycles"]["summary"]["holes_total"], 2)
+        self.assertTrue(all(h["wcs"] == "G55"
+                            for g in fd["drill_cycles"]["groups"]
+                            for h in g["holes"]))
+
+        # 对比：分坐标系的路径/问题/行程（机床包围盒）变化
+        _, cmp = self.req("POST", "/api/compare", {
+            "config": cfg, "label_a": "multi", "gcode_a": nc,
+            "label_b": "g54only",
+            "gcode_b": "G21 G90 G54\nM3 S5000\nG0 Z20\nG0 X10 Y10\n"
+                       "G1 Z-2 F300\nG1 X30 Y30 F600\nG0 Z20\nM5\n"})
+        self.assertIn("wcs", cmp)
+        g55 = cmp["wcs"]["by_wcs"]["G55"]
+        self.assertGreater(g55["baseline_path_mm"]["total"], 0)
+        self.assertEqual(g55["candidate_path_mm"]["total"], 0.0)
+        self.assertLess(g55["delta_path_mm"]["total"], 0)
+        self.assertIsNotNone(g55["baseline_machine_bbox_mm"])
+        self.assertIsNone(g55["candidate_machine_bbox_mm"])
+        g59 = cmp["wcs"]["by_wcs"]["G59"]
+        self.assertLess(g59["delta_issues"], 0)      # G59 的问题被解决
+        self.assertGreater(g59["resolved_issues"], 0)
+
+        # 配置校验：非法偏置定位到坐标系与字段
+        bad = dict(cfg, wcs_offsets={"G55": {"x": "oops"}})
+        _, err = self.req("POST", "/api/machines", bad, expect=400)
+        payload = json.loads(err)
+        self.assertEqual(payload["error"]["code"], "BAD_CONFIG")
+        self.assertTrue(any("wcs_offsets.G55.x" in e
+                            for e in payload["error"]["details"]["errors"]))
+
+        # 旧配置（仅 offset_x/y/z）归入 G54，已有作业可读取
+        legacy = {"name": "legacy", "travel_x": [0, 300],
+                  "travel_y": [0, 200], "travel_z": [-50, 60], "safe_z": 10,
+                  "max_feed_mm_min": 3000, "max_spindle_rpm": 12000,
+                  "offset_x": -5, "offset_y": 2, "offset_z": 1}
+        _, m = self.req("POST", "/api/machines", legacy, expect=201)
+        _, one = self.req("GET", f"/api/machines/{m['id']}")
+        self.assertEqual(one["config"]["wcs_offsets"]["G54"],
+                         {"x": -5.0, "y": 2.0, "z": 1.0})
+        _, rr = self.req("POST", "/api/analyze",
+                         {"machine_id": m["id"],
+                          "gcode": "G21 G90 G54\nG0 X0 Y0 Z20\n"})
+        self.assertEqual(rr["machine"]["wcs_offsets"]["G54"]["x"], -5.0)
+
+        # 多坐标系示例可下载
+        resp, nc_text = self.req("GET", "/api/examples/wcs_demo", raw=True)
+        self.assertIn("attachment", resp.headers["Content-Disposition"])
+        self.assertIn(b"G55", nc_text)
 
 
 if __name__ == "__main__":

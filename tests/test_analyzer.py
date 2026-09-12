@@ -54,13 +54,13 @@ class TestParser(unittest.TestCase):
         self.assertEqual(traj["state_out"]["unit"], "mm")
 
     def test_malformed_line_lists_unsupported(self):
-        report = analyze_program("G55 X-\n", cfg())
+        report = analyze_program("G60 X-\n", cfg())
         c = codes(report)
         self.assertIn("MALFORMED_LINE", c)
         self.assertIn("UNSUPPORTED_INSTRUCTION", c)
         unsup = [i for i in report["issues"]
                  if i["code"] == "UNSUPPORTED_INSTRUCTION"][0]
-        self.assertIn("G55", unsup["details"]["unsupported_tokens"])
+        self.assertIn("G60", unsup["details"]["unsupported_tokens"])
         # 整段阻断，状态无痕
         self.assertIsNone(report["final_state"]["unit"])
         traj = report["trajectory"][0]
@@ -659,6 +659,238 @@ class TestCompare(unittest.TestCase):
         self.assertEqual(dc["by_cycle"]["G83"]["candidate_blocked"], 1)
         self.assertIn("total_drill_depth_mm", dc["delta"])
         self.assertIn("expanded_path_total_mm", dc["delta"])
+
+
+class TestMultiWcs(unittest.TestCase):
+    """G54-G59 多工件坐标系：配置、模态切换、未配置坐标系、分系统计。"""
+
+    BASE = {
+        "name": "wcs-test",
+        "travel_x": [0, 300], "travel_y": [0, 200], "travel_z": [-50, 60],
+        "safe_z": 10, "max_feed_mm_min": 3000, "max_spindle_rpm": 12000,
+    }
+
+    def cfg_wcs(self):
+        return MachineConfig.from_dict(dict(
+            self.BASE,
+            wcs_offsets={"G54": {"x": 0, "y": 0, "z": 0},
+                         "G55": {"x": 100, "y": 50, "z": 0}}))
+
+    # -- 配置解析 ------------------------------------------------------------
+
+    def test_legacy_offsets_fold_into_g54(self):
+        c = MachineConfig.from_dict(dict(
+            self.BASE, offset_x=-5, offset_y=2, offset_z=1))
+        self.assertEqual(c.wcs_offsets["G54"], {"x": -5.0, "y": 2.0, "z": 1.0})
+        self.assertEqual((c.offset_x, c.offset_y, c.offset_z), (-5, 2, 1))
+        self.assertEqual(c.offset_for("G54"), (-5.0, 2.0, 1.0))
+        self.assertIsNone(c.offset_for("G56"))     # 未配置
+        self.assertIsNone(c.offset_for(None))
+        # to_dict 回读（已有作业的配置仍可读取）
+        c2 = MachineConfig.from_dict(c.to_dict())
+        self.assertEqual(c2.wcs_offsets["G54"]["x"], -5.0)
+
+    def test_explicit_g54_overrides_legacy(self):
+        c = MachineConfig.from_dict(dict(
+            self.BASE, offset_x=-5,
+            wcs_offsets={"G54": {"x": 7}, "G56": {"y": 3}}))
+        self.assertEqual(c.offset_x, 7.0)          # 显式 wcs_offsets.G54 优先
+        self.assertEqual(c.wcs_offsets["G54"], {"x": 7.0, "y": 0.0, "z": 0.0})
+        self.assertEqual(c.wcs_offsets["G56"], {"x": 0.0, "y": 3.0, "z": 0.0})
+
+    def test_invalid_offset_locates_wcs_and_field(self):
+        with self.assertRaises(ConfigError) as cm:
+            MachineConfig.from_dict(dict(
+                self.BASE, wcs_offsets={"G55": {"x": "abc"}}))
+        self.assertTrue(any("wcs_offsets.G55.x" in e
+                            for e in cm.exception.errors),
+                        cm.exception.errors)
+        # 未知坐标系名
+        with self.assertRaises(ConfigError) as cm2:
+            MachineConfig.from_dict(dict(
+                self.BASE, wcs_offsets={"G60": {"x": 1}}))
+        self.assertTrue(any("G60" in e for e in cm2.exception.errors))
+        # 未知字段
+        with self.assertRaises(ConfigError) as cm3:
+            MachineConfig.from_dict(dict(
+                self.BASE, wcs_offsets={"G54": {"w": 1}}))
+        self.assertTrue(any("wcs_offsets.G54" in e
+                            for e in cm3.exception.errors))
+
+    # -- 模态切换 ------------------------------------------------------------
+
+    def test_switch_recomputes_work_coords_machine_fixed(self):
+        nc = ("G21 G90 G54\n"
+              "G0 X10 Y20 Z30\n"   # 工件(10,20,30)，机床(10,20,30)
+              "G55\n"              # 机床不动 -> 工件(-90,-30,30)
+              "G0 X0 Y0\n")        # 工件(0,0,30) -> 机床(100,50,30)
+        r = analyze_program(nc, self.cfg_wcs())
+        self.assertEqual(codes(r), [])
+        sw = [t for t in r["trajectory"] if t["line_no"] == 3][0]
+        self.assertEqual(sw["type"], "setting")
+        self.assertEqual(sw["normalized"], "G55")
+        out = sw["state_out"]
+        self.assertEqual(out["wcs"], "G55")
+        self.assertEqual((out["x"]["value_mm"], out["y"]["value_mm"],
+                          out["z"]["value_mm"]), (-90.0, -30.0, 30.0))
+        self.assertEqual(out["wcs_offset_mm"], {"x": 100, "y": 50, "z": 0})
+        st = r["final_state"]
+        self.assertEqual(st["wcs"], "G55")
+        self.assertEqual((st["x"]["value_mm"], st["y"]["value_mm"]), (0, 0))
+        # 机床包围盒覆盖两个坐标系下的真实机床位置
+        self.assertEqual(r["bbox_machine_mm"]["x_mm"], [10.0, 100.0])
+        self.assertEqual(r["bbox_machine_mm"]["y_mm"], [20.0, 50.0])
+        self.assertEqual(r["bbox_machine_mm"]["z_mm"], [30.0, 30.0])
+
+    def test_segment_records_wcs_offset_and_machine_coords(self):
+        nc = ("G21 G90 G54\n"
+              "G0 X10 Y20 Z30\n"
+              "G55\n"
+              "G0 X0 Y0\n")
+        r = analyze_program(nc, self.cfg_wcs())
+        seg = [t for t in r["trajectory"] if t["line_no"] == 4][0]["segment"]
+        self.assertEqual(seg["wcs"], "G55")
+        self.assertTrue(seg["wcs_configured"])
+        self.assertEqual(seg["offset_mm"], {"x": 100, "y": 50, "z": 0})
+        self.assertEqual(seg["start_mm"], [-90.0, -30.0, 30.0])
+        self.assertEqual(seg["end_mm"], [0.0, 0.0, 30.0])
+        self.assertEqual(seg["start_machine_mm"], [10.0, 20.0, 30.0])
+        self.assertEqual(seg["end_machine_mm"], [100.0, 50.0, 30.0])
+        self.assertEqual(seg["points_machine_mm"][1], [100.0, 50.0, 30.0])
+        # G54 段
+        seg54 = [t for t in r["trajectory"] if t["line_no"] == 2][0]["segment"]
+        self.assertEqual(seg54["wcs"], "G54")
+        self.assertEqual(seg54["end_machine_mm"], [10.0, 20.0, 30.0])
+
+    def test_out_of_bounds_uses_current_wcs_offset(self):
+        # G55 偏置 (100,50,0)：工件 X250 -> 机床 X350 越出 x_max=300
+        r = analyze_program(
+            "G21 G90 G55\nG0 X250 Y0 Z20\n", self.cfg_wcs())
+        oob = [i for i in r["issues"] if i["code"] == "OUT_OF_BOUNDS"]
+        self.assertEqual(len(oob), 1)
+        self.assertEqual(oob[0]["details"]["axis"], "X")
+        self.assertAlmostEqual(oob[0]["details"]["value_mm"], 350.0)
+        self.assertEqual(oob[0]["details"]["wcs"], "G55")
+        self.assertIn("G55", oob[0]["basis"])
+
+    # -- 未配置坐标系 ----------------------------------------------------------
+
+    def test_unconfigured_wcs_marks_machine_unknown(self):
+        nc = ("G21 G90 G55\n"        # G55 已配置 (100,50,0)
+              "G0 X10 Y10 Z20\n"
+              "G56\n"               # G56 未配置偏置
+              "G0 X250 Y10 Z20\n"   # 若沿用 G55 偏置 -> 机床 X350 越界
+              "G0 X200 Y0\n")
+        r = analyze_program(nc, self.cfg_wcs())
+        c = codes(r)
+        self.assertIn("UNKNOWN_WCS", c)
+        self.assertNotIn("OUT_OF_BOUNDS", c)   # 不沿用上一偏置
+        unk = [i for i in r["issues"] if i["code"] == "UNKNOWN_WCS"]
+        self.assertTrue(all(i["details"]["reason"] == "wcs_not_configured"
+                            for i in unk))
+        self.assertTrue(all(i["details"]["wcs"] == "G56" for i in unk))
+        # 机床包围盒整体不可用并说明原因
+        self.assertIsNone(r["bbox_machine_mm"])
+        self.assertIn("未配置", r["machine_bbox_note"])
+        # 分系统计：G56 未配置、机床包围盒未知，但工件路径仍累计
+        g56 = r["wcs"]["by_wcs"]["G56"]
+        self.assertFalse(g56["configured"])
+        self.assertIsNone(g56["offset_mm"])
+        self.assertIsNone(g56["machine_bbox_mm"])
+        self.assertEqual(g56["issues"], 2)
+        self.assertAlmostEqual(g56["path_length_mm"]["rapid"],
+                               (50 ** 2 + 10 ** 2) ** 0.5, places=4)
+        self.assertEqual(g56["path_length_mm"]["unknown_segments"], 1)
+        # G55 段机床包围盒正常
+        g55 = r["wcs"]["by_wcs"]["G55"]
+        self.assertTrue(g55["configured"])
+        self.assertEqual(g55["machine_bbox_mm"]["x_mm"], [110.0, 110.0])
+        # 未配置坐标系段的机床坐标为 null
+        seg = [t for t in r["trajectory"] if t["line_no"] == 5][0]["segment"]
+        self.assertEqual(seg["wcs"], "G56")
+        self.assertFalse(seg["wcs_configured"])
+        self.assertIsNone(seg["offset_mm"])
+        self.assertIsNone(seg["end_machine_mm"])
+        self.assertIsNone(seg["points_machine_mm"])
+
+    def test_wcs_report_section(self):
+        nc = ("G21 G90 G54\nM3 S1000\nG0 X0 Y0 Z20\nG1 X10 F500\n"
+              "G55\nG0 X0 Y0\nG1 X5 F500\n")
+        r = analyze_program(nc, self.cfg_wcs())
+        w = r["wcs"]
+        self.assertEqual(w["used"], ["G54", "G55"])
+        self.assertEqual(w["offsets_mm"]["G55"], {"x": 100, "y": 50, "z": 0})
+        self.assertGreater(w["by_wcs"]["G54"]["path_length_mm"]["cutting"], 0)
+        self.assertGreater(w["by_wcs"]["G55"]["path_length_mm"]["total"], 0)
+        # 分系路径合计 = 全局
+        tot = sum(w["by_wcs"][k]["path_length_mm"]["total"]
+                  for k in ("G54", "G55"))
+        self.assertAlmostEqual(tot, r["path_length_mm"]["total"], places=6)
+
+    # -- 圆弧 / 螺旋 / 固定循环按当前坐标系生成机床轨迹 -------------------------
+
+    def test_arc_machine_bbox_uses_current_offset(self):
+        nc = ("G21 G90 G55\nM3 S1000\nG0 X0 Y0 Z20\n"
+              "G2 X0 Y0 I10 J0 F500\n")   # 整圆：工件 x[0,20] y[-10,10]
+        r = analyze_program(nc, self.cfg_wcs())
+        self.assertEqual(codes(r), [])
+        self.assertEqual(r["bbox_machine_mm"]["x_mm"], [100.0, 120.0])
+        self.assertEqual(r["bbox_machine_mm"]["y_mm"], [40.0, 60.0])
+        seg = [t for t in r["trajectory"]
+               if t.get("segment", {}).get("arc")][0]["segment"]
+        self.assertEqual(seg["wcs"], "G55")
+        self.assertIsNotNone(seg["points_machine_mm"])
+
+    def test_cycle_under_g55(self):
+        nc = ("G21 G90 G55\nM3 S3000\nG0 X0 Y0 Z20\n"
+              "G81 R2 Z-5 F200\nX10\nG80\n")
+        r = analyze_program(nc, self.cfg_wcs())
+        self.assertEqual(codes(r), [])
+        holes = r["drill_cycles"]["groups"][0]["holes"]
+        self.assertEqual([h["wcs"] for h in holes], ["G55", "G55"])
+        self.assertEqual(holes[0]["machine_x_mm"], 100.0)
+        self.assertEqual(holes[1]["machine_x_mm"], 110.0)
+        # 循环段与展开动作带坐标系与机床坐标
+        seg = [t for t in r["trajectory"]
+               if (t.get("segment") or {}).get("kind")
+               == "canned_cycle"][0]["segment"]
+        self.assertEqual(seg["wcs"], "G55")
+        mv = seg["moves_mm"][0]
+        self.assertIn("start_machine_mm", mv)
+        self.assertEqual(mv["start_machine_mm"][0],
+                         mv["start_mm"][0] + 100)
+        # 机床包围盒含 G55 偏置后的孔位
+        self.assertEqual(r["bbox_machine_mm"]["x_mm"], [100.0, 110.0])
+        # 分系统计含循环展开路径
+        g55 = r["wcs"]["by_wcs"]["G55"]
+        self.assertGreater(g55["path_length_mm"]["cutting"], 0)
+
+    def test_safe_z_judged_in_current_work_coords(self):
+        # G55 Z 偏置 +20：工件 Z5（机床 Z25）仍按工件坐标判定低于 safe_z=10
+        c = MachineConfig.from_dict(dict(
+            self.BASE, wcs_offsets={"G55": {"x": 0, "y": 0, "z": 20}}))
+        r = analyze_program(
+            "G21 G90 G55\nG0 X0 Y0 Z20\nG0 Z5\n", c)
+        iss = [i for i in r["issues"] if i["code"] == "RAPID_BELOW_SAFE_Z"]
+        self.assertEqual(len(iss), 1)
+        self.assertAlmostEqual(iss[0]["details"]["ref_z_mm"], 5.0)
+        self.assertEqual(iss[0]["details"]["wcs"], "G55")
+
+    # -- 对比 ------------------------------------------------------------------
+
+    def test_compare_wcs_section(self):
+        a = "G21 G90 G54\nM3 S1000\nG0 X0 Y0 Z20\nG1 X10 F500\n"
+        b = ("G21 G90 G54\nM3 S1000\nG0 X0 Y0 Z20\nG1 X10 F500\n"
+             "G55\nG0 X0 Y0\nG1 X5 F500\n")
+        cmp = compare_reports(analyze_program(a, self.cfg_wcs()),
+                              analyze_program(b, self.cfg_wcs()), "a", "b")
+        g55 = cmp["wcs"]["by_wcs"]["G55"]
+        self.assertEqual(g55["baseline_path_mm"]["total"], 0.0)
+        self.assertGreater(g55["candidate_path_mm"]["total"], 0.0)
+        self.assertGreater(g55["delta_path_mm"]["total"], 0)
+        self.assertIsNotNone(g55["candidate_machine_bbox_mm"])
+        self.assertIsNone(g55["baseline_machine_bbox_mm"])
+        self.assertIn("total", cmp["wcs"])
 
 
 class TestCannedCycles(unittest.TestCase):

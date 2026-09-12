@@ -17,7 +17,7 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 |---|---|
 | 单位 | `G21` 公制 mm、`G20` 英制 inch（内部 ×25.4 换算 mm） |
 | 定位 | `G90` 绝对、`G91` 增量 |
-| 坐标系 | `G54`（偏置 X/Y/Z 由机床配置提供，叠加后做行程检查） |
+| 坐标系 | `G54`-`G59`（各坐标系 X/Y/Z 偏置由机床配置 `wcs_offsets` 分别提供，叠加后做行程检查） |
 | 平面 | `G17` XY（上电默认，联动轴 Z）、`G18` XZ（联动轴 Y）、`G19` YZ（联动轴 X），模态保持 |
 | 运动 | `G0` 快速、`G1` 直线、`G2` 顺圆、`G3` 逆圆（当前平面内插补） |
 | 固定循环 | `G80` 取消、`G81` 钻孔、`G82` 锪孔（`P` 孔底暂停）、`G83` 深孔啄钻（`Q` 分步）；`G98` 返回初始平面（默认）、`G99` 返回 R 平面；`R` R 平面、`L` 重复孔位；**仅允许在 `G17` 平面展开** |
@@ -25,6 +25,26 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 | 工艺 | `F` 进给（按当前单位换算 mm/min）、`S` 主轴转速 rpm |
 | 主轴 | `M3` 正转启动、`M5` 停止 |
 | 词 | `X Y Z`、`I J K`（圆弧圆心）、`Q P L`（固定循环）、`N` 行号（忽略）；注释 `(...)` 与 `;...` |
+
+### 工件坐标系（G54-G59）口径
+
+- `G54`-`G59` 为**模态**切换，每个坐标系的 X/Y/Z 偏置在机床配置
+  **`wcs_offsets`** 中分别设置；旧字段 `offset_x/offset_y/offset_z` 归入
+  `G54`（显式 `wcs_offsets.G54` 优先），已有配置与作业可直接读取。
+- **换系时刀具的机床位置不动**，工件坐标随新偏置重新换算
+  （`新工件坐标 = 旧工件坐标 + 旧偏置 - 新偏置`）；后续直线、圆弧、
+  螺旋和固定钻孔循环都按当前坐标系生成机床轨迹，安全 Z 仍按当前
+  工件坐标判定。
+- 程序引用**未配置偏置**的坐标系时**不沿用上一偏置**：报
+  `UNKNOWN_WCS`（`details.reason=wcs_not_configured`），跳过行程检查，
+  相关机床坐标、行程及包围盒结论标为未知（`bbox_machine_mm=null`，
+  分工坐标系统计中该坐标系 `machine_bbox_mm=null`）。
+- 每段轨迹记录 `wcs`、`offset_mm`、工件坐标（`start_mm/end_mm/points_mm`）
+  与机床坐标（`start_machine_mm/end_machine_mm/points_machine_mm`，
+  偏置未知时为 `null`）；固定循环的每个孔记录 `wcs` 与孔位机床坐标
+  （`machine_x_mm/machine_y_mm`），每个展开动作带机床坐标。
+- 偏置值非法时配置校验会**定位到坐标系与字段**，如
+  `wcs_offsets.G55.x 必须是数值`。
 
 ### 圆弧与螺旋插补口径
 
@@ -72,8 +92,8 @@ python3 -m gcode_checker --verbose       # 打印访问日志
   主轴未转/无进给等工艺问题按**触发行**去重（一个 G83 孔只报一次）。
 
 **未支持示例**（遇到即 `UNSUPPORTED_INSTRUCTION`，整段不执行、不改模态）：
-`G28/30、G40-G43、G54.1/G55-G59、G84-G89、M2/M30、M4、M6、M7-M9、T/H/D` 等。
-无法解析的残片（如 `X-`）报 `MALFORMED_LINE`；若同行还有未支持词（如 `G55 X-`），
+`G28/30、G40-G43、G54.1、G84-G89、M2/M30、M4、M6、M7-M9、T/H/D` 等。
+无法解析的残片（如 `X-`）报 `MALFORMED_LINE`；若同行还有未支持词（如 `G54.1 X-`），
 两类问题都会列出。
 
 ## 3. 机床配置字段
@@ -85,12 +105,20 @@ python3 -m gcode_checker --verbose       # 打印访问日志
   "safe_z": 10,
   "max_feed_mm_min": 3000,
   "max_spindle_rpm": 12000,
-  "offset_x": -150, "offset_y": -100, "offset_z": 0
+  "offset_x": -150, "offset_y": -100, "offset_z": 0,
+  "wcs_offsets": {
+    "G54": {"x": -150, "y": -100, "z": 0},
+    "G55": {"x": 50, "y": 20, "z": -5}
+  }
 }
 ```
 
 - `travel_*` 也可写成正数标量表示 `[0, v]`；或直接给 `x_min/x_max/y_min/...`。
-- 工件坐标 → 机床坐标：`machine = program + offset`。
+- 工件坐标 → 机床坐标：`machine = program + 当前坐标系偏置`。
+- `wcs_offsets` 分别设置 `G54`-`G59` 的 X/Y/Z 偏置（缺省轴按 0）；
+  旧字段 `offset_x/offset_y/offset_z` 归入 `G54`（显式 `wcs_offsets.G54`
+  优先），未出现在 `wcs_offsets` 中的坐标系视为**未配置**。
+- 偏置非法时按坐标系与字段报错，如 `wcs_offsets.G55.x 必须是数值`。
 - `safe_z` 按**工件（程序）坐标**判定快速移动。
 
 ## 4. 接口
@@ -103,7 +131,7 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 | GET | `/api/dialect` | 支持的指令、问题代码、严重度表 |
 | GET | `/api/docs` | 本文档（Markdown） |
 | GET | `/api/examples` | 内置示例 .nc 清单 |
-| GET | `/api/examples/<name>` | 下载示例（safe_demo/problems_demo/inch_demo/arc_demo/plane_arc_demo/drill_cycle_demo） |
+| GET | `/api/examples/<name>` | 下载示例（safe_demo/problems_demo/inch_demo/arc_demo/plane_arc_demo/wcs_demo/drill_cycle_demo） |
 
 ### 机床配置
 
@@ -137,7 +165,10 @@ python3 -m gcode_checker --verbose       # 打印访问日志
   - `plane=G17,G18`：按圆弧平面筛选（G17/G18/G19）；只保留带平面信息的
     问题（弧段的越界/主轴/进给、圆弧无解、循环平面限制），轨迹中其他
     平面的弧段条目被剔除，`arcs` 汇总与风险计数随之重算
-  - `trajectory=0`：省略逐行轨迹以减小响应；`trajectory=all`：循环/平面筛选时保留完整轨迹
+  - `wcs=G54,G55`：按工件坐标系筛选（G54-G59）；只保留该坐标系下产生的
+    问题与轨迹段（无轨迹段的设定/注释行保留），`wcs` 汇总节只保留命中
+    坐标系，固定循环分组按孔的 `wcs` 裁剪，风险计数随之重算
+  - `trajectory=0`：省略逐行轨迹以减小响应；`trajectory=all`：循环/平面/坐标系筛选时保留完整轨迹
 
   指定 `cycle`/`hole_*` 后，报告中的 `drill_cycles`（groups、by_cycle、
   summary 的孔数/钻深/暂停/展开路径）与逐行轨迹的孔及动作（含孔间定位）
@@ -174,7 +205,8 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 （总计及按 G81/G82/G83 分类的 `by_cycle`），在 `arcs` 中汇总
 各平面（G17/G18/G19）的弧段数、弧长、螺旋段数与阻断弧数的增减，
 以及该平面问题的新增（`introduced_issues`）/解决（`resolved_issues`）/
-净变化（`delta_issues`）。
+净变化（`delta_issues`），并在 `wcs` 中汇总各工件坐标系（G54-G59）的
+路径长度、机床坐标包围盒（行程占用）与问题的新增/解决/净变化。
 - `GET /api/comparisons` / `GET /api/comparisons/<id>`：读取保存的对比。
 
 ## 5. 报告结构
@@ -199,6 +231,19 @@ python3 -m gcode_checker --verbose       # 打印访问日志
     "total": { "count": 4, "arc_length_mm": …, "length_3d_mm": …,
                "helical_count": 2, "full_circle_count": 1 },
     "blocked_count": 1 },
+  "wcs": {
+    "offsets_mm": { "G54": {"x":-150,"y":-100,"z":0}, "G55": {…} },
+    "used": ["G54", "G55"],
+    "by_wcs": {
+      "G54": { "configured": true, "offset_mm": {"x":-150,"y":-100,"z":0},
+        "path_length_mm": {"rapid":…,"cutting":…,"total":…,
+                           "unknown_segments":0},
+        "machine_bbox_mm": { …该坐标系下机床坐标包围盒… },
+        "issues": 2 },
+      "G59": { "configured": false, "offset_mm": null,
+        "path_length_mm": {…}, "machine_bbox_mm": null, "issues": 3 }
+    }
+  },
   "drill_cycles": {
     "summary": { "cycle_groups": 2, "holes_total": 9, "holes_drilled": 8,
       "holes_blocked": 1, "total_drill_depth_mm": 63.0, "total_dwell_s": 0.5,
@@ -212,7 +257,7 @@ python3 -m gcode_checker --verbose       # 打印访问日志
   },
   "bbox_program_mm": { "x_mm": [0, 90], "y_mm": […], "z_mm": […],
                        "size_mm": [90, 20, 52] },
-  "bbox_machine_mm": { …叠加偏置后的机床坐标包围盒… },
+  "bbox_machine_mm": { …叠加当前坐标系偏置后的机床坐标包围盒… },
   "path_length_mm": { "rapid": 123.4, "cutting": 88.1,
                       "total": 211.5, "reliable": true, "unknown_segments": 0,
                       "canned_cycle_rapid": 40.2, "canned_cycle_cutting": 33.0 },
@@ -233,7 +278,9 @@ python3 -m gcode_checker --verbose       # 打印访问日志
   "status": "drilled",                 // drilled | blocked
   "trigger_line_no": 5, "trigger_source_line": "X20 Y0",
   "definition_line_no": 4,
+  "wcs": "G54",                        // 触发孔时的工件坐标系
   "x_mm": 20, "y_mm": 0,
+  "machine_x_mm": -130, "machine_y_mm": -100,   // 孔位机床坐标（偏置未知为 null）
   "initial_plane_z_mm": 20, "r_plane_z_mm": 2, "z_bottom_mm": -11,
   "return_plane": "G99", "retract_z_mm": 2,
   "drill_depth_mm": 13, "dwell_s": 0,
@@ -271,7 +318,7 @@ python3 -m gcode_checker --verbose       # 打印访问日志
   "state_out": { …离开本行的完整模态快照… },
   "basis": "X 轴机床坐标 170 mm 越出行程边界 150 mm（超程 20 mm；已叠加 G54 偏置）",
   "details": { "axis": "X", "value_mm": 170, "bound_mm": 150,
-               "overshoot_mm": 20, "side": "max" }
+               "overshoot_mm": 20, "side": "max", "wcs": "G54" }
 }
 ```
 
@@ -289,9 +336,15 @@ python3 -m gcode_checker --verbose       # 打印访问日志
   "issue_codes": ["…"],
   "segment": {
     "kind": "arc_cw",
+    "wcs": "G55",                       // 本段所属的工件坐标系
+    "wcs_configured": true,
+    "offset_mm": {"x": 50, "y": 20, "z": -5},
     "start_mm": [10, 10, -2], "end_mm": [50, 20, -2],
+    "start_machine_mm": [60, 30, -7],   // 叠加当前坐标系偏置的机床坐标
+    "end_machine_mm": [100, 40, -7],    // （偏置未知时这些机床坐标为 null）
     "length_mm": 32.1,
     "points_mm": [ …离散轨迹（直线取端点，圆弧自动加密）… ],
+    "points_machine_mm": [ …对应的机床坐标轨迹… ],
     "arc": { "plane": "G17(XY)", "plane_code": "G17", "direction": "CW",
              "programming": "I/J",
              "center_mm": [20, 10], "center_axes": ["X", "Y"],
@@ -310,7 +363,7 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 | `MALFORMED_LINE` | critical | 残片/非法数字（如 `X-`），整段阻断 |
 | `UNSUPPORTED_INSTRUCTION` | error | 不在方言表内的指令/地址词，整段阻断 |
 | `ARC_NO_SOLUTION` | critical | 圆心词与 R 混用、圆心词不属于当前平面、R 编程整圆、起终半径不一致、半径 0、弦长 > 2R 等；整段阻断并回滚本行模态 |
-| `OUT_OF_BOUNDS` | critical | 轨迹上任意点（圆弧取真实弧线极值点）叠加 G54 偏置后越出行程 |
+| `OUT_OF_BOUNDS` | critical | 轨迹上任意点（圆弧取真实弧线极值点）叠加当前坐标系偏置后越出行程 |
 | `RAPID_BELOW_SAFE_Z` | error | G0 轨迹上任意点 Z < safe_z（工件坐标） |
 | `SPINDLE_NOT_RUNNING` | error | G1/G2/G3 切削时 `spindle_on=false` |
 | `FEED_OVER_LIMIT` | error | F（换算 mm/min）> max_feed_mm_min |
@@ -319,7 +372,7 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 | `NO_MOTION_MODE` | warning | 有轴词但没有任何 G0-G3 模态（不猜测运动） |
 | `UNKNOWN_UNITS` | warning | G20/G21 建立前出现 F 或运动，位置标记未知 |
 | `UNKNOWN_DISTANCE_MODE` | warning | G90/G91 建立前出现轴坐标，位置标记未知 |
-| `UNKNOWN_WCS` | warning | G54 建立前运动：跳过行程检查，机床包围盒不可用 |
+| `UNKNOWN_WCS` | warning | G54-G59 建立前运动，或引用了未配置偏置的坐标系：跳过行程检查，机床包围盒不可用 |
 | `CYCLE_MISSING_PARAMS` | error | 循环首次启用缺 Z/R（G83 还需正 Q），对应孔阻断、模态可补齐 |
 | `CYCLE_BAD_PARAM` | error | G83 的 Q<=0、P 为负、L 非正整数，对应孔阻断 |
 | `CYCLE_PLANE_CONFLICT` | error | 孔底高于 R 平面，对应孔阻断 |
@@ -339,8 +392,11 @@ python3 -m gcode_checker --verbose       # 打印访问日志
    该段不进入包围盒/长度/行程统计，并给出对应 warning。
 4. **路径长度**：仅累计物理已知段；圆弧按弧长（含垂直轴联动的三维螺旋
    长度），直线按 3D 弦长。`reliable=false` 时报告会标注存在未知段。
-5. **安全 Z 按工件坐标**判定；**行程按机床坐标**（叠加 G54 偏置）判定；
+5. **安全 Z 按工件坐标**判定；**行程按机床坐标**（叠加当前坐标系偏置）判定；
    圆弧的包围盒与行程检查按真实弧线极值点（端点 + 扫过的象限角）计算。
+   **坐标系切换**（G54-G59）时机床位置不动、工件坐标按新偏置重新换算；
+   引用未配置偏置的坐标系时不沿用上一偏置，相关机床坐标/行程/包围盒
+   结论标为未知。
 6. **固定循环**：循环参数非法/缺项只阻断对应孔并写明依据，不产生位移、
    不改写程序；固定循环仅允许在 `G17` 平面展开（`G18/G19` 下对应孔阻断）；
    G83 内部排屑快速动作豁免安全 Z 告警，孔间定位仍检查；
@@ -350,10 +406,11 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 ## 8. curl 快速上手
 
 ```bash
-# 1) 建配置
+# 1) 建配置（含 G54/G55 两套工件坐标偏置）
 curl -s localhost:8080/api/machines -H 'Content-Type: application/json' -d '{
   "name":"demo", "travel_x":[0,300], "travel_y":[0,200], "travel_z":[-100,0],
-  "safe_z":10, "max_feed_mm_min":3000, "max_spindle_rpm":12000}'
+  "safe_z":10, "max_feed_mm_min":3000, "max_spindle_rpm":12000,
+  "wcs_offsets":{"G54":{"x":0,"y":0,"z":0},"G55":{"x":100,"y":50,"z":0}}}'
 
 # 2) 下载示例并建作业（含钻孔循环示例 drill_cycle_demo）
 curl -s localhost:8080/api/examples/problems_demo -o problems.nc
@@ -378,5 +435,9 @@ curl -s localhost:8080/api/examples/drill_cycle_demo -o drill.nc
 
 # 5) 多平面圆弧与螺旋插补示例（G17/G18/G19、I/J、I/K、J/K、R、联动轴）
 curl -s localhost:8080/api/examples/plane_arc_demo -o planes.nc
+
+# 6) 多工件坐标系示例（G54/G55 切换、G59 未配置），按坐标系筛选报告
+curl -s localhost:8080/api/examples/wcs_demo -o wcs.nc
+curl -s 'localhost:8080/api/jobs/<id>/report?wcs=G55'
 ```
 """
