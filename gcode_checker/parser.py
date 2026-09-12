@@ -21,6 +21,9 @@ SUPPORTED_G = {
     "17": "plane_xy",    # 圆弧平面 XY（联动轴 Z）
     "18": "plane_xz",    # 圆弧平面 XZ（联动轴 Y）
     "19": "plane_yz",    # 圆弧平面 YZ（联动轴 X）
+    "43": "tool_len_plus",   # 刀长补偿：主轴基准点 + H 偏置（加）
+    "44": "tool_len_minus",  # 刀长补偿：主轴基准点 - H 偏置（减）
+    "49": "tool_len_cancel",  # 取消刀长补偿
     "20": "inch",        # 英制
     "21": "mm",          # 公制
     "90": "absolute",    # 绝对定位

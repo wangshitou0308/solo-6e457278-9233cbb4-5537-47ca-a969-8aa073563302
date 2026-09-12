@@ -1030,5 +1030,239 @@ class TestCannedCycles(unittest.TestCase):
         self.assertIsNone(r2["final_state"]["motion_mode"])
 
 
+def lcfg(**offsets):
+    base = {
+        "name": "lcomp",
+        "travel_x": [0, 300], "travel_y": [0, 200], "travel_z": [-50, 60],
+        "safe_z": 10, "max_feed_mm_min": 3000, "max_spindle_rpm": 12000,
+        "offset_x": 0, "offset_y": 0, "offset_z": 0,
+        "length_offsets": offsets or {"1": 10.0, "2": -3.0, "3": 2.0},
+    }
+    return MachineConfig.from_dict(base)
+
+
+class TestLengthCompensationConfig(unittest.TestCase):
+    def test_offset_table_normalized_int_keys(self):
+        c = lcfg()
+        self.assertEqual(c.length_offsets, {1: 10.0, 2: -3.0, 3: 2.0})
+        self.assertEqual(c.length_offset_for(1), 10.0)
+        # 接受 "H1" 形式的键
+        c2 = MachineConfig.from_dict({
+            "name": "x", "travel_x": [0, 1], "travel_y": [0, 1],
+            "travel_z": [0, 1], "safe_z": 0, "max_feed_mm_min": 1,
+            "max_spindle_rpm": 1, "length_offsets": {"H7": 2.5}})
+        self.assertEqual(c2.length_offsets, {7: 2.5})
+        # to_dict 输出字符串键
+        self.assertEqual(c.to_dict()["length_offsets"],
+                         {"1": 10.0, "2": -3.0, "3": 2.0})
+
+    def test_bad_h_number_locates_field(self):
+        for bad in ("0", "H0", "-1", "1.5", "abc"):
+            with self.assertRaises(ConfigError) as cm:
+                MachineConfig.from_dict({
+                    "name": "x", "travel_x": [0, 1], "travel_y": [0, 1],
+                    "travel_z": [0, 1], "safe_z": 0, "max_feed_mm_min": 1,
+                    "max_spindle_rpm": 1,
+                    "length_offsets": {bad: 1.0}})
+            self.assertTrue(
+                any("H 号必须为正整数" in e for e in cm.exception.errors),
+                bad)
+
+    def test_bad_offset_value_locates_field(self):
+        with self.assertRaises(ConfigError) as cm:
+            MachineConfig.from_dict({
+                "name": "x", "travel_x": [0, 1], "travel_y": [0, 1],
+                "travel_z": [0, 1], "safe_z": 0, "max_feed_mm_min": 1,
+                "max_spindle_rpm": 1,
+                "length_offsets": {"3": "abc"}})
+        self.assertTrue(any("length_offsets.H3 必须是数值" in e
+                            for e in cm.exception.errors))
+
+    def test_non_object_table_rejected(self):
+        with self.assertRaises(ConfigError) as cm:
+            MachineConfig.from_dict({
+                "name": "x", "travel_x": [0, 1], "travel_y": [0, 1],
+                "travel_z": [0, 1], "safe_z": 0, "max_feed_mm_min": 1,
+                "max_spindle_rpm": 1, "length_offsets": [1, 2]})
+        self.assertTrue(any("length_offsets 必须是对象" in e
+                            for e in cm.exception.errors))
+
+
+class TestLengthCompensation(unittest.TestCase):
+    HEADER = "G21 G90 G54\nM3 S6000\nG0 X0 Y0 Z20\n"
+
+    def test_comp_only_line_keeps_spindle_fixed_recomputes_tip(self):
+        # G43 H1=10：主轴基准点保持 Z20，刀尖 20 -> 10
+        r = analyze_program(self.HEADER + "G43 H1\n", lcfg())
+        st = r["final_state"]
+        self.assertEqual(st["z"]["value_mm"], 10.0)
+        self.assertEqual(st["tool_length_compensation"]["h"], 1)
+        ev = r["length_compensation"]["events"][0]
+        self.assertEqual(ev["tip_z_workpiece_mm"], 10.0)
+        self.assertEqual(ev["spindle_z_machine_mm"], 20.0)
+        self.assertTrue(ev["tip_z_recomputed"])
+        e = [x for x in r["trajectory"] if x["type"] == "length_compensation"][0]
+        self.assertEqual(e["normalized"], "G43 H1")
+
+    def test_g44_minus_and_g49_cancel(self):
+        # G44 H2，表值 -3：代数补偿 = -(-3) = +3；刀尖 20 -> 17
+        r = analyze_program(
+            self.HEADER + "G44 H2\nG49\n", lcfg())
+        st = r["final_state"]
+        self.assertEqual(st["z"]["value_mm"], 20.0)   # 取消后基准仍 20
+        self.assertFalse(st["tool_length_compensation"]["active"])
+        ev44, ev49 = r["length_compensation"]["events"]
+        self.assertEqual(ev44["signed_offset_mm"], 3.0)
+        self.assertEqual(ev44["tip_z_workpiece_mm"], 17.0)
+        self.assertEqual(ev44["spindle_z_machine_mm"], 20.0)
+        self.assertEqual(ev49["tip_z_workpiece_mm"], 20.0)
+        self.assertEqual(ev49["spindle_z_machine_mm"], 20.0)
+
+    def test_same_line_motion_uses_new_compensation(self):
+        # 起点补偿 0、终点补偿 +10：刀尖 Z-2，主轴基准 Z8
+        r = analyze_program(
+            self.HEADER + "G1 G43 H1 Z-2 F500\n", lcfg())
+        seg = [e["segment"] for e in r["trajectory"]
+               if e.get("segment", {}).get("kind") == "linear"][0]
+        self.assertEqual(seg["end_mm"][2], -2.0)
+        self.assertEqual(seg["end_machine_mm"][2], 8.0)
+        self.assertEqual(seg["start_machine_mm"][2], 20.0)
+        self.assertEqual(seg["comp_start_signed_mm"], 0.0)
+        self.assertEqual(seg["comp_end_signed_mm"], 10.0)
+        self.assertEqual(seg["h"], 1)
+
+    def test_xy_only_motion_holds_spindle_z(self):
+        r = analyze_program(
+            self.HEADER + "G43 H1\nG0 X20 Y0\nG49\n", lcfg())
+        seg = [e["segment"] for e in r["trajectory"]
+               if e.get("segment", {}).get("kind") == "rapid"
+               and e["segment"]["end_mm"][0] == 20.0][0]
+        self.assertEqual(seg["end_mm"][2], 10.0)     # 刀尖 Z10
+        self.assertEqual(seg["end_machine_mm"][2], 20.0)  # 基准保持 Z20
+
+    def test_z_travel_uses_spindle_reference(self):
+        # H1=10：刀尖 Z-2 时基准 Z8；给一个小 Z 行程的配置 -> 越界
+        c = MachineConfig.from_dict({
+            "name": "small-z", "travel_x": [0, 300], "travel_y": [0, 200],
+            "travel_z": [-5, 5], "safe_z": 0,
+            "max_feed_mm_min": 3000, "max_spindle_rpm": 12000,
+            "length_offsets": {"1": 10.0}})
+        r = analyze_program(
+            "G21 G90 G54\nM3 S1000\nG0 X0 Y0 Z0\nG1 G43 H1 Z-2 F500\n", c)
+        oob = [i for i in r["issues"] if i["code"] == "OUT_OF_BOUNDS"]
+        self.assertTrue(oob)
+        self.assertEqual(oob[0]["details"]["axis"], "Z")
+        self.assertAlmostEqual(oob[0]["details"]["value_mm"], 8.0)
+
+    def test_safe_z_judged_by_tool_tip(self):
+        # 刀尖 Z20（>=safe_z=10）的快速移动不告警，即使基准被抬高到 Z30
+        r = analyze_program(
+            self.HEADER + "G43 H1\nG0 X20 Y0\n", lcfg())
+        self.assertNotIn("RAPID_BELOW_SAFE_Z", codes(r))
+
+    def test_missing_h_blocks_segment(self):
+        r = analyze_program(
+            "G21 G90 G54\nG20 G43 Z5\n", lcfg())
+        self.assertIn("LENGTH_COMP_MISSING_H", codes(r))
+        e = r["trajectory"][1]
+        self.assertFalse(e["executed"])
+        self.assertEqual(e["block_reason"], "length_comp")
+        # 整段回滚：G20 不留痕（单位仍为上一行的 mm）、补偿未生效
+        self.assertEqual(r["final_state"]["unit"], "mm")
+        self.assertFalse(
+            r["final_state"]["tool_length_compensation"]["active"])
+
+    def test_h_not_found_blocks_segment(self):
+        r = analyze_program(
+            "G21 G90 G54\nG43 H9 Z5\nG43 H0\nG43 H1.5\n", lcfg())
+        self.assertEqual(codes(r).count("LENGTH_COMP_H_NOT_FOUND"), 3)
+        self.assertFalse(
+            r["final_state"]["tool_length_compensation"]["active"])
+
+    def test_comp_conflict_blocks_segment(self):
+        r1 = analyze_program("G21 G90 G54\nG43 G44 H1\n", lcfg())
+        self.assertIn("LENGTH_COMP_CONFLICT", codes(r1))
+        r2 = analyze_program("G21 G90 G54\nG43 H1 H3\n", lcfg())
+        self.assertIn("LENGTH_COMP_CONFLICT", codes(r2))
+        r3 = analyze_program("G21 G90 G54\nG49 G44\n", lcfg())
+        self.assertIn("LENGTH_COMP_CONFLICT", codes(r3))
+
+    def test_h_without_g43_g44_has_no_effect(self):
+        r = analyze_program(
+            "G21 G90 G54\nG0 X0 Y0 Z20\nH1\n", lcfg())
+        self.assertEqual(codes(r), [])
+        self.assertFalse(
+            r["final_state"]["tool_length_compensation"]["active"])
+        e = r["trajectory"][-1]
+        self.assertIn("H1(无 G43/G44，不生效)", e["normalized"])
+        # G49 同行的 H 也不生效
+        r2 = analyze_program("G21 G90 G54\nG43 H1\nG49 H3\n", lcfg())
+        ev = r2["length_compensation"]["events"][-1]
+        self.assertEqual(ev["code"], "G49")
+        self.assertIsNone(ev["h"])
+
+    def test_arc_and_helical_record_comp(self):
+        nc = ("G21 G90 G54\nM3 S6000\nG0 X20 Y20 Z0\nG43 H1\n"
+              "G1 X20 Y20 Z0 F500\n"
+              "G3 X60 Y20 I20 J0 Z-6\nG49\n")
+        r = analyze_program(nc, lcfg())
+        seg = [e["segment"] for e in r["trajectory"]
+               if e.get("segment", {}).get("kind") == "arc_ccw"][0]
+        self.assertEqual(seg["h"], 1)
+        # 螺旋终点刀尖 Z-6 -> 基准 Z4
+        self.assertEqual(seg["end_machine_mm"][2], 4.0)
+
+    def test_canned_cycle_records_h_and_spindle_bottom(self):
+        nc = (self.HEADER + "G43 H1\n"
+              "G99 G81 R2 Z-8 F250\nX20 Y0\nG80\nG49\n")
+        r = analyze_program(nc, lcfg())
+        cyc = [e["segment"] for e in r["trajectory"]
+               if e.get("segment", {}).get("kind") == "canned_cycle"][0]
+        self.assertEqual(cyc["h"], 1)
+        h1 = cyc["holes"][0]
+        self.assertEqual(h1["h"], 1)
+        self.assertEqual(h1["z_bottom_mm"], -8.0)
+        # 孔底主轴基准 = -8 + 10 = 2
+        self.assertEqual(h1["spindle_bottom_z_machine_mm"], 2.0)
+        for mv in cyc["moves_mm"]:
+            self.assertEqual(mv["h"], 1)
+            self.assertIsNotNone(mv["end_machine_mm"])
+        # 按 H 汇总包含钻孔
+        row = r["length_compensation"]["by_h"]["H1"]
+        self.assertEqual(row["holes_drilled"], 2)
+        self.assertGreater(row["path_length_mm"]["canned_cycle_cutting"], 0)
+
+    def test_cycle_blocked_after_comp_line_keeps_comp_no_move(self):
+        # G43 同行定义缺 R 的循环：孔阻断（无位移），但 G43 模态生效
+        nc = (self.HEADER + "G43 H1\nG81 Z-8 F200\nG80\n")
+        r = analyze_program(nc, lcfg())
+        self.assertIn("CYCLE_MISSING_PARAMS", codes(r))
+        self.assertTrue(
+            r["final_state"]["tool_length_compensation"]["active"])
+        # 阻断孔未更新刀尖位置（保持重算后的 Z10）
+        self.assertEqual(r["final_state"]["z"]["value_mm"], 10.0)
+
+    def test_compare_lists_compensation_and_z_travel_changes(self):
+        a = self.HEADER + "G43 H1\nG1 X20 Z5 F500\nG0 Z20\nG49\nM5\n"
+        b = ("G21 G90 G54\nM3 S6000\nG0 X0 Y0 Z20\n"
+             "G43 H3\nG1 X20 Z5 F500\nG0 Z20\nG49\nM5\n")
+        r = compare_reports(analyze_program(a, lcfg()),
+                            analyze_program(b, lcfg()), "a", "b")
+        lc = r["length_compensation"]
+        self.assertIn("H1", lc["by_h"])
+        self.assertIn("H3", lc["by_h"])
+        # 两侧 H 表相同，无表变化
+        self.assertEqual(lc["offset_table_changes"], [])
+        # 主轴基准 Z 行程：H1=10 比 H3=2 抬高更多
+        za = lc["spindle_z_travel"]["baseline_spindle_z_machine_mm"][1]
+        zb = lc["spindle_z_travel"]["candidate_spindle_z_machine_mm"][1]
+        self.assertAlmostEqual(za, 30.0)
+        self.assertAlmostEqual(zb, 22.0)
+        self.assertAlmostEqual(lc["spindle_z_travel"]["delta_max_mm"], -8.0)
+        # G43/G44/G49 各 1 次
+        self.assertEqual(lc["events"]["delta"],
+                         {"G43": 0, "G44": 0, "G49": 0})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

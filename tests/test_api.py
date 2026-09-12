@@ -195,7 +195,7 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(set(names),
                          {"safe_demo", "problems_demo", "inch_demo",
                           "arc_demo", "plane_arc_demo", "drill_cycle_demo",
-                          "wcs_demo", "subprogram_demo",
+                          "wcs_demo", "length_comp_demo", "subprogram_demo",
                           "subprogram_errors_demo"})
         kinds = {e["name"]: e["kind"] for e in ex["examples"]}
         self.assertEqual(kinds["subprogram_demo"], "package")
@@ -637,6 +637,95 @@ class ApiTest(unittest.TestCase):
         self.assertIn("attachment", resp.headers["Content-Disposition"])
         self.assertIn(b"G55", nc_text)
 
+    def test_12_length_compensation(self):
+        cfg_l = dict(CONFIG, safe_z=10,
+                     length_offsets={"1": 10, "2": -3, "3": 2})
+        # 配置校验：H 号非正整数 / 偏置非数值 -> 400 BAD_CONFIG 并定位字段
+        _, err = self.req("POST", "/api/machines",
+                          dict(cfg_l, length_offsets={"H0": 1}), expect=400)
+        errors = json.loads(err)["error"]["details"]["errors"]
+        self.assertTrue(any("length_offsets.H0" in e for e in errors))
+        _, err = self.req("POST", "/api/machines",
+                          dict(cfg_l, length_offsets={"3": "x"}), expect=400)
+        errors = json.loads(err)["error"]["details"]["errors"]
+        self.assertTrue(any("length_offsets.H3 必须是数值" in e
+                            for e in errors))
+
+        nc = (
+            "G21 G90 G54\nM3 S6000\nG0 X0 Y0 Z20\n"
+            "G43 H1\n"
+            "G1 X20 Z5 F500\n"
+            "G99 G81 R2 Z-8 F250\nX40\nG80\n"
+            "G49\n"
+            "G43\n"                 # 缺 H：阻断
+            "G43 H9\n"              # H9 不在表：阻断
+            "M5\n")
+        _, r = self.req("POST", "/api/analyze", {"config": cfg_l, "gcode": nc})
+        codes = [i["code"] for i in r["issues"]]
+        self.assertIn("LENGTH_COMP_MISSING_H", codes)
+        self.assertIn("LENGTH_COMP_H_NOT_FOUND", codes)
+        lc = r["length_compensation"]
+        self.assertEqual(lc["offsets_mm"],
+                         {"H1": 10.0, "H2": -3.0, "H3": 2.0})
+        ev43 = [e for e in lc["events"] if e["code"] == "G43"][0]
+        self.assertEqual(ev43["tip_z_workpiece_mm"], 10.0)
+        self.assertEqual(ev43["spindle_z_machine_mm"], 20.0)
+        # 循环孔带 H 与孔底主轴基准 Z（-8 + 10 = 2）
+        cyc = [t["segment"] for t in r["trajectory"]
+               if t.get("segment", {}).get("kind") == "canned_cycle"][0]
+        self.assertEqual(cyc["h"], 1)
+        self.assertEqual(cyc["holes"][0]["spindle_bottom_z_machine_mm"], 2.0)
+
+        # 建作业走 filter_report：按 H 筛选
+        _, job = self.req("POST", "/api/jobs",
+                          {"config": cfg_l, "gcode": nc}, expect=202)
+        self.wait_job(job["id"])
+        _, f = self.req("GET", f"/api/jobs/{job['id']}/report?h=H1")
+        self.assertEqual(f["filter"]["h"], ["H1"])
+        # 缺 H / H 不存在的阻断问题不归属任何已建立 H，被筛掉
+        fcodes = [i["code"] for i in f["issues"]]
+        self.assertNotIn("LENGTH_COMP_MISSING_H", fcodes)
+        self.assertNotIn("LENGTH_COMP_H_NOT_FOUND", fcodes)
+        self.assertEqual(list(f["length_compensation"]["by_h"]), ["H1"])
+        segs = [t["segment"] for t in f["trajectory"] if t.get("segment")]
+        self.assertTrue(all(s.get("h") == 1 for s in segs))
+        # 钻孔分组按孔的 h 裁剪
+        self.assertTrue(all(h["h"] == 1
+                            for g in f["drill_cycles"]["groups"]
+                            for h in g["holes"]))
+        # h 接受纯数字；非法 h 400
+        _, f2 = self.req("GET", f"/api/jobs/{job['id']}/report?h=1")
+        self.assertEqual(f2["filter"]["h"], ["H1"])
+        self.req("GET", f"/api/jobs/{job['id']}/report?h=H0", expect=400)
+        self.req("GET", f"/api/jobs/{job['id']}/report?h=abc", expect=400)
+
+        # 对比：length_compensation 节列出补偿与 Z 行程变化
+        nc2 = ("G21 G90 G54\nM3 S6000\nG0 X0 Y0 Z20\n"
+               "G43 H3\nG1 X20 Z5 F500\nG0 Z20\nG49\nM5\n")
+        _, cmp = self.req("POST", "/api/compare", {
+            "config": cfg_l, "label_a": "h1", "gcode_a": nc,
+            "label_b": "h3", "gcode_b": nc2})
+        lcmp = cmp["length_compensation"]
+        self.assertIn("H1", lcmp["by_h"])
+        self.assertIn("H3", lcmp["by_h"])
+        self.assertEqual(lcmp["events"]["delta"]["G43"], 0)  # 都是 1 次
+        # H1=10 在 H3=2 不在表差异里（两侧表相同，故无表变化）
+        self.assertEqual(lcmp["offset_table_changes"], [])
+        self.assertIsNotNone(
+            lcmp["spindle_z_travel"]["baseline_spindle_z_machine_mm"])
+        # 阻断问题计数
+        self.assertGreaterEqual(
+            lcmp["block_issue_counts"]["LENGTH_COMP_MISSING_H"]["baseline"], 1)
+
+    def test_13_length_comp_example_download(self):
+        resp, text = self.req("GET", "/api/examples/length_comp_demo",
+                              raw=True)
+        self.assertIn("attachment", resp.headers["Content-Disposition"])
+        self.assertIn(b"G43", text)
+        listing, meta = self.req("GET", "/api/examples")
+        self.assertIn("length_comp_demo",
+                      [e["name"] for e in meta["examples"]])
+
 
 class PackageApiTest(unittest.TestCase):
     @classmethod
@@ -843,6 +932,48 @@ class PackageApiTest(unittest.TestCase):
         self.assertNotIn("trajectory", notraj)
         # 顶层 package/call_graph 仍然保留
         self.assertIn("call_graph", notraj["package"])
+
+    def test_05b_length_comp_h_filter_in_package(self):
+        # 主程序 G43 H1，子程序切削；length_offsets 随内联配置提供
+        config = dict(CONFIG, safe_z=10,
+                      length_offsets={"1": 10, "2": 2})
+        package = {
+            "name": "pkg_lcomp",
+            "main": ("G21 G90 G54\nM3 S4000\nG0 X0 Y0 Z20\n"
+                     "G43 H1\nM98 P100\nG49\nM30\n"),
+            "subprograms": [
+                {"name": "o100.nc",
+                 "content": "O100\nG1 X10 Z5 F500\nG0 Z20\nM99\n"}],
+        }
+        body = dict(package, config=config)
+        _, created = self.req("POST", "/api/packages", body, expect=202)
+        pid = created["id"]
+        detail = self.wait_package(pid)
+        self.assertEqual(detail["status"], "completed")
+        _, full = self.req("GET", f"/api/packages/{pid}/report")
+        # 子程序切削段继承 H1，主轴基准 Z = 刀尖 + 10
+        sub_seg = [e["segment"] for e in full["trajectory"]
+                   if e.get("source_program") == "O100"
+                   and e.get("segment", {}).get("kind") == "linear"][0]
+        self.assertEqual(sub_seg["h"], 1)
+        self.assertEqual(sub_seg["end_machine_mm"][2], 15.0)
+        # 报告含 length_compensation 节与 G43 事件
+        lc = full["length_compensation"]
+        self.assertTrue(any(e["code"] == "G43" for e in lc["events"]))
+        # h 筛选：保留 H1 段（含 G49 取消事件），问题计数重算
+        _, flt = self.req("GET", f"/api/packages/{pid}/report?h=H1")
+        segs = [e["segment"] for e in flt["trajectory"] if e.get("segment")]
+        self.assertTrue(all(s.get("h") == 1 for s in segs))
+        self.assertEqual(flt["filter"]["h"], ["H1"])
+        self.assertEqual(
+            list(flt["length_compensation"]["by_h"]), ["H1"])
+        # h 与 source 叠加
+        _, both = self.req(
+            "GET", f"/api/packages/{pid}/report?h=H1&source=O100")
+        self.assertTrue({e.get("source_program") for e in both["trajectory"]}
+                        <= {"O100"})
+        # 非法 h 400
+        self.req("GET", f"/api/packages/{pid}/report?h=H0", expect=400)
 
     def test_06_blocked_package(self):
         created = self.create_package(PACKAGE_BAD)

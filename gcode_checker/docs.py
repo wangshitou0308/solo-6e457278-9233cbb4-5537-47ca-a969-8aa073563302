@@ -18,6 +18,7 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 | 单位 | `G21` 公制 mm、`G20` 英制 inch（内部 ×25.4 换算 mm） |
 | 定位 | `G90` 绝对、`G91` 增量 |
 | 坐标系 | `G54`-`G59`（各坐标系 X/Y/Z 偏置由机床配置 `wcs_offsets` 分别提供，叠加后做行程检查） |
+| 刀长补偿 | `G43` 加、`G44` 减、`G49` 取消；`H` 寄存器号（正整数）只随 `G43/G44` 生效，偏置由机床配置 `length_offsets` 提供 |
 | 平面 | `G17` XY（上电默认，联动轴 Z）、`G18` XZ（联动轴 Y）、`G19` YZ（联动轴 X），模态保持 |
 | 运动 | `G0` 快速、`G1` 直线、`G2` 顺圆、`G3` 逆圆（当前平面内插补） |
 | 固定循环 | `G80` 取消、`G81` 钻孔、`G82` 锪孔（`P` 孔底暂停）、`G83` 深孔啄钻（`Q` 分步）；`G98` 返回初始平面（默认）、`G99` 返回 R 平面；`R` R 平面、`L` 重复孔位；**仅允许在 `G17` 平面展开** |
@@ -45,6 +46,41 @@ python3 -m gcode_checker --verbose       # 打印访问日志
   （`machine_x_mm/machine_y_mm`），每个展开动作带机床坐标。
 - 偏置值非法时配置校验会**定位到坐标系与字段**，如
   `wcs_offsets.G55.x 必须是数值`。
+
+### 刀长补偿（G43/G44/G49 + H）口径
+
+- 机床配置 **`length_offsets`** 给出 H 寄存器刀长偏置表（mm），如
+  `{"1": 10.0, "2": -3.0}`；键可写 `1` 或 `"H1"`，**H 号必须为正整数**
+  （`H0` 不接受）、偏置必须是数值，否则保存配置时按字段拒绝：
+  `length_offsets.H0：H 号必须为正整数` 或
+  `length_offsets.H3 必须是数值（刀长偏置 mm）`。
+- **G43 加**：主轴基准点机床 Z = 刀尖工件 Z + 工件 Z 偏置 + H 偏置；
+  **G44 减**：主轴基准点机床 Z = 刀尖工件 Z + 工件 Z 偏置 − H 偏置
+  （因此 `G44 H2` 在 H2=−3 时基准点反而抬高 3 mm）；**G49** 取消补偿。
+- **H 只随 G43/G44 生效**：没有 G43/G44 的行上写 `H` 不生效（规范化中
+  标注 `H3(无 G43/G44，不生效)`）；`G49 H1` 的 H 同样不生效。
+- **同行运动使用新补偿**：如 `G1 G43 H1 Z-2 F500` 段起点按旧补偿、
+  终点按新补偿解算（刀尖 Z=−2、基准点 Z=8）。
+- **只有补偿指令时主轴基准点保持不动**：无 Z 词的 `G43/G44/G49` 行不
+  产生运动，按新补偿重算刀尖工件坐标
+  （`新刀尖 Z = 基准点 Z − 工件偏置 − 新代数补偿`），随后仅 XY 的运动
+  段基准点 Z 保持恒定。
+- **两类高度结论分别判定**：安全 Z 按**刀尖工件 Z** 判定；**Z 轴行程按
+  主轴基准点机床 Z**（工件偏置 + 刀长补偿）判定——长刀可能刀尖尚在安全
+  高度而基准点已超 Z 行程。
+- 直线、圆弧、螺旋与固定钻孔循环的每个段/孔/展开动作都记录 **H 号、
+  补偿方向与数值**（`h`、`tool_compensation`、`comp_start/end_signed_mm`）、
+  **刀尖工件坐标**（`start_mm/end_mm/points_mm`）与**主轴基准点机床坐标**
+  （`start_machine_mm/end_machine_mm/points_machine_mm`）；孔记录另给
+  `spindle_bottom_z_machine_mm`。
+- 阻断规则（**整段阻断**，连同本行单位/模式/平面/坐标系等模态改动一起
+  回滚，**不沿用旧补偿值**）：`G43/G44` 缺 H → `LENGTH_COMP_MISSING_H`；
+  H 非正整数或不在 `length_offsets` → `LENGTH_COMP_H_NOT_FOUND`；
+  `G43/G44/G49` 同段混用、补偿码重复或同段多个 H →
+  `LENGTH_COMP_CONFLICT`。
+- 报告 `length_compensation` 节含 H 偏置表、G43/G44/G49 事件流（每行的
+  刀尖工件 Z 与主轴基准点机床 Z）、按 H 号汇总的路径/钻孔/问题，以及
+  主轴基准点 Z 行程占用；可用 `?h=H1,H2`（也接受 `?h=1,2`）筛选。
 
 ### 圆弧与螺旋插补口径
 
@@ -92,7 +128,7 @@ python3 -m gcode_checker --verbose       # 打印访问日志
   主轴未转/无进给等工艺问题按**触发行**去重（一个 G83 孔只报一次）。
 
 **未支持示例**（遇到即 `UNSUPPORTED_INSTRUCTION`，整段不执行、不改模态）：
-`G28/30、G40-G43、G54.1、G84-G89、M4、M6、M7-M9、T/H/D` 等。
+`G28/30、G40-G42（半径刀补）、G54.1、G84-G89、M4、M6、M7-M9、T、D` 等。
 无法解析的残片（如 `X-`）报 `MALFORMED_LINE`；若同行还有未支持词（如 `G54.1 X-`），
 两类问题都会列出。
 
@@ -181,7 +217,8 @@ python3 -m gcode_checker --verbose       # 打印访问日志
   "wcs_offsets": {
     "G54": {"x": -150, "y": -100, "z": 0},
     "G55": {"x": 50, "y": 20, "z": -5}
-  }
+  },
+  "length_offsets": {"1": 10.0, "2": -3.0, "3": 2.0}
 }
 ```
 
@@ -191,7 +228,11 @@ python3 -m gcode_checker --verbose       # 打印访问日志
   旧字段 `offset_x/offset_y/offset_z` 归入 `G54`（显式 `wcs_offsets.G54`
   优先），未出现在 `wcs_offsets` 中的坐标系视为**未配置**。
 - 偏置非法时按坐标系与字段报错，如 `wcs_offsets.G55.x 必须是数值`。
-- `safe_z` 按**工件（程序）坐标**判定快速移动。
+- `length_offsets` 为 H 寄存器刀长偏置表（mm）：键为正整数 H 号
+  （可写 `1` 或 `"H1"`，`H0` 拒绝），值必须是数值，否则按字段拒绝
+  （如 `length_offsets.H3 必须是数值`）。
+- `safe_z` 按**刀尖工件（程序）Z 坐标**判定快速移动；Z 轴行程按叠加
+  工件偏置与刀长补偿后的**主轴基准点机床 Z** 判定。
 
 ## 4. 接口
 
@@ -203,7 +244,7 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 | GET | `/api/dialect` | 支持的指令、问题代码、严重度表 |
 | GET | `/api/docs` | 本文档（Markdown） |
 | GET | `/api/examples` | 内置示例 .nc 清单 |
-| GET | `/api/examples/<name>` | 下载示例（safe_demo/problems_demo/inch_demo/arc_demo/plane_arc_demo/wcs_demo/drill_cycle_demo；程序包示例 subprogram_demo/subprogram_errors_demo 为 JSON） |
+| GET | `/api/examples/<name>` | 下载示例（safe_demo/problems_demo/inch_demo/arc_demo/plane_arc_demo/wcs_demo/drill_cycle_demo/length_comp_demo；程序包示例 subprogram_demo/subprogram_errors_demo 为 JSON） |
 
 ### 机床配置
 
@@ -240,7 +281,10 @@ python3 -m gcode_checker --verbose       # 打印访问日志
   - `wcs=G54,G55`：按工件坐标系筛选（G54-G59）；只保留该坐标系下产生的
     问题与轨迹段（无轨迹段的设定/注释行保留），`wcs` 汇总节只保留命中
     坐标系，固定循环分组按孔的 `wcs` 裁剪，风险计数随之重算
-  - `trajectory=0`：省略逐行轨迹以减小响应；`trajectory=all`：循环/平面/坐标系筛选时保留完整轨迹
+  - `h=H1,H2`（也接受 `h=1,2`）：按刀长补偿 H 号筛选；只保留该 H 生效
+    期间产生的问题、轨迹段与孔，`length_compensation` 汇总只保留命中 H
+    （G49 取消事件随筛选保留），风险计数随之重算
+  - `trajectory=0`：省略逐行轨迹以减小响应；`trajectory=all`：循环/平面/坐标系/H 筛选时保留完整轨迹
 
   指定 `cycle`/`hole_*` 后，报告中的 `drill_cycles`（groups、by_cycle、
   summary 的孔数/钻深/暂停/展开路径）与逐行轨迹的孔及动作（含孔间定位）
@@ -260,6 +304,7 @@ python3 -m gcode_checker --verbose       # 打印访问日志
   `package`/`program` 展开节）；阻断时返回阻断报告（无安全结论）。支持：
   - `source=main,O100`：**按来源程序筛选轨迹**（可多选逗号分隔）；
     逐行轨迹与问题只保留命中来源程序，风险计数随之重算；非法来源返回 400。
+  - `h=H1,H2`：按刀长补偿 H 号筛选（跨全部来源程序，与 `source` 可叠加）。
   - `trajectory=0`：省略逐行轨迹（顶层 package/call_graph 保留）。
 - `GET /api/packages/<id>/report/download`：以 `attachment` 下载程序包
   完整 JSON（展开状态、调用图、调用错误、轨迹与分析结果）。
@@ -309,8 +354,13 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 （总计及按 G81/G82/G83 分类的 `by_cycle`），在 `arcs` 中汇总
 各平面（G17/G18/G19）的弧段数、弧长、螺旋段数与阻断弧数的增减，
 以及该平面问题的新增（`introduced_issues`）/解决（`resolved_issues`）/
-净变化（`delta_issues`），并在 `wcs` 中汇总各工件坐标系（G54-G59）的
-路径长度、机床坐标包围盒（行程占用）与问题的新增/解决/净变化。
+净变化（`delta_issues`），在 `wcs` 中汇总各工件坐标系（G54-G59）的
+路径长度、机床坐标包围盒（行程占用）与问题的新增/解决/净变化，
+并在 `length_compensation` 中列出刀长补偿变化：`offset_table_changes`
+（H 偏置表数值差异）、`events`（G43/G44/G49 次数两侧值与 delta）、
+`by_h`（各 H 号的路径长度、钻孔数/钻深、问题的新增/解决/净变化）与
+`spindle_z_travel`（主轴基准点 Z 机床坐标行程的两侧值与 min/max delta）、
+`block_issue_counts`（缺 H/H 不存在/补偿冲突问题计数）。
 - `GET /api/comparisons` / `GET /api/comparisons/<id>`：读取保存的对比。
 
 ## 5. 报告结构
@@ -326,6 +376,9 @@ python3 -m gcode_checker --verbose       # 打印访问日志
     "motion_mode": "linear", "plane": "G17",
     "x/y/z": {"value_mm": …, "known": true},
     "feed_mm_per_min": {…}, "spindle_rpm": 6000, "spindle_on": true,
+    "tool_length_compensation": {"active": true, "code": "G43",
+      "direction": "plus", "h": 1, "offset_mm": 10,
+      "signed_offset_mm": 10, "applied_line_no": 4},
     "canned_cycle": { …当前激活循环的参数与来源，无则 null… },
     "cycle_return_plane": "G98" },
   "arcs": {
@@ -348,6 +401,26 @@ python3 -m gcode_checker --verbose       # 打印访问日志
         "path_length_mm": {…}, "machine_bbox_mm": null, "issues": 3 }
     }
   },
+  "length_compensation": {
+    "supported": {"G43": "…加…", "G44": "…减…", "G49": "取消", "H": "…"},
+    "offsets_mm": {"H1": 10, "H2": -3, "H3": 2},     // 机床 H 寄存器表
+    "events": [                                       // G43/G44/G49 逐次事件
+      {"line_no": 4, "code": "G43", "direction": "plus", "h": 1,
+       "offset_mm": 10, "signed_offset_mm": 10, "wcs": "G54",
+       "tip_z_workpiece_mm": 10,                      // 重算后的刀尖工件 Z
+       "spindle_z_machine_mm": 20,                    // 主轴基准点机床 Z（不动）
+       "tip_z_recomputed": true} ],
+    "by_h": { "H1": {"h": 1, "offset_mm": 10,
+      "path_length_mm": {"rapid":…, "cutting":…, "total":…,
+                         "canned_cycle_rapid":…, "canned_cycle_cutting":…},
+      "holes_drilled": 2, "holes_blocked": 0,
+      "total_drill_depth_mm": 16, "issues": 0} },
+    "without_compensation": { …未补偿段的路径/钻孔/问题… },
+    "spindle_z_travel": {"spindle_z_machine_mm": [-8, 30],
+                         "note": "主轴基准点 Z 机床坐标（工件偏置+刀长补偿）"},
+    "issues": {"LENGTH_COMP_MISSING_H": 0,
+               "LENGTH_COMP_H_NOT_FOUND": 1, "LENGTH_COMP_CONFLICT": 0}
+  },
   "drill_cycles": {
     "summary": { "cycle_groups": 2, "holes_total": 9, "holes_drilled": 8,
       "holes_blocked": 1, "total_drill_depth_mm": 63.0, "total_dwell_s": 0.5,
@@ -361,7 +434,7 @@ python3 -m gcode_checker --verbose       # 打印访问日志
   },
   "bbox_program_mm": { "x_mm": [0, 90], "y_mm": […], "z_mm": […],
                        "size_mm": [90, 20, 52] },
-  "bbox_machine_mm": { …叠加当前坐标系偏置后的机床坐标包围盒… },
+  "bbox_machine_mm": { …主轴基准点机床坐标包围盒（Z 已含刀长补偿）… },
   "path_length_mm": { "rapid": 123.4, "cutting": 88.1,
                       "total": 211.5, "reliable": true, "unknown_segments": 0,
                       "canned_cycle_rapid": 40.2, "canned_cycle_cutting": 33.0 },
@@ -383,8 +456,12 @@ python3 -m gcode_checker --verbose       # 打印访问日志
   "trigger_line_no": 5, "trigger_source_line": "X20 Y0",
   "definition_line_no": 4,
   "wcs": "G54",                        // 触发孔时的工件坐标系
+  "h": 1,                              // 生效的刀长补偿 H 号（无补偿为 null）
+  "tool_compensation": {"code": "G43", "direction": "plus", "h": 1,
+    "offset_mm": 10, "signed_offset_mm": 10},
   "x_mm": 20, "y_mm": 0,
   "machine_x_mm": -130, "machine_y_mm": -100,   // 孔位机床坐标（偏置未知为 null）
+  "spindle_bottom_z_machine_mm": 2,    // 孔底主轴基准点 Z 机床坐标（偏置+刀补）
   "initial_plane_z_mm": 20, "r_plane_z_mm": 2, "z_bottom_mm": -11,
   "return_plane": "G99", "retract_z_mm": 2,
   "drill_depth_mm": 13, "dwell_s": 0,
@@ -443,12 +520,16 @@ python3 -m gcode_checker --verbose       # 打印访问日志
     "wcs": "G55",                       // 本段所属的工件坐标系
     "wcs_configured": true,
     "offset_mm": {"x": 50, "y": 20, "z": -5},
-    "start_mm": [10, 10, -2], "end_mm": [50, 20, -2],
-    "start_machine_mm": [60, 30, -7],   // 叠加当前坐标系偏置的机床坐标
-    "end_machine_mm": [100, 40, -7],    // （偏置未知时这些机床坐标为 null）
+    "h": 1,                             // 生效的刀长补偿 H 号（无补偿为 null）
+    "tool_compensation": {"code": "G43", "direction": "plus", "h": 1,
+      "offset_mm": 10, "signed_offset_mm": 10},   // 无补偿时为 null
+    "comp_start_signed_mm": 0, "comp_end_signed_mm": 10,  // 旧->新补偿
+    "start_mm": [10, 10, -2], "end_mm": [50, 20, -2],      // 刀尖工件坐标
+    "start_machine_mm": [60, 30, -7],   // 主轴基准点机床坐标（Z 含刀长补偿）
+    "end_machine_mm": [100, 40, 3],     // （偏置未知时这些机床坐标为 null）
     "length_mm": 32.1,
     "points_mm": [ …离散轨迹（直线取端点，圆弧自动加密）… ],
-    "points_machine_mm": [ …对应的机床坐标轨迹… ],
+    "points_machine_mm": [ …主轴基准点机床坐标轨迹… ],
     "arc": { "plane": "G17(XY)", "plane_code": "G17", "direction": "CW",
              "programming": "I/J",
              "center_mm": [20, 10], "center_axes": ["X", "Y"],
@@ -459,6 +540,10 @@ python3 -m gcode_checker --verbose       # 打印访问日志
   }
 }
 ```
+
+补偿-only 行（`G43 H1`/`G44 H2`/`G49`）的条目 `type` 为
+`length_compensation`，并带 `tool_length_event`（含 H 号、方向与数值、
+重算后的刀尖工件 Z、保持不动的主轴基准点机床 Z）。
 
 ## 6. 问题代码与严重度
 
@@ -482,6 +567,9 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 | `CYCLE_PLANE_CONFLICT` | error | 孔底高于 R 平面，对应孔阻断 |
 | `CYCLE_NO_INHERITABLE_STATE` | error | 后续孔位的 XY/初始平面状态未知，对应孔阻断 |
 | `CYCLE_PLANE_NOT_G17` | error | G18/G19 平面下展开固定循环，对应孔阻断（G17 恢复后可继续） |
+| `LENGTH_COMP_MISSING_H` | error | `G43/G44` 同段未给 H；整段阻断、不沿用旧补偿 |
+| `LENGTH_COMP_H_NOT_FOUND` | error | H 非正整数或不在机床 `length_offsets` 表；整段阻断 |
+| `LENGTH_COMP_CONFLICT` | error | G43/G44/G49 同段混用、补偿码重复或同段多个 H；整段阻断 |
 
 风险分：critical 25 / error 10 / warning 3 / info 1（封顶 100），
 级别 `none/low(≤10)/medium(≤30)/high(≤60)/critical`。
@@ -496,11 +584,14 @@ python3 -m gcode_checker --verbose       # 打印访问日志
    该段不进入包围盒/长度/行程统计，并给出对应 warning。
 4. **路径长度**：仅累计物理已知段；圆弧按弧长（含垂直轴联动的三维螺旋
    长度），直线按 3D 弦长。`reliable=false` 时报告会标注存在未知段。
-5. **安全 Z 按工件坐标**判定；**行程按机床坐标**（叠加当前坐标系偏置）判定；
+5. **安全 Z 按刀尖工件坐标**判定；**行程按主轴基准点机床坐标**
+   （工件偏置 + Z 向刀长补偿）判定；
    圆弧的包围盒与行程检查按真实弧线极值点（端点 + 扫过的象限角）计算。
    **坐标系切换**（G54-G59）时机床位置不动、工件坐标按新偏置重新换算；
    引用未配置偏置的坐标系时不沿用上一偏置，相关机床坐标/行程/包围盒
-   结论标为未知。
+   结论标为未知。**刀长补偿**（G43 加 / G44 减 / G49 取消，H 只随
+   G43/G44 生效）只改变 Z：补偿-only 行主轴基准点不动、重算刀尖工件 Z，
+   同行运动使用新补偿；缺 H / H 非法 / 同段冲突整段阻断、不沿用旧值。
 6. **固定循环**：循环参数非法/缺项只阻断对应孔并写明依据，不产生位移、
    不改写程序；固定循环仅允许在 `G17` 平面展开（`G18/G19` 下对应孔阻断）；
    G83 内部排屑快速动作豁免安全 Z 告警，孔间定位仍检查；
@@ -510,11 +601,12 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 ## 8. curl 快速上手
 
 ```bash
-# 1) 建配置（含 G54/G55 两套工件坐标偏置）
+# 1) 建配置（含 G54/G55 两套工件坐标偏置与 H1/H2 刀长偏置）
 curl -s localhost:8080/api/machines -H 'Content-Type: application/json' -d '{
   "name":"demo", "travel_x":[0,300], "travel_y":[0,200], "travel_z":[-100,0],
   "safe_z":10, "max_feed_mm_min":3000, "max_spindle_rpm":12000,
-  "wcs_offsets":{"G54":{"x":0,"y":0,"z":0},"G55":{"x":100,"y":50,"z":0}}}'
+  "wcs_offsets":{"G54":{"x":0,"y":0,"z":0},"G55":{"x":100,"y":50,"z":0}},
+  "length_offsets":{"1":10,"2":-3}}'
 
 # 2) 下载示例并建作业（含钻孔循环示例 drill_cycle_demo）
 curl -s localhost:8080/api/examples/problems_demo -o problems.nc
@@ -543,6 +635,10 @@ curl -s localhost:8080/api/examples/plane_arc_demo -o planes.nc
 # 6) 多工件坐标系示例（G54/G55 切换、G59 未配置），按坐标系筛选报告
 curl -s localhost:8080/api/examples/wcs_demo -o wcs.nc
 curl -s 'localhost:8080/api/jobs/<id>/report?wcs=G55'
+
+# 6b) 刀长补偿示例（G43/G44/G49/H，含缺 H、H 不存在、同段冲突阻断），按 H 筛选
+curl -s localhost:8080/api/examples/length_comp_demo -o length.nc
+curl -s 'localhost:8080/api/jobs/<id>/report?h=H1'
 
 # 7) 程序包静态展开（O/M98/M99/L、调用图、调用栈、按来源筛选、分页预览）
 curl -s localhost:8080/api/examples/subprogram_demo -o pkg.json

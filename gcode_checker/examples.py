@@ -222,6 +222,46 @@ G80
 M5
 """,
     },
+    "length_comp_demo": {
+        "filename": "length_comp_demo.nc",
+        "title": "刀长补偿示例（G43/G44/G49 + H 寄存器）",
+        "description": "G43 加、G44 减、G49 取消；补偿-only 行主轴基准点不动、重算"
+                       "刀尖工件 Z；同行运动使用新补偿。含 G43 缺 H、H 不在表、"
+                       "G43/G44 同段冲突等阻断演示。建议配置：行程 "
+                       "X[0,300] Y[0,200] Z[-50,60]、safe_z=10、F 上限 3000、"
+                       "S 上限 12000；length_offsets：H1=10、H2=-3、H3=2。",
+        "content": """\
+; length_comp_demo.nc —— 刀长补偿 G43/G44/G49
+; 建议配置：X[0,300] Y[0,200] Z[-50,60]，safe_z=10，F<=3000，S<=12000
+; length_offsets：H1=10，H2=-3（G44 减去 -3 即主轴基准 +3），H3=2
+G21 G90 G54
+M3 S6000
+G0 X0 Y0 Z20
+
+; ---- G43 加补偿：补偿-only 行，主轴基准点保持 Z20，刀尖重算为 Z10 ----
+G43 H1
+G1 X20 Z5 F500          ; 同行运动使用新补偿：刀尖 Z5，主轴基准 Z15
+G0 Z20                  ; 抬刀（刀尖 Z20，主轴基准 Z30）
+
+; ---- G44 减补偿：H2 表值 -3，主轴基准 = 刀尖 - (-3) = 刀尖 + 3 ----
+G44 H2
+G1 X40 Z5 F500
+G0 Z20
+
+; ---- G49 取消补偿：主轴基准点不动，刀尖 Z 回到与基准一致 ----
+G49
+G1 X60 Z5 F500
+G0 Z20
+
+; ---- 阻断演示（整段阻断，不沿用旧补偿值，本行其他模态改动一并回滚）----
+G43 Z5                  ; G43 缺 H：LENGTH_COMP_MISSING_H
+G43 H9 Z5               ; H9 不在 length_offsets：LENGTH_COMP_H_NOT_FOUND
+G43 G44 H1              ; 同段补偿指令冲突：LENGTH_COMP_CONFLICT
+G43 H0                  ; H0 非正整数：LENGTH_COMP_H_NOT_FOUND
+H3                      ; 无 G43/G44，H 不生效（仅规范化标注）
+M5
+""",
+    },
 }
 
 # 程序包示例（POST /api/packages 请求体格式）。JSON 字符串可直接作为

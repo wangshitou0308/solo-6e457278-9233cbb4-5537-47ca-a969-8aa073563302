@@ -19,7 +19,8 @@ def _fingerprint(issue: dict) -> tuple:
     d = issue.get("details", {})
     key = ["axis", "unsupported_tokens", "malformed_tokens", "reason",
            "below_mm", "overshoot_mm", "exceed_mm_per_min", "exceed_rpm",
-           "cycle", "hole_no", "missing", "bad", "unknown", "plane", "wcs"]
+           "cycle", "hole_no", "missing", "bad", "unknown", "plane", "wcs",
+           "h"]
     detail_fp = tuple((k, str(d.get(k))) for k in key if k in d)
     return (issue["code"], issue.get("normalized", ""), detail_fp)
 
@@ -276,12 +277,18 @@ def compare_reports(baseline: dict, candidate: dict,
         },
     }
 
+    # 刀长补偿（G43/G44/G49 + H）：补偿使用、按 H 路径/钻孔、问题与
+    # 主轴基准点 Z 行程的两侧值与变化
+    length_compare = _length_comp_compare(
+        baseline, candidate, resolved, introduced)
+
     return {
         "labels": {"baseline": baseline_label, "candidate": candidate_label},
         "machine": candidate["machine"],
         "drill_cycles": drill_compare,
         "arcs": arc_compare,
         "wcs": wcs_compare,
+        "length_compensation": length_compare,
         "risk": {
             "baseline": baseline["risk"],
             "candidate": candidate["risk"],
@@ -327,6 +334,120 @@ def _sev_of(code: str, r1: dict, r2: dict) -> str:
             if i["code"] == code:
                 return i["severity"]
     return "info"
+
+
+def _lc_section(report: dict) -> dict:
+    return report.get("length_compensation", {})
+
+
+def _h_issue_counts(report: dict) -> dict:
+    c: dict = {}
+    for i in report["issues"]:
+        h = i.get("details", {}).get("h")
+        if h is None:
+            continue
+        c[h] = c.get(h, 0) + 1
+    return c
+
+
+def _length_comp_compare(baseline: dict, candidate: dict,
+                         resolved: list, introduced: list) -> dict:
+    """刀长补偿对比：H 表变化、G43/G44/G49 事件、按 H 的路径/钻孔/问题，
+    以及主轴基准点 Z 行程变化。"""
+    la, lb = _lc_section(baseline), _lc_section(candidate)
+    table_a = la.get("offsets_mm", {})
+    table_b = lb.get("offsets_mm", {})
+    h_labels = sorted(set(table_a) | set(table_b),
+                      key=lambda t: int(t[1:]) if t[1:].isdigit() else 0)
+    table_changes = []
+    for label in h_labels:
+        va, vb = table_a.get(label), table_b.get(label)
+        if va != vb:
+            table_changes.append({"h": label, "baseline_mm": va,
+                                  "candidate_mm": vb,
+                                  "delta_mm": (round(vb - va, 6)
+                                              if va is not None and vb is not None
+                                              else None)})
+
+    def events(sec):
+        out = {"G43": 0, "G44": 0, "G49": 0}
+        for e in sec.get("events", []):
+            code = e.get("code")
+            if code in out:
+                out[code] += 1
+        return out
+
+    ea, eb = events(la), events(lb)
+    by_h_a, by_h_b = la.get("by_h", {}), lb.get("by_h", {})
+    ia, ib = _h_issue_counts(baseline), _h_issue_counts(candidate)
+    res_h = Counter(i.get("details", {}).get("h")
+                    for i in resolved if i.get("details", {}).get("h") is not None)
+    int_h = Counter(i.get("details", {}).get("h")
+                    for i in introduced
+                    if i.get("details", {}).get("h") is not None)
+    by_h = {}
+    for label in sorted(set(by_h_a) | set(by_h_b)):
+        a, b = by_h_a.get(label, {}), by_h_b.get(label, {})
+        hno = (a.get("h") if a.get("h") is not None
+               else b.get("h"))
+        pa, pb = (a.get("path_length_mm", {}),
+                  b.get("path_length_mm", {}))
+        by_h[label] = {
+            "h": hno,
+            "offset_baseline_mm": table_a.get(label),
+            "offset_candidate_mm": table_b.get(label),
+            "baseline_path_mm": {
+                "rapid": pa.get("rapid", 0.0),
+                "cutting": pa.get("cutting", 0.0),
+                "total": pa.get("total", 0.0)},
+            "candidate_path_mm": {
+                "rapid": pb.get("rapid", 0.0),
+                "cutting": pb.get("cutting", 0.0),
+                "total": pb.get("total", 0.0)},
+            "delta_path_total_mm": round(
+                pb.get("total", 0.0) - pa.get("total", 0.0), 6),
+            "baseline_holes": a.get("holes_drilled", 0),
+            "candidate_holes": b.get("holes_drilled", 0),
+            "delta_holes": (b.get("holes_drilled", 0)
+                            - a.get("holes_drilled", 0)),
+            "baseline_drill_depth_mm": a.get("total_drill_depth_mm", 0.0),
+            "candidate_drill_depth_mm": b.get("total_drill_depth_mm", 0.0),
+            "delta_drill_depth_mm": round(
+                b.get("total_drill_depth_mm", 0.0)
+                - a.get("total_drill_depth_mm", 0.0), 6),
+            "baseline_issues": ia.get(hno, 0),
+            "candidate_issues": ib.get(hno, 0),
+            "delta_issues": ib.get(hno, 0) - ia.get(hno, 0),
+            "resolved_issues": res_h.get(hno, 0),
+            "introduced_issues": int_h.get(hno, 0),
+        }
+
+    za = (la.get("spindle_z_travel") or {}).get("spindle_z_machine_mm")
+    zb = (lb.get("spindle_z_travel") or {}).get("spindle_z_machine_mm")
+    z_travel = {"baseline_spindle_z_machine_mm": za,
+                "candidate_spindle_z_machine_mm": zb}
+    if za is not None and zb is not None:
+        z_travel["delta_min_mm"] = round(zb[0] - za[0], 6)
+        z_travel["delta_max_mm"] = round(zb[1] - za[1], 6)
+    comp_codes = ("LENGTH_COMP_MISSING_H", "LENGTH_COMP_H_NOT_FOUND",
+                  "LENGTH_COMP_CONFLICT")
+    ca = Counter(i["code"] for i in baseline["issues"]
+                 if i["code"] in comp_codes)
+    cb = Counter(i["code"] for i in candidate["issues"]
+                 if i["code"] in comp_codes)
+    block_counts = {c: {"baseline": ca.get(c, 0), "candidate": cb.get(c, 0),
+                        "delta": cb.get(c, 0) - ca.get(c, 0)}
+                    for c in comp_codes}
+    return {
+        "offset_table_changes": table_changes,
+        "events": {
+            "baseline": ea, "candidate": eb,
+            "delta": {c: eb[c] - ea[c] for c in ("G43", "G44", "G49")},
+        },
+        "by_h": by_h,
+        "spindle_z_travel": z_travel,
+        "block_issue_counts": block_counts,
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -73,8 +73,8 @@ class ApiError(Exception):
 # ---------------------------------------------------------------------------
 
 def filter_report(report: dict, query: dict) -> dict:
-    """按 severity / code / 行范围 / 循环类型 / 孔序 / 圆弧平面 / 坐标系
-    筛选问题；其余统计同步重算。"""
+    """按 severity / code / 行范围 / 循环类型 / 孔序 / 圆弧平面 / 坐标系 /
+    刀长补偿 H 号筛选问题；其余统计同步重算。"""
     severities = _csv_param(query, "severity")
     codes = _csv_param(query, "code")
     line_from = _int_param(query, "line_from")
@@ -84,6 +84,7 @@ def filter_report(report: dict, query: dict) -> dict:
     hole_to = _int_param(query, "hole_to")
     planes = _csv_param(query, "plane")
     wcs_list = _csv_param(query, "wcs")
+    h_filter = _h_filter_param(query)
 
     for s in severities:
         if s not in SEVERITY_ORDER:
@@ -136,6 +137,9 @@ def filter_report(report: dict, query: dict) -> dict:
     if wcs_upper:
         issues = [i for i in issues
                   if i.get("details", {}).get("wcs") in wcs_upper]
+    if h_filter:
+        issues = [i for i in issues
+                  if i.get("details", {}).get("h") in h_filter]
     def _in_hole_range(i):
         no = i.get("details", {}).get("hole_no")
         if no is None:
@@ -157,6 +161,7 @@ def filter_report(report: dict, query: dict) -> dict:
                         or hole_to is not None)
     plane_filter = bool(planes_upper)
     wcs_filter = bool(wcs_upper)
+    h_filter_active = bool(h_filter)
     out["filter"] = {
         "severity": severities, "code": codes,
         "line_from": line_from, "line_to": line_to,
@@ -164,17 +169,21 @@ def filter_report(report: dict, query: dict) -> dict:
         "hole_from": hole_from, "hole_to": hole_to,
         "plane": planes_upper,
         "wcs": wcs_upper,
+        "h": [f"H{v}" for v in h_filter],
         "matched": len(issues),
         "total_in_report": len(report["issues"]),
     }
-    if (cycle_filter or wcs_filter) and "drill_cycles" in out:
+    if (cycle_filter or wcs_filter or h_filter_active) and "drill_cycles" in out:
         out["drill_cycles"] = _filter_drill_cycles(
             report["drill_cycles"], cycles_upper, hole_from, hole_to,
-            wcs_upper)
+            wcs_upper, h_filter)
     if plane_filter and "arcs" in out:
         out["arcs"] = _filter_arcs(report["arcs"], planes_upper, issues)
     if wcs_filter and "wcs" in out:
         out["wcs"] = _filter_wcs(report["wcs"], wcs_upper)
+    if h_filter_active and "length_compensation" in out:
+        out["length_compensation"] = _filter_length_comp(
+            report["length_compensation"], h_filter)
     # 逐行轨迹：默认随循环/平面/坐标系筛选裁剪；?trajectory=0 省略，
     # ?trajectory=all 不裁剪
     traj_flag = query.get("trajectory", ["1"])[0]
@@ -185,13 +194,57 @@ def filter_report(report: dict, query: dict) -> dict:
     else:
         if cycle_filter and "trajectory" in out:
             out["trajectory"] = _filter_trajectory_cycles(
-                out["trajectory"], cycles_upper, hole_from, hole_to)
+                out["trajectory"], cycles_upper, hole_from, hole_to,
+                h_filter)
         if plane_filter and "trajectory" in out:
             out["trajectory"] = _filter_trajectory_planes(
                 out["trajectory"], planes_upper)
         if wcs_filter and "trajectory" in out:
             out["trajectory"] = _filter_trajectory_wcs(
                 out["trajectory"], wcs_upper)
+        if h_filter_active and "trajectory" in out:
+            out["trajectory"] = _filter_trajectory_h(
+                out["trajectory"], h_filter)
+    return out
+
+
+def _entry_h(e: dict):
+    """逐行条目归属的 H 号：补偿段取事件 H，轨迹段取段 H，其余 None。"""
+    ev = e.get("tool_length_event")
+    if ev is not None:
+        return ev.get("h")
+    seg = e.get("segment")
+    if seg is not None:
+        return seg.get("h")
+    return None
+
+
+def _filter_trajectory_h(trajectory, h_nums):
+    """逐行轨迹按刀长补偿 H 号裁剪：保留命中 H 的轨迹段/补偿段；
+    G49 取消事件不归属任何 H，随筛选保留（标注补偿结束）；
+    无轨迹的设定/注释行原样保留。"""
+    out = []
+    for e in trajectory:
+        if e.get("segment") is None:
+            out.append(e)
+            continue
+        ev = e.get("tool_length_event")
+        if ev is not None and ev.get("code") == "G49":
+            out.append(e)
+        elif _entry_h(e) in h_nums:
+            out.append(e)
+    return out
+
+
+def _filter_length_comp(lc: dict, h_nums) -> dict:
+    """刀长补偿汇总按 H 号裁剪：只保留命中 H 的事件/按 H 汇总。"""
+    out = dict(lc)
+    out["events"] = [e for e in lc.get("events", [])
+                     if e.get("h") in h_nums]
+    out["by_h"] = {f"H{v}": lc.get("by_h", {}).get(f"H{v}")
+                   for v in h_nums if f"H{v}" in lc.get("by_h", {})}
+    out["without_compensation"] = None
+    out["filtered"] = True
     return out
 
 
@@ -219,16 +272,17 @@ def _summarize_holes(holes):
 
 
 def _filter_drill_cycles(dc: dict, cycles, hole_from, hole_to,
-                         wcs=None) -> dict:
-    """按循环类型/孔序/坐标系筛选固定循环段与孔记录；所有分组/明细/汇总
-    只反映命中孔。"""
+                         wcs=None, h_nums=None) -> dict:
+    """按循环类型/孔序/坐标系/刀长补偿 H 号筛选固定循环段与孔记录；
+    所有分组/明细/汇总只反映命中孔。"""
     groups = []
     for g in dc.get("groups", []):
         if cycles and g["cycle"] not in cycles:
             continue
         holes = [h for h in g.get("holes", [])
                  if _hole_in(h["hole_no"], hole_from, hole_to)
-                 and (not wcs or h.get("wcs") in wcs)]
+                 and (not wcs or h.get("wcs") in wcs)
+                 and (not h_nums or h.get("h") in h_nums)]
         if not holes:
             continue  # 整组无命中孔，直接剔除
         s = _summarize_holes(holes)
@@ -360,7 +414,8 @@ def _filter_trajectory_planes(trajectory, planes):
     return out
 
 
-def _filter_trajectory_cycles(trajectory, cycles, hole_from, hole_to):
+def _filter_trajectory_cycles(trajectory, cycles, hole_from, hole_to,
+                              h_nums=None):
     """同步裁剪逐行轨迹中固定循环段的孔/动作明细。
 
     每个动作都带 hole_no（含孔间定位段 position），按命中孔过滤；
@@ -375,7 +430,8 @@ def _filter_trajectory_cycles(trajectory, cycles, hole_from, hole_to):
         if cycles and seg.get("cycle") not in cycles:
             continue
         holes = [h for h in seg.get("holes", [])
-                 if _hole_in(h["hole_no"], hole_from, hole_to)]
+                 if _hole_in(h["hole_no"], hole_from, hole_to)
+                 and (not h_nums or h.get("h") in h_nums)]
         if not holes:
             continue
         keep_nos = {h["hole_no"] for h in holes}
@@ -400,7 +456,8 @@ def _filter_trajectory_cycles(trajectory, cycles, hole_from, hole_to):
 
 def filter_package_report(report: dict, query: dict) -> dict:
     """程序包报告筛选：?source=O100 按来源程序裁剪逐行轨迹与问题；
-    ?trajectory=0 省略轨迹。顶层统计保持完整（块级统计另给 filter 说明）。"""
+    ?h=H1 按刀长补偿 H 号筛选（与 source 可叠加）；?trajectory=0 省略轨迹。
+    顶层统计保持完整（块级统计另给 filter 说明）。"""
     out = dict(report)
     traj_flag = query.get("trajectory", ["1"])[0]
     if traj_flag in ("0", "false", "no"):
@@ -409,23 +466,38 @@ def filter_package_report(report: dict, query: dict) -> dict:
         return out
 
     sources = _csv_param(query, "source")
-    if not sources:
+    h_filter = _h_filter_param(query)
+    if not sources and not h_filter:
         return out
-    valid = {"main"} | {s["program"] for s in
-                        report.get("package", {}).get("subprograms", [])
-                        if s.get("program")}
-    bad = [s for s in sources if s not in valid]
-    if bad:
-        raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_QUERY",
-                       f"未知来源程序 {bad}", {"allowed": sorted(valid)})
+    if sources:
+        valid = {"main"} | {s["program"] for s in
+                            report.get("package", {}).get("subprograms", [])
+                            if s.get("program")}
+        bad = [s for s in sources if s not in valid]
+        if bad:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_QUERY",
+                           f"未知来源程序 {bad}", {"allowed": sorted(valid)})
     wanted = set(sources)
-    issues = [i for i in report["issues"]
-              if i.get("source_program", "main") in wanted]
+    issues = report["issues"]
+    traj = report["trajectory"]
+    if sources:
+        issues = [i for i in issues
+                  if i.get("source_program", "main") in wanted]
+        traj = [e for e in traj
+                if e.get("source_program", "main") in wanted]
+    if h_filter:
+        issues = [i for i in issues
+                  if i.get("details", {}).get("h") in h_filter]
+        traj = _filter_trajectory_h(traj, h_filter)
+        if "length_compensation" in out:
+            out["length_compensation"] = _filter_length_comp(
+                report["length_compensation"], h_filter)
+        if "drill_cycles" in out:
+            out["drill_cycles"] = _filter_drill_cycles(
+                report["drill_cycles"], None, None, None, None, h_filter)
     counts = {s: 0 for s in SEVERITY_ORDER}
     for i in issues:
         counts[i["severity"]] += 1
-    traj = [e for e in report["trajectory"]
-            if e.get("source_program", "main") in wanted]
     out["issues"] = issues
     out["trajectory"] = traj
     out["risk"] = dict(report["risk"])
@@ -433,6 +505,7 @@ def filter_package_report(report: dict, query: dict) -> dict:
     out["risk"]["total_issues"] = len(issues)
     out["filter"] = {
         "source": sources,
+        "h": [f"H{v}" for v in h_filter],
         "matched_issues": len(issues),
         "matched_blocks": len(traj),
         "total_issues_in_report": len(report["issues"]),
@@ -456,6 +529,26 @@ def _int_param(query: dict, name: str):
     except ValueError:
         raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_QUERY",
                        f"{name} 必须是整数")
+
+
+def _h_filter_param(query: dict):
+    """?h=H1,H2 或 ?h=1,2（可混用）；H 号必须为正整数。"""
+    out = []
+    for raw in _csv_param(query, "h"):
+        tok = raw.upper()
+        if tok.startswith("H"):
+            tok = tok[1:]
+        try:
+            v = int(tok)
+        except ValueError:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_QUERY",
+                           f"未知刀长补偿 H 号 {raw!r}（必须为正整数，如 H1）")
+        if v <= 0:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_QUERY",
+                           f"刀长补偿 H 号必须为正整数：{raw!r}")
+        if v not in out:
+            out.append(v)
+    return out
 
 
 # ---------------------------------------------------------------------------

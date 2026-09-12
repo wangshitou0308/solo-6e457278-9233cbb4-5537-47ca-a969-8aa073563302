@@ -62,6 +62,9 @@ ISSUE_SEVERITY = {
     "CYCLE_PLANE_CONFLICT": "error",       # 孔底与 R 平面 / 初始平面顺序矛盾
     "CYCLE_NO_INHERITABLE_STATE": "error",  # 后续孔位没有可继承的循环/位置状态
     "CYCLE_PLANE_NOT_G17": "error",        # 固定循环只允许在 G17(XY) 平面展开
+    "LENGTH_COMP_MISSING_H": "error",      # G43/G44 未给 H
+    "LENGTH_COMP_H_NOT_FOUND": "error",    # H 非正整数或不在 H 寄存器偏置表
+    "LENGTH_COMP_CONFLICT": "error",       # 同段补偿指令冲突（G43/G44/G49 混用等）
 }
 
 ISSUE_TITLE = {
@@ -83,13 +86,20 @@ ISSUE_TITLE = {
     "CYCLE_PLANE_CONFLICT": "固定循环平面顺序矛盾（对应孔已阻断）",
     "CYCLE_NO_INHERITABLE_STATE": "后续孔位没有可继承的循环状态（该孔已阻断）",
     "CYCLE_PLANE_NOT_G17": "固定循环仅允许在 G17(XY) 平面展开（对应孔已阻断）",
+    "LENGTH_COMP_MISSING_H": "刀长补偿指令缺少 H 号（该段已阻断）",
+    "LENGTH_COMP_H_NOT_FOUND": "刀长补偿 H 号非法或不在偏置表（该段已阻断）",
+    "LENGTH_COMP_CONFLICT": "同程序段补偿指令冲突（该段已阻断）",
 }
 
 ALLOWED_LETTERS = {"G", "M", "X", "Y", "Z", "I", "J", "K", "R", "F", "S", "N",
-                   "Q", "P", "L"}
+                   "Q", "P", "L", "H"}
 MOTION_G = {"0": "rapid", "1": "linear", "2": "arc_cw", "3": "arc_ccw"}
 MOTION_CN = {"rapid": "快速", "linear": "直线",
              "arc_cw": "顺时针圆弧", "arc_ccw": "逆时针圆弧"}
+# 刀长补偿 G 代码 -> 模态键（G43 加、G44 减、G49 取消）
+LENGTH_COMP_G = {"43": "plus", "44": "minus", "49": "cancel"}
+LENGTH_COMP_CN = {"plus": "G43 加", "minus": "G44 减", "cancel": "G49 取消"}
+# H 寄存器偏置必须为正整数（H0 等在控制器上另有含义，本预检不使用）
 SETTING_G_UNIT = {"20": "inch", "21": "mm"}
 SETTING_G_MODE = {"90": "absolute", "91": "relative"}
 # 工件坐标系模态 G54-G59（偏置由机床配置 wcs_offsets 给出）
@@ -180,6 +190,8 @@ class MachineConfig:
     # G54-G59 各自的工件坐标偏置 {"G54": {"x":..,"y":..,"z":..}, ...}
     # 未出现在表中的坐标系视为“未配置”：程序引用时机床坐标结论标为未知
     wcs_offsets: dict = field(default_factory=dict)
+    # H 寄存器刀长偏置表 {h号(正整数): 偏置 mm}，G43 加 / G44 减
+    length_offsets: dict = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: dict) -> "MachineConfig":
@@ -260,6 +272,38 @@ class MachineConfig:
             wcs_offsets["G54"] = {"x": ox, "y": oy, "z": oz}
         g54 = wcs_offsets["G54"]
 
+        # 刀长补偿 H 寄存器偏置表 length_offsets={"1": 12.5, 2: -3.0}；
+        # 键必须为正整数（H0 不接受），值必须为数值（mm），非法时定位到
+        # 具体寄存器（如 length_offsets.H3 必须是数值），拒绝保存。
+        length_offsets: dict[int, float] = {}
+        raw_offsets = d.get("length_offsets")
+        if raw_offsets is not None:
+            if not isinstance(raw_offsets, dict):
+                errors.append(
+                    "length_offsets 必须是对象，形如 "
+                    '{"1": 12.5, "2": -3.0}（H 号 -> 刀长偏置 mm）')
+            else:
+                for hk, hv in raw_offsets.items():
+                    hs = str(hk).strip().upper()
+                    if hs.startswith("H"):
+                        hs = hs[1:]
+                    try:
+                        hf = float(hs)
+                    except (TypeError, ValueError):
+                        hf = None
+                    if hf is None or not hf.is_integer() or hf <= 0:
+                        errors.append(
+                            f"length_offsets.{hk}：H 号必须为正整数"
+                            f"（如 H1），收到 {hk!r}")
+                        continue
+                    hno = int(hf)
+                    try:
+                        length_offsets[hno] = float(hv)
+                    except (TypeError, ValueError):
+                        errors.append(
+                            f"length_offsets.H{hno} 必须是数值（刀长偏置 mm），"
+                            f"收到 {hv!r}")
+
         for lo, hi, ax in ((x_min, x_max, "X"), (y_min, y_max, "Y"),
                            (z_min, z_max, "Z")):
             if hi <= lo:
@@ -281,6 +325,7 @@ class MachineConfig:
             max_spindle_rpm=max_rpm,
             offset_x=g54["x"], offset_y=g54["y"], offset_z=g54["z"],
             wcs_offsets=wcs_offsets,
+            length_offsets=dict(sorted(length_offsets.items())),
         )
 
     def offset_for(self, wcs: str | None):
@@ -291,6 +336,12 @@ class MachineConfig:
         if off is None:
             return None
         return (off["x"], off["y"], off["z"])
+
+    def length_offset_for(self, h: int | None) -> float | None:
+        """取 H 寄存器的刀长偏置（mm）；未登记返回 None。"""
+        if h is None:
+            return None
+        return self.length_offsets.get(h)
 
     def to_dict(self) -> dict:
         return {
@@ -306,6 +357,8 @@ class MachineConfig:
             "offset_z": self.offset_z,
             "wcs_offsets": {w: dict(off)
                             for w, off in sorted(self.wcs_offsets.items())},
+            "length_offsets": {str(h): self.length_offsets[h]
+                               for h in sorted(self.length_offsets)},
             "travel_x": [self.x_min, self.x_max],
             "travel_y": [self.y_min, self.y_max],
             "travel_z": [self.z_min, self.z_max],
@@ -343,6 +396,14 @@ class State:
     pending_return_line: int | None = None
     pending_return_source: str | None = None
     pending_return_default: bool = True
+    # 刀长补偿模态：direction 'plus'(G43)/'minus'(G44)/None(G49/上电)；
+    # h 为生效的 H 号，signed 为代数值（G43=+表值，G44=-表值）。
+    # state.x/y/z 始终表示刀尖工件坐标；主轴基准点机床坐标按
+    # tip_machine + (0,0,signed) 计算（Z 行程按基准点判定）。
+    comp_direction: str | None = None
+    comp_h: int | None = None
+    comp_signed: float = 0.0
+    comp_apply_line: int | None = None
 
     def clone(self) -> "State":
         return State(
@@ -362,6 +423,10 @@ class State:
             pending_return_line=self.pending_return_line,
             pending_return_source=self.pending_return_source,
             pending_return_default=self.pending_return_default,
+            comp_direction=self.comp_direction,
+            comp_h=self.comp_h,
+            comp_signed=self.comp_signed,
+            comp_apply_line=self.comp_apply_line,
         )
 
     def unit_factor(self) -> float | None:
@@ -391,6 +456,17 @@ class State:
                              if self.cycle is not None else None),
             "cycle_return_plane": ("G98" if self.pending_return == "initial"
                                    else "G99"),
+            "tool_length_compensation": {
+                "active": self.comp_direction is not None,
+                "code": ("G49" if self.comp_direction is None
+                         else ("G43" if self.comp_direction == "plus"
+                               else "G44")),
+                "direction": self.comp_direction,
+                "h": self.comp_h,
+                "offset_mm": round6(abs(self.comp_signed)),
+                "signed_offset_mm": round6(self.comp_signed),
+                "applied_line_no": self.comp_apply_line,
+            },
         }
 
 
@@ -636,6 +712,13 @@ class Analyzer:
         self._snap_in_return_line: int | None = None
         self._snap_in_return_source: str | None = None
         self._snap_in_return_default = True
+        # 刀长补偿：G43/G44/G49 事件流、按 H 号的路径/钻孔汇总、
+        # 当前行补偿信息（由 _apply_length_comp 设置：起点用旧补偿、
+        # 段内其余点用新补偿；补偿-only 行用于重算刀尖 Z）。
+        self.length_events: list[dict] = []
+        self.comp_path: dict = {}
+        self._line_comp: dict | None = None
+        self._snap_in_line_no: int | None = None
         # (line_no, code) -> 已登记问题索引：循环展开动作的工艺问题按行去重
         self._line_dedup: dict[tuple[int, str], int] = {}
 
@@ -661,6 +744,9 @@ class Analyzer:
         # 每个问题都归属到触发时的工件坐标系（未建立则为 None），
         # 报告可按 wcs=G54..G59 筛选
         details.setdefault("wcs", self.state.wcs)
+        # 同时归属到触发时生效的刀长补偿 H 号（未补偿为 None）；
+        # 补偿指令自身的问题可在 details 里显式给出请求的 h。
+        details.setdefault("h", self.state.comp_h)
         iss = Issue(
             code=code,
             severity=ISSUE_SEVERITY[code],
@@ -736,6 +822,125 @@ class Analyzer:
                 setattr(self.state, letter.lower(), Axis(None, False))
         self.state.wcs = new_wcs
 
+    def _apply_length_comp(self, pl: ParsedLine,
+                            issue_indexes: list[int]) -> bool:
+        """处理本行刀长补偿 G43(加)/G44(减)/G49(取消) 与 H 词。
+
+        - H 只在与 G43/G44 同段时生效；G49 段上的 H 不生效（不报错）；
+          无补偿指令行上的 H 不生效（不报错，仅规范化标注）。
+        - 同行运动使用新补偿：补偿改变且本行无 Z 词时（补偿-only 或仅
+          XY 运动），主轴基准点保持不动，按新补偿重算刀尖工件 Z。
+        - 缺 H / H 非正整数 / H 不在偏置表 / 同段补偿指令冲突：整段阻断，
+          返回 False（不沿用旧值）。
+        成功时把本行补偿信息存入 self._line_comp（含起点旧补偿 signed_old
+        与段内新补偿 signed_new）。
+        """
+        keys = [g_code_key(w) for w in pl.g_words]
+        comp_keys = [k for k in keys if k in LENGTH_COMP_G]
+        h_words = [w for w in pl.words if w.letter == "H"]
+        st = self.state
+
+        # 无补偿指令：H 不生效；段沿用当前补偿（起终点一致）
+        if not comp_keys:
+            bare_h = " ".join(f"H{fmt_num(w.value)}" for w in h_words)
+            self._line_comp = {
+                "changed": False, "token": "",
+                "bare_h": bare_h,
+                "signed_old": st.comp_signed, "signed_new": st.comp_signed,
+                "h": st.comp_h, "direction": st.comp_direction}
+            return True
+
+        # 同段冲突：G43/G44/G49 出现多个，或同一补偿码重复
+        if len(comp_keys) > 1 or len(set(comp_keys)) != len(comp_keys):
+            issue_indexes.append(self._issue(
+                "LENGTH_COMP_CONFLICT", pl,
+                f"同一程序段出现冲突的刀长补偿指令 "
+                f"{'/'.join('G' + k for k in keys if k in LENGTH_COMP_G)}"
+                "（G43/G44/G49 同段互斥）；该段阻断，不沿用旧补偿值",
+                {"comp_codes": ["G" + k for k in comp_keys]}))
+            return False
+        code = comp_keys[0]
+        direction = None if code == "49" else LENGTH_COMP_G[code]
+        token = f"G{code}"
+        event = None
+
+        if direction is None:
+            # G49：取消补偿；同行 H 不生效
+            event = {"code": "G49", "direction": "cancel", "h": None,
+                     "offset_mm": None, "signed_offset_mm": 0.0}
+        else:
+            if not h_words:
+                issue_indexes.append(self._issue(
+                    "LENGTH_COMP_MISSING_H", pl,
+                    f"G{code} 刀长补偿需要同一程序段给出 H 寄存器号"
+                    "（如 G43 H1）；该段阻断，不沿用旧补偿值",
+                    {"comp_code": f"G{code}", "h": None}))
+                return False
+            if len(h_words) > 1:
+                issue_indexes.append(self._issue(
+                    "LENGTH_COMP_CONFLICT", pl,
+                    f"同一程序段给出 {len(h_words)} 个 H 号"
+                    f"（{'/'.join('H' + fmt_num(w.value) for w in h_words)}），"
+                    "刀长补偿只能指定一个 H；该段阻断",
+                    {"comp_codes": ["G" + code],
+                     "h_words": [fmt_num(w.value) for w in h_words]}))
+                return False
+            hw = h_words[0]
+            h_int = (int(hw.value) if float(hw.value).is_integer() else None)
+            table = self.cfg.length_offset_for(h_int)
+            if h_int is None or h_int <= 0 or table is None:
+                issue_indexes.append(self._issue(
+                    "LENGTH_COMP_H_NOT_FOUND", pl,
+                    f"刀长补偿 H{fmt_num(hw.value)} 非法或不在机床配置 "
+                    "length_offsets 偏置表中（H 必须为正整数且已登记）；"
+                    "该段阻断，不沿用旧补偿值",
+                    {"comp_code": f"G{code}",
+                     "h": h_int if (h_int is not None and h_int > 0) else None,
+                     "h_raw": hw.value,
+                     "registered_h": sorted(self.cfg.length_offsets)}))
+                return False
+            signed = self._comp_sign(direction) * table
+            token += f" H{h_int}"
+            event = {"code": f"G{code}", "direction": direction,
+                     "h": h_int, "offset_mm": round6(abs(table)),
+                     "signed_offset_mm": round6(signed)}
+
+        signed_old = st.comp_signed
+        dir_old = st.comp_direction
+        signed_new = event["signed_offset_mm"]
+        new_h = event["h"]
+        new_dir = None if event["direction"] == "cancel" else event["direction"]
+
+        # 同行运动使用新补偿：本行没有 Z 词时，主轴基准点保持不动，
+        # 重算刀尖工件坐标 Z（新刀尖 = 基准点 - 新补偿，基准点按旧补偿固定）
+        has_z = any(w.letter == "Z" for w in pl.words)
+        tip_adjusted = False
+        if signed_new != signed_old and not has_z and st.z.known \
+                and st.z.value is not None:
+            st.z = Axis(st.z.value + signed_old - signed_new, True)
+            tip_adjusted = True
+
+        st.comp_direction = new_dir
+        st.comp_h = new_h
+        st.comp_signed = signed_new
+        st.comp_apply_line = pl.line_no
+
+        event.update({
+            "line_no": pl.line_no, "source_line": pl.source,
+            "wcs": st.wcs, "tip_z_recomputed": tip_adjusted,
+            "spindle_z_fixed": tip_adjusted,
+            "tip_z_mm": (round6(st.z.value)
+                         if st.z.known and st.z.value is not None else None),
+        })
+        self.length_events.append(event)
+        self._line_comp = {
+            "changed": signed_new != signed_old or new_dir != dir_old,
+            "token": token, "bare_h": "",
+            "event": event,
+            "signed_old": signed_old, "signed_new": signed_new,
+            "h": new_h, "direction": new_dir, "tip_adjusted": tip_adjusted}
+        return True
+
     def _snapshot(self) -> dict:
         """模态快照（附当前坐标系偏置，便于逐行轨迹直接读取）。"""
         snap = self.state.snapshot()
@@ -759,22 +964,95 @@ class Analyzer:
                 p[1] + off[1] if p[1] is not None else None,
                 p[2] + off[2] if p[2] is not None else None]
 
-    def _machine_out(self, p, off):
-        """轨迹输出用机床坐标点；偏置未知时整体为 None。"""
+    # -- 刀长补偿：刀尖工件坐标 <-> 主轴基准点机床坐标 ---------------------
+    # 约定：state.x/y/z 始终是刀尖工件坐标；G43 时代数补偿为 +H 表值，
+    # G44 时为 -H 表值。主轴基准点机床坐标 = 刀尖工件 + 工件偏置
+    # + (0, 0, 代数补偿)。安全 Z 按刀尖工件 Z 判定；Z 轴行程按基准点判定。
+
+    @staticmethod
+    def _comp_sign(direction: str | None) -> float:
+        if direction == "plus":
+            return 1.0
+        if direction == "minus":
+            return -1.0
+        return 0.0
+
+    def _signed_comp(self, direction: str | None, h: int | None) -> float:
+        off = self.cfg.length_offset_for(h)
+        if off is None or direction is None:
+            return 0.0
+        return self._comp_sign(direction) * off
+
+    def _comp_out(self):
+        """当前刀长补偿（供轨迹输出）：未生效返回 None。"""
+        if self.state.comp_direction is None:
+            return None
+        return {
+            "code": ("G43" if self.state.comp_direction == "plus" else "G44"),
+            "direction": self.state.comp_direction,
+            "h": self.state.comp_h,
+            "offset_mm": round6(abs(self.state.comp_signed)),
+            "signed_offset_mm": round6(self.state.comp_signed),
+        }
+
+    def _length_event_out(self, ev: dict, tip_z, off) -> dict:
+        """补偿事件（供轨迹 length_compensation 条目与报告 length_comp 节）。"""
+        signed = ev["signed_offset_mm"]
+        spindle_z = None
+        if tip_z is not None and off is not None:
+            spindle_z = round6(tip_z + off[2] + signed)
+        return {
+            "line_no": ev["line_no"],
+            "source_line": ev["source_line"],
+            "code": ev["code"],
+            "direction": ev["direction"],
+            "h": ev["h"],
+            "offset_mm": ev["offset_mm"],
+            "signed_offset_mm": signed,
+            "wcs": ev.get("wcs"),
+            "tip_z_workpiece_mm": round6(tip_z),
+            "spindle_z_machine_mm": spindle_z,
+            "tip_z_recomputed": ev.get("tip_z_recomputed", False),
+        }
+
+    def _spindle_point(self, p, off=None, signed: float | None = None):
+        """刀尖工件坐标 -> 主轴基准点机床坐标（工件偏置 + Z 向刀长补偿）。"""
+        off = self._current_offset() if off is None else off
+        if off is None:
+            return [None, None, None]
+        if signed is None:
+            signed = self.state.comp_signed
+        return [p[0] + off[0] if p[0] is not None else None,
+                p[1] + off[1] if p[1] is not None else None,
+                p[2] + off[2] + signed if p[2] is not None else None]
+
+    def _spindle_out(self, p, off, signed: float | None = None):
+        """轨迹输出用主轴基准点机床坐标；工件偏置未知时整体为 None。"""
         if off is None:
             return None
-        return [round6(p[i] + off[i]) if p[i] is not None else None
-                for i in range(3)]
+        if signed is None:
+            signed = self.state.comp_signed
+        out = []
+        for i in range(3):
+            if p[i] is None:
+                out.append(None)
+            elif i == 2:
+                out.append(round6(p[i] + off[i] + signed))
+            else:
+                out.append(round6(p[i] + off[i]))
+        return out
 
-    def _grow_bbox(self, pts, machine: bool):
+    def _grow_bbox(self, pts, machine: bool, comps=None):
         if machine:
             off = self._current_offset()
             if off is None:
                 return
             wbox = self.wcs_mbbox.setdefault(
                 self.state.wcs, [[math.inf] * 3, [-math.inf] * 3])
-            for p in pts:
-                mp = self._machine_point(p, off)
+            for k, p in enumerate(pts):
+                signed = (comps[k] if comps is not None
+                          and k < len(comps) else None)
+                mp = self._spindle_point(p, off, signed)
                 for i, v in enumerate(mp):
                     if v is None:
                         continue
@@ -796,13 +1074,16 @@ class Analyzer:
                 if v > self.bmax[i]:
                     self.bmax[i] = v
 
-    def _bounds_violations(self, pts) -> list[dict]:
+    def _bounds_violations(self, pts, comps=None) -> list[dict]:
         c = self.cfg
         limits = (("X", c.x_min, c.x_max), ("Y", c.y_min, c.y_max),
                   ("Z", c.z_min, c.z_max))
         worst: dict[str, dict] = {}
-        for p in pts:
-            mp = self._machine_point(p)
+        off = self._current_offset()
+        for k, p in enumerate(pts):
+            signed = (comps[k] if comps is not None
+                      and k < len(comps) else None)
+            mp = self._spindle_point(p, off, signed)
             for i, (axis, lo, hi) in enumerate(limits):
                 v = mp[i]
                 if v is None:
@@ -866,8 +1147,10 @@ class Analyzer:
                     motion_g: str | None,
                     coord_words: list[tuple[str, float]],
                     f_val: float | None, s_val: float | None,
-                    motion_is_modal: bool = False) -> str:
-        """G(单位/模式/平面/WCS/运动) -> M -> XYZIJKR -> F S 的规范顺序。"""
+                    motion_is_modal: bool = False,
+                    comp_token: str | None = None,
+                    bare_h: str = "") -> str:
+        """G(单位/模式/平面/WCS/刀补/运动) -> M -> XYZIJKR -> F S 的规范顺序。"""
         out: list[str] = []
         unit_g = next((g for g in applied_g if g in SETTING_G_UNIT), None)
         mode_g = next((g for g in applied_g if g in SETTING_G_MODE), None)
@@ -881,6 +1164,8 @@ class Analyzer:
             out.append(f"G{plane_g}")
         if wcs_g:
             out.append(f"G{wcs_g}")
+        if comp_token:
+            out.append(comp_token)
         if motion_g is not None:
             out.append(f"G{motion_g}" + ("(模态)" if motion_is_modal else ""))
         for w in m_words:
@@ -891,7 +1176,11 @@ class Analyzer:
             out.append("F" + fmt_num(f_val))
         if s_val is not None:
             out.append("S" + fmt_num(s_val))
-        return " ".join(out)
+        text = " ".join(out)
+        if bare_h:
+            note = f"{bare_h}(无 G43/G44，不生效)"
+            text = f"{text}  {note}" if text else note
+        return text
 
     # -- 主流程 ------------------------------------------------------------
 
@@ -929,6 +1218,8 @@ class Analyzer:
         self._snap_in_return_line = self.state.pending_return_line
         self._snap_in_return_source = self.state.pending_return_source
         self._snap_in_return_default = self.state.pending_return_default
+        self._line_comp = None
+        self._snap_in_line_no = pl.line_no
 
         if pl.is_blank:
             self.blank_count += 1
@@ -1017,6 +1308,19 @@ class Analyzer:
                      if g is not None]
 
         issue_indexes: list[int] = []
+
+        # 3.5) 刀长补偿 G43/G44/G49（H 只随 G43/G44 生效）。
+        # 补偿指令非法（缺 H / H 不存在 / 同段冲突）时整段阻断：连同本行
+        # 单位/模式/平面/工件坐标系等模态改动一起回滚，不沿用旧补偿值。
+        if not self._apply_length_comp(pl, issue_indexes):
+            self._rollback_to(self._snap_in)
+            normalized = self._blocked_normalized(pl)
+            self._finish_line(pl, "blocked", normalized, executed=False,
+                              block_reason="length_comp",
+                              issue_indexes=issue_indexes)
+            self.blocked_count += 1
+            return
+        comp_token = (self._line_comp or {}).get("token")
 
         # 分类本行 G 词（G80-G83、G98/G99 为固定循环组，G0-G3 为运动组）
         keys = [g_code_key(w) for w in g_words]
@@ -1168,20 +1472,26 @@ class Analyzer:
             and (ijk_words or r_word is not None))
         if not axis_words and not arc_no_endpoint:
             normalized = self._normalized(
-                applied_g, m_words, line_motion_key, coord_words, f_raw, s_raw)
+                applied_g, m_words, line_motion_key, coord_words, f_raw, s_raw,
+                comp_token=comp_token,
+                bare_h=(self._line_comp or {}).get("bare_h", ""))
             if "80" in keys:
                 normalized = (normalized + " " if normalized else "") + "G80(取消循环)"
             if line_return_key is not None:
                 normalized = (normalized + " " if normalized else "") + (
                     f"G{line_return_key}(返回{RETURN_CN[RETURN_G[line_return_key]]})")
-            self._finish_line(pl, "setting", normalized, executed=True,
+            entry_type = ("length_compensation"
+                          if (self._line_comp or {}).get("event") else "setting")
+            self._finish_line(pl, entry_type, normalized, executed=True,
                               issue_indexes=issue_indexes)
             return
 
         # 有轴坐标词但没有任何运动模态 -> 不猜测运动
         if self.state.motion_mode is None:
             normalized = self._normalized(
-                applied_g, m_words, None, coord_words, f_raw, s_raw)
+                applied_g, m_words, None, coord_words, f_raw, s_raw,
+                comp_token=comp_token,
+                bare_h=(self._line_comp or {}).get("bare_h", ""))
             issue_indexes.append(self._issue(
                 "NO_MOTION_MODE", pl,
                 "出现轴坐标词，但本行与此前都没有 G0-G3；不猜测运动，"
@@ -1263,12 +1573,15 @@ class Analyzer:
                     "length_mm": length,
                 }
 
+            self._attach_segment_comp(segment)
             self._run_segment_checks(pl, motion_mode, segment, issue_indexes)
             self._accumulate(motion_mode, segment)
 
         normalized = self._normalized(
             applied_g, m_words, motion_g,
-            coord_words, f_raw, s_raw, motion_is_modal)
+            coord_words, f_raw, s_raw, motion_is_modal,
+            comp_token=comp_token,
+            bare_h=(self._line_comp or {}).get("bare_h", ""))
         self._finish_line(
             pl, motion_mode, normalized, executed=True,
             segment=self._segment_out(segment),
@@ -1392,6 +1705,7 @@ class Analyzer:
         def ax(d):
             return Axis(d["value_mm"], d["known"])
 
+        lc = snapshot.get("tool_length_compensation", {})
         s = State(
             unit=snapshot["unit"],
             distance_mode=snapshot["distance_mode"],
@@ -1408,8 +1722,17 @@ class Analyzer:
             pending_return_line=self._snap_in_return_line,
             pending_return_source=self._snap_in_return_source,
             pending_return_default=self._snap_in_return_default,
+            comp_direction=lc.get("direction"),
+            comp_h=lc.get("h"),
+            comp_signed=lc.get("signed_offset_mm") or 0.0,
+            comp_apply_line=lc.get("applied_line_no"),
         )
         self.state = s
+        # 撤销本行登记的刀长补偿事件（圆弧无解回滚 / 补偿段阻断时）
+        if self._snap_in_line_no is not None and self.length_events \
+                and self.length_events[-1].get(
+                    "line_no") == self._snap_in_line_no:
+            self.length_events.pop()
 
     # -- 固定钻孔循环 ------------------------------------------------------
 
@@ -1676,6 +1999,15 @@ class Analyzer:
         blocked = trigger and (
             bool(block_codes) or unknown_unit or unknown_mode)
 
+        # 阻断孔不产生位移：若本行刀长补偿改变（补偿-only 重算过刀尖 Z），
+        # 撤销该重算——补偿模态仍按本行 G43/G44/G49 生效，但主轴基准点
+        # 与刀尖工件坐标都保持在行前位置。
+        lc = self._line_comp or {}
+        if blocked and lc.get("tip_adjusted"):
+            self.state.z = Axis(
+                self.state.z.value - lc["signed_old"] + lc["signed_new"], True)
+            lc["tip_adjusted"] = False
+
         # 展开孔位（即便阻断也登记孔记录，写明依据；阻断不产生位移）。
         # 工艺问题（主轴未转/无进给）在 _issue 层按触发行去重，
         # G83 多次进给动作不会重复报告。
@@ -1751,6 +2083,7 @@ class Analyzer:
             pos_known = (not blocked and tgt_xy[0] is not None
                          and tgt_xy[1] is not None and last_z is not None)
             wcs_off = self._current_offset()
+            comp_signed = self.state.comp_signed
             hole = {
                 "hole_no": no,
                 "cycle": cd.cycle,
@@ -1759,6 +2092,8 @@ class Analyzer:
                 "trigger_source_line": pl.source,
                 "definition_line_no": cd.def_line_no,
                 "wcs": self.state.wcs,
+                "h": self.state.comp_h,
+                "tool_compensation": self._comp_out(),
                 "x_mm": round6(tgt_xy[0]) if not blocked else None,
                 "y_mm": round6(tgt_xy[1]) if not blocked else None,
                 "machine_x_mm": (round6(tgt_xy[0] + wcs_off[0])
@@ -1767,6 +2102,10 @@ class Analyzer:
                 "machine_y_mm": (round6(tgt_xy[1] + wcs_off[1])
                                  if not blocked and wcs_off is not None
                                  and tgt_xy[1] is not None else None),
+                # 孔底主轴基准点 Z 机床坐标（工件偏置 + 刀长补偿）
+                "spindle_bottom_z_machine_mm": (
+                    round6(cd.z.value + wcs_off[2] + comp_signed)
+                    if not blocked and wcs_off is not None else None),
                 "l_repeat": (int(round(l_word)) if l_word is not None else 1),
                 "status": "blocked" if blocked else "drilled",
                 "block_codes": block_codes if blocked else [],
@@ -1858,24 +2197,41 @@ class Analyzer:
             if wst is not None:
                 wst["rapid"] += rapid_len
                 wst["cutting"] += cut_len
+            # 按 H 号统计展开路径（钻削工艺）
+            hb = self._comp_path_bucket()
+            hb["cycle_rapid"] += rapid_len
+            hb["cycle_cutting"] += cut_len
+            hb["drill_depth"] += depth_sum
 
-        # 循环段与每个展开动作都记录坐标系、偏置与机床坐标
+        # 循环段与每个展开动作都记录坐标系、偏置、刀长补偿 H 与
+        # 主轴基准点机床坐标（Z 已叠加刀长补偿）
         wcs_off = self._current_offset()
+        comp_signed = self.state.comp_signed
         for mv in all_moves:
-            mv["start_machine_mm"] = self._machine_out(mv["start_mm"], wcs_off)
-            mv["end_machine_mm"] = self._machine_out(mv["end_mm"], wcs_off)
+            mv["h"] = self.state.comp_h
+            mv["tool_compensation"] = self._comp_out()
+            mv["start_machine_mm"] = self._spindle_out(
+                mv["start_mm"], wcs_off, comp_signed)
+            mv["end_machine_mm"] = self._spindle_out(
+                mv["end_mm"], wcs_off, comp_signed)
+        snap_z = self._snap_in["z"]["value_mm"]
         segment = {
             "kind": "canned_cycle",
             "cycle": cd.cycle,
             "wcs": self.state.wcs,
             "wcs_configured": wcs_off is not None,
             "offset_mm": self._offset_out(wcs_off),
+            "h": self.state.comp_h,
+            "tool_compensation": self._comp_out(),
+            "comp_start_signed_mm": (self._line_comp or {}).get(
+                "signed_old", comp_signed),
+            "comp_end_signed_mm": comp_signed,
             "hole_nos": hole_nos,
             "start_mm": ([round6(v) for v in
-                          (start_xy[0], start_xy[1],
-                           self._snap_in["z"]["value_mm"])]
+                          (start_xy[0], start_xy[1], snap_z)]
                          if start_xy[0] is not None
-                         and start_xy[1] is not None else None),
+                         and start_xy[1] is not None
+                         and snap_z is not None else None),
             "holes": holes,
             "moves_mm": all_moves,
             "length_mm": round(rapid_len + cut_len, 6),
@@ -1895,10 +2251,13 @@ class Analyzer:
         """
         pts = [tuple(mv["start_mm"]), tuple(mv["end_mm"])]
         kind = "rapid" if mv["motion"] == "rapid" else "linear"
+        c = self.state.comp_signed
         seg = {
             "kind": kind,
             "start": pts[0], "end": pts[1], "points": pts,
             "length_mm": mv["length_mm"],
+            # 循环展开期间刀长补偿恒定（触发行起点也已按新补偿重算）
+            "comp_start_signed_mm": c, "comp_end_signed_mm": c,
         }
         before = len(issue_indexes)
         # 循环内部快速动作（G83 排屑回退/再下钻、到 R 的垂直接近）豁免
@@ -1938,8 +2297,8 @@ class Analyzer:
             z_ref = s1[2] if end_below else min(zs)
             issue_indexes.append(self._issue(
                 "RAPID_BELOW_SAFE_Z", pl,
-                f"固定循环孔间快速定位到达/经过 Z={fmt_num(z_ref)} mm"
-                f"（工件坐标，孔序 {hole_no}），低于安全 Z "
+                f"固定循环孔间快速定位到达/经过刀尖 Z={fmt_num(z_ref)} mm"
+                f"（刀尖工件坐标，孔序 {hole_no}），低于安全 Z "
                 f"{fmt_num(self.cfg.safe_z)} mm"
                 f"（低 {fmt_num(self.cfg.safe_z - z_ref)} mm；"
                 f"通常因 G99 在 R 平面横移导致）",
@@ -2002,18 +2361,26 @@ class Analyzer:
 
     def _cycle_normalized(self, pl, cd: CycleDef, line_cycle_key,
                           f_raw, s_raw) -> str:
-        """循环行的规范化文本（含循环代号、返回平面、本行词与继承标注）。"""
+        """循环行的规范化文本（含刀长补偿、循环代号、返回平面、本行词与
+        继承标注）。"""
         out: list[str] = []
+        comp_token = (self._line_comp or {}).get("token")
+        if comp_token:
+            out.append(comp_token)
         if line_cycle_key is not None:
             out.append(CYCLE_G[line_cycle_key])
         ret_g = "G98" if cd.return_mode == "initial" else "G99"
         if not cd.return_mode_default:
             out.append(ret_g)
         for w in pl.words:
-            if w.letter in ("N", "G"):
+            if w.letter in ("N", "G", "H"):
                 continue
             if w.letter in ("X", "Y", "Z", "R", "Q", "P", "L", "F", "S"):
                 out.append(f"{w.letter}{fmt_num(w.value)}")
+        # 同行但不随补偿生效的 H（G49 行或无 G43/G44）
+        bare_h = (self._line_comp or {}).get("bare_h", "")
+        if bare_h:
+            out.append(f"{bare_h}(无 G43/G44，不生效)")
         for w in pl.m_words:
             out.append("M" + fmt_num(w.value))
         # 继承参数标注
@@ -2186,11 +2553,43 @@ class Analyzer:
 
     # -- 段级检查 ----------------------------------------------------------
 
+    def _attach_segment_comp(self, segment: dict):
+        """给普通运动段逐点挂刀长补偿（mm 代数值）：起点用进入本行前的
+        旧补偿，其余点用本行新补偿（补偿不改变时二者相同）。"""
+        lc = self._line_comp or {}
+        old = lc.get("signed_old", self.state.comp_signed)
+        new = lc.get("signed_new", self.state.comp_signed)
+        comps = []
+        for k in range(len(segment["points"])):
+            comps.append(old if k == 0 else new)
+        segment["comp_signed_mm"] = comps
+        segment["comp_start_signed_mm"] = old
+        segment["comp_end_signed_mm"] = new
+
     def _run_segment_checks(self, pl, motion_mode, segment, issue_indexes,
                             cycle_context: bool = False,
                             line_dedupe: bool = False):
         # 圆弧段用真实弧线的精确极值点做行程/包围盒；其余段用轨迹点
         points = segment.get("check_points") or segment["points"]
+        # 逐点刀长补偿（代数值 mm）：行程/机床包围盒按主轴基准点判定
+        if "comp_signed_mm" in segment:
+            src = segment["comp_signed_mm"]
+            if segment.get("check_points") is not None and \
+                    len(src) == len(segment["points"]):
+                # 圆弧：极值点落在真实弧线上，按其在采样序列中的位置取补偿
+                comps = []
+                src_pts = segment["points"]
+                for p in points:
+                    if p is src_pts[0]:
+                        comps.append(src[0])
+                    else:
+                        comps.append(src[-1])
+            else:
+                comps = src
+        else:
+            # 固定循环展开动作：整段补偿恒定
+            c = segment.get("comp_end_signed_mm", self.state.comp_signed)
+            comps = [c] * len(points)
         # 弧段产生的问题带上平面信息，报告可按 plane=G17/G18/G19 筛选
         arc_plane = (segment.get("arc") or {}).get("plane_code")
 
@@ -2219,19 +2618,26 @@ class Analyzer:
                 _details({"reason": "wcs_not_configured",
                           "wcs": self.state.wcs})))
         else:
-            for v in self._bounds_violations(points):
+            for v in self._bounds_violations(points, comps):
                 c = self.cfg
                 bound = {"X": (c.x_min, c.x_max),
                          "Y": (c.y_min, c.y_max),
                          "Z": (c.z_min, c.z_max)}[v["axis"]]
+                comp_note = ""
+                if v["axis"] == "Z" and abs(self.state.comp_signed) > MM_EPS:
+                    comp_note = (f"与 {self.state.wcs} 偏置及刀长补偿"
+                                 f"H{self.state.comp_h}"
+                                 f"（{fmt_num(self.state.comp_signed)} mm）")
+                else:
+                    comp_note = f"已叠加 {self.state.wcs} 偏置"
                 issue_indexes.append(self._issue(
                     "OUT_OF_BOUNDS", pl,
-                    f"{v['axis']} 轴机床坐标 {fmt_num(v['value_mm'])} mm 越出行程"
+                    f"{v['axis']} 轴主轴基准点机床坐标 "
+                    f"{fmt_num(v['value_mm'])} mm 越出行程"
                     f"边界 {fmt_num(v['bound_mm'])} mm（超程 "
-                    f"{fmt_num(v['overshoot_mm'])} mm；已叠加 "
-                    f"{self.state.wcs} 偏置）",
+                    f"{fmt_num(v['overshoot_mm'])} mm；{comp_note}）",
                     _details(v)))
-            self._grow_bbox(points, machine=True)
+            self._grow_bbox(points, machine=True, comps=comps)
 
         self._grow_bbox(points, machine=False)
 
@@ -2253,7 +2659,8 @@ class Analyzer:
                 z_ref = s1[2] if end_below else min(zs)
                 issue_indexes.append(self._issue(
                     "RAPID_BELOW_SAFE_Z", pl,
-                    f"快速移动到达/经过 Z={fmt_num(z_ref)} mm（工件坐标），"
+                    f"快速移动到达/经过刀尖 Z={fmt_num(z_ref)} mm"
+                    f"（刀尖工件坐标），"
                     f"低于安全 Z {fmt_num(self.cfg.safe_z)} mm（低 "
                     f"{fmt_num(self.cfg.safe_z - z_ref)} mm）",
                     _details({"ref_z_mm": round(z_ref, 6),
@@ -2297,16 +2704,27 @@ class Analyzer:
         if st is not None:
             st["unknown_segments"] += 1
 
+    def _comp_path_bucket(self) -> dict:
+        """当前生效刀长补偿 H 号的路径统计桶（未补偿归到 "__none__"）。"""
+        key = self.state.comp_h if self.state.comp_h is not None else "__none__"
+        return self.comp_path.setdefault(key, {
+            "rapid": 0.0, "cutting": 0.0,
+            "cycle_rapid": 0.0, "cycle_cutting": 0.0,
+            "drill_depth": 0.0})
+
     def _accumulate(self, motion_mode, segment):
         length = segment["length_mm"]
         st = self._wcs_path_stat()
+        hb = self._comp_path_bucket()
         if length is not None:
             if motion_mode == "rapid":
                 self.length_rapid += length
+                hb["rapid"] += length
                 if st is not None:
                     st["rapid"] += length
             else:
                 self.length_cutting += length
+                hb["cutting"] += length
                 if st is not None:
                     st["cutting"] += length
         arc = segment.get("arc")
@@ -2348,6 +2766,13 @@ class Analyzer:
             entry["block_reason"] = block_reason
         if segment is not None:
             entry["segment"] = segment
+        # 刀长补偿段（G43/G44/G49）：记录补偿事件与刀尖/主轴基准点坐标
+        lc = self._line_comp or {}
+        ev = lc.get("event")
+        if ev is not None:
+            off = self._current_offset()
+            tip_z = self.state.z.value if self.state.z.known else None
+            entry["tool_length_event"] = self._length_event_out(ev, tip_z, off)
         if issue_indexes:
             entry["issue_codes"] = [self.issues[i].code for i in issue_indexes]
         self._annotate_entry(entry, self.current_block)
@@ -2362,19 +2787,37 @@ class Analyzer:
         if segment is None:
             return None
         off = self._current_offset()
+        comps = segment.get("comp_signed_mm")
+        s0 = segment.get("comp_start_signed_mm", self.state.comp_signed)
+        s1 = segment.get("comp_end_signed_mm", self.state.comp_signed)
+
+        def spindle(p, signed):
+            if off is None or p is None:
+                return None
+            return self._spindle_out(p, off, signed)
+
         out = {
             "kind": segment["kind"],
             "wcs": self.state.wcs,
             "wcs_configured": off is not None,
             "offset_mm": self._offset_out(off),
+            "h": segment.get("h", self.state.comp_h),
+            "tool_compensation": segment.get("tool_compensation",
+                                             self._comp_out()),
+            "comp_start_signed_mm": round6(s0),
+            "comp_end_signed_mm": round6(s1),
             "start_mm": [round6(v) for v in segment["start"]],
             "end_mm": [round6(v) for v in segment["end"]],
-            "start_machine_mm": self._machine_out(segment["start"], off),
-            "end_machine_mm": self._machine_out(segment["end"], off),
+            # 主轴基准点机床坐标（Z 叠加刀长补偿；行程按它判定）
+            "start_machine_mm": self._spindle_out(segment["start"], off, s0),
+            "end_machine_mm": self._spindle_out(segment["end"], off, s1),
             "length_mm": round6(segment["length_mm"]),
             "points_mm": [[round6(c) for c in p] for p in segment["points"]],
             "points_machine_mm": (
-                [self._machine_out(p, off) for p in segment["points"]]
+                [self._spindle_out(p, off,
+                                   comps[k] if comps is not None
+                                   and k < len(comps) else s1)
+                 for k, p in enumerate(segment["points"])]
                 if off is not None else None),
         }
         if "arc" in segment:
@@ -2522,6 +2965,98 @@ class Analyzer:
             "by_wcs": by_wcs,
         }
 
+    def _length_comp_out(self) -> dict:
+        """刀长补偿汇总：H 寄存器表、G43/G44/G49 事件、按 H 号的路径/
+        钻孔/问题汇总，以及主轴基准点 Z 轴行程占用（机床坐标）。"""
+        # 每个孔（含阻断孔）归属的 H 号
+        holes_by_h: dict = {}
+        depth_by_h: dict = {}
+        for grp in self.cycle_groups:
+            for h in grp["holes"]:
+                key = h.get("h") if h.get("h") is not None else "__none__"
+                d = holes_by_h.setdefault(key, {"drilled": 0, "blocked": 0})
+                if h.get("status") == "drilled":
+                    d["drilled"] += 1
+                    depth_by_h[key] = depth_by_h.get(key, 0.0) + (
+                        h.get("drill_depth_mm") or 0.0)
+                else:
+                    d["blocked"] += 1
+        issue_by_h: dict = {}
+        for iss in self.issues:
+            h = iss.details.get("h")
+            key = h if h is not None else "__none__"
+            issue_by_h[key] = issue_by_h.get(key, 0) + 1
+
+        def bucket_for(key):
+            b = self.comp_path.get(
+                key, {"rapid": 0.0, "cutting": 0.0,
+                      "cycle_rapid": 0.0, "cycle_cutting": 0.0,
+                      "drill_depth": 0.0})
+            hd = holes_by_h.get(key, {"drilled": 0, "blocked": 0})
+            return {
+                "path_length_mm": {
+                    "rapid": round(b["rapid"], 6),
+                    "cutting": round(b["cutting"], 6),
+                    "total": round(b["rapid"] + b["cutting"], 6),
+                    "canned_cycle_rapid": round(b["cycle_rapid"], 6),
+                    "canned_cycle_cutting": round(b["cycle_cutting"], 6),
+                },
+                "holes_drilled": hd["drilled"],
+                "holes_blocked": hd["blocked"],
+                "total_drill_depth_mm": round(
+                    b.get("drill_depth", depth_by_h.get(key, 0.0)), 6),
+                "issues": issue_by_h.get(key, 0),
+            }
+
+        used_h = sorted(h for h in self.comp_path if isinstance(h, int))
+        by_h = {f"H{h}": dict(bucket_for(h), h=h,
+                              offset_mm=self.cfg.length_offsets.get(h))
+                for h in used_h}
+        # G43/G44 事件中出现但无路径累计的 H 也列出
+        for ev in self.length_events:
+            if ev["h"] is not None and f"H{ev['h']}" not in by_h:
+                by_h[f"H{ev['h']}"] = dict(
+                    bucket_for(ev["h"]), h=ev["h"],
+                    offset_mm=self.cfg.length_offsets.get(ev["h"]))
+        no_comp = bucket_for("__none__")
+        events = []
+        for ev in self.length_events:
+            off = self.cfg.offset_for(ev.get("wcs"))
+            events.append(self._length_event_out(
+                ev, ev.get("tip_z_mm"), off))
+        z_travel = None
+        if not any(math.isinf(v) for v in self.mbmin + self.mbmax) \
+                and self.all_moves_wcs_known:
+            z_travel = {
+                "spindle_z_machine_mm": [round(self.mbmin[2], 6),
+                                         round(self.mbmax[2], 6)],
+                "note": "主轴基准点 Z 机床坐标（工件偏置 + 刀长补偿）",
+            }
+        return {
+            "supported": {"G43": "刀长补偿加：主轴基准点 = 刀尖 + H 偏置",
+                          "G44": "刀长补偿减：主轴基准点 = 刀尖 - H 偏置",
+                          "G49": "取消刀长补偿",
+                          "H": "H 号只在与 G43/G44 同段时生效，"
+                               "偏置取自机床配置 length_offsets"},
+            "offsets_mm": {f"H{h}": self.cfg.length_offsets[h]
+                           for h in sorted(self.cfg.length_offsets)},
+            "events": events,
+            "by_h": by_h,
+            "without_compensation": no_comp,
+            "spindle_z_travel": z_travel,
+            "issues": {
+                "LENGTH_COMP_MISSING_H": sum(
+                    1 for i in self.issues
+                    if i.code == "LENGTH_COMP_MISSING_H"),
+                "LENGTH_COMP_H_NOT_FOUND": sum(
+                    1 for i in self.issues
+                    if i.code == "LENGTH_COMP_H_NOT_FOUND"),
+                "LENGTH_COMP_CONFLICT": sum(
+                    1 for i in self.issues
+                    if i.code == "LENGTH_COMP_CONFLICT"),
+            },
+        }
+
     def _build_report(self, physical_lines: int) -> dict:
         counts = {s: 0 for s in SEVERITY_ORDER}
         for iss in self.issues:
@@ -2549,6 +3084,7 @@ class Analyzer:
             "drill_cycles": self._drill_cycles_out(),
             "arcs": self._arcs_out(),
             "wcs": self._wcs_out(),
+            "length_compensation": self._length_comp_out(),
             "bbox_program_mm": self._bbox_out(self.bmin, self.bmax),
             "bbox_machine_mm": (
                 self._bbox_out(self.mbmin, self.mbmax)
@@ -2595,7 +3131,17 @@ class Analyzer:
                                "调用继承模态、M99 返回调用点、重复调用不重置"
                                "状态；展开块保留来源程序、原行、调用栈与重复"
                                "序号。单程序分析不支持这些指令。"),
-                "safe_z": "安全 Z 按工件(程序)坐标判定",
+                "safe_z": "安全 Z 按工件(程序)坐标的刀尖 Z 判定",
+                "length_compensation": (
+                    "G43 刀长补偿加（主轴基准点=刀尖+H 偏置）、G44 减、"
+                    "G49 取消；H 只随 G43/G44 生效，偏置取自机床配置 "
+                    "length_offsets（H 为正整数、偏置为数值，否则拒绝保存）；"
+                    "同行运动使用新补偿；只有补偿指令时主轴基准点保持不动、"
+                    "按新补偿重算刀尖工件 Z；G43/G44 缺 H、H 非法/不在表、"
+                    "同段补偿指令冲突时整段阻断，不沿用旧值；安全 Z 按刀尖"
+                    "工件 Z 判定，Z 轴行程按叠加工件偏置与刀长补偿后的主轴"
+                    "基准点机床 Z 判定；直线/圆弧/螺旋/固定钻孔循环均记录 H 号、"
+                    "补偿方向与数值、刀尖工件坐标及主轴基准点机床坐标"),
                 "feed": "F 按出现时的单位换算为 mm/min 后模态保持",
                 "canned_cycle": (
                     "G81/G82/G83 为模态固定循环，G80 或 G0-G3 取消；"
@@ -2624,6 +3170,9 @@ DIALECT = {
         "G17": "圆弧平面 XY（上电默认），垂直联动轴 Z",
         "G18": "圆弧平面 XZ，垂直联动轴 Y",
         "G19": "圆弧平面 YZ，垂直联动轴 X",
+        "G43": "刀长补偿加（主轴基准点 = 刀尖工件 + H 偏置；须同行给 H）",
+        "G44": "刀长补偿减（主轴基准点 = 刀尖工件 - H 偏置；须同行给 H）",
+        "G49": "取消刀长补偿",
         "G20": "英制单位", "G21": "公制单位",
         "G90": "绝对定位", "G91": "增量定位",
         "G54": "工件坐标系 1（偏置由配置 wcs_offsets 提供）",
@@ -2697,6 +3246,36 @@ DIALECT = {
             "G18/G19 平面下展开 -> CYCLE_PLANE_NOT_G17，阻断对应孔",
         ],
     },
+    "length_compensation": {
+        "G43": "刀长补偿加：主轴基准点机床 Z = 刀尖工件 Z + 工件 Z 偏置 + H 偏置",
+        "G44": "刀长补偿减：主轴基准点机床 Z = 刀尖工件 Z + 工件 Z 偏置 - H 偏置",
+        "G49": "取消刀长补偿（代数值归零）",
+        "H": "H 寄存器号（正整数），只在与 G43/G44 同段时生效；"
+             "无 G43/G44 的 H 不生效；G49 同行的 H 不生效",
+        "offset_table": "H 偏置由机床配置 length_offsets 提供（mm），"
+                        "如 {\"1\": 12.5, \"2\": -3}；H 号非正整数或偏置非"
+                        "数值时定位字段并拒绝保存",
+        "same_line_motion": "G43/G44/G49 与运动同段时，该段起点用旧补偿、"
+                            "其余点用新补偿（同行运动使用新补偿）",
+        "comp_only_line": "只有补偿指令（无 Z 词）时主轴基准点保持不动，"
+                          "按新补偿重算刀尖工件 Z：新刀尖 = 基准点 - 新补偿",
+        "safe_z": "安全 Z 始终按刀尖工件 Z 判定",
+        "z_travel": "Z 轴行程按主轴基准点机床 Z（工件偏置 + 刀长补偿）判定",
+        "records": "直线/圆弧/螺旋/固定钻孔循环均记录 H 号、补偿方向与数值、"
+                   "刀尖工件坐标（start_mm/end_mm/points_mm）与主轴基准点"
+                   "机床坐标（start_machine_mm/end_machine_mm/"
+                   "points_machine_mm）；孔记录与每个展开动作同样记录",
+        "block_rules": [
+            "G43/G44 缺 H -> LENGTH_COMP_MISSING_H，整段阻断",
+            "H 非正整数或不在 length_offsets -> LENGTH_COMP_H_NOT_FOUND，"
+            "整段阻断",
+            "G43/G44/G49 同段混用、同一补偿码重复或同段多个 H -> "
+            "LENGTH_COMP_CONFLICT，整段阻断",
+            "阻断段不沿用旧补偿值：连同本行其他模态改动一起回滚",
+        ],
+        "report_filter": "报告可按 h=H1 或 h=1 筛选问题、轨迹、孔与按 H 汇总；"
+                         "对比结果列出各 H 的补偿使用、路径/钻孔与 Z 行程变化",
+    },
     "supported_m": {"M3": "主轴正转", "M5": "主轴停止"},
     "package_flow_m": {
         "O": "子程序号行（仅程序包模式 POST /api/packages）",
@@ -2709,6 +3288,7 @@ DIALECT = {
                     "中支持；单独提交给 /api/analyze、/api/jobs 时仍按未支持"
                     "指令处理。变量/宏表达式（#、[]）在任何模式下均不支持。",
     "supported_words": ["X", "Y", "Z", "I", "J", "K", "R", "F", "S", "N(忽略)",
+                        "H(刀长补偿寄存器号，随 G43/G44 生效)",
                         "Q(固定循环步进)", "P(固定循环暂停)",
                         "L(固定循环重复次数)",
                         "O(子程序号，仅程序包模式)"],
@@ -2717,10 +3297,11 @@ DIALECT = {
                           "并整段阻断，不猜测执行",
     "unsupported_examples": [
         "G28/G30 回零",
-        "G40-G43 刀补", "G54.1 附加工件坐标系",
+        "G40-G42 半径刀补", "G54.1 附加工件坐标系",
         "G84-G89 其他固定循环（仅支持 G80-G83）",
-        "M2/M30 程序结束", "M4 反转", "M6 换刀", "M7-M9 冷却",
-        "T 刀号", "H/D 刀补号",
+        "M2/M30 程序结束（仅程序包模式支持）", "M4 反转", "M6 换刀",
+        "M7-M9 冷却",
+        "T 刀号", "D 半径刀补号",
     ],
     "severity_levels": SEVERITY_ORDER,
 }
