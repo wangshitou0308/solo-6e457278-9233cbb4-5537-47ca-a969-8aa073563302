@@ -926,8 +926,15 @@ class Analyzer:
                               issue_indexes=issue_indexes)
             return
 
-        # 6) 无轴坐标词 => 纯设定段（即使本行写了 G0-G3 也不产生位移）
-        if not axis_words:
+        # 6) 无轴坐标词 => 纯设定段（即使本行写了 G0-G3 也不产生位移）。
+        # 例外：G2/G3 带圆心词 I/J/K（或 R）而无 XYZ 终点词时，终点即起点，
+        # 按完整弧段解算（圆心编程整圆；R 编程整圆等非法情形仍走阻断），
+        # 避免这类整圆绕过预检。
+        arc_no_endpoint = (
+            not axis_words
+            and self.state.motion_mode in ("arc_cw", "arc_ccw")
+            and (ijk_words or r_word is not None))
+        if not axis_words and not arc_no_endpoint:
             normalized = self._normalized(
                 applied_g, m_words, line_motion_key, coord_words, f_raw, s_raw)
             if "80" in keys:
@@ -960,13 +967,14 @@ class Analyzer:
         motion_is_modal = line_motion_key is None
         motion_g = line_motion_key or modal_key
 
-        # 6) 单位 / 定位模式不明的运动
+        # 6) 单位 / 定位模式不明的运动（无 XYZ 的圆心整圆不涉及绝对/增量
+        # 歧义，不要求 G90/G91；I/J/K/R 仍需单位换算）
         if self.state.unit_factor() is None:
             issue_indexes.append(self._issue(
                 "UNKNOWN_UNITS", pl,
                 "运动发生在任何 G20/G21 之前，物理尺寸无法确定；"
                 "刀具位置标记为未知，跳过行程/包围盒/长度计算", {}))
-        if self.state.distance_mode is None:
+        if axis_words and self.state.distance_mode is None:
             issue_indexes.append(self._issue(
                 "UNKNOWN_DISTANCE_MODE", pl,
                 "出现轴坐标词，但 G90/G91 尚未建立，无法判定绝对/增量定位；"
@@ -976,7 +984,8 @@ class Analyzer:
 
         start_pt = self._current_point()
         segment = None
-        if self.state.unit_factor() is None or self.state.distance_mode is None:
+        if (self.state.unit_factor() is None
+                or (axis_words and self.state.distance_mode is None)):
             # 位置整体退化为未知，只保留主轴/进给等模态检查
             for letter in axis_words:
                 self._set_axis(letter, Axis(None, False))
@@ -1818,6 +1827,13 @@ class Analyzer:
                             line_dedupe: bool = False):
         # 圆弧段用真实弧线的精确极值点做行程/包围盒；其余段用轨迹点
         points = segment.get("check_points") or segment["points"]
+        # 弧段产生的问题带上平面信息，报告可按 plane=G17/G18/G19 筛选
+        arc_plane = (segment.get("arc") or {}).get("plane_code")
+
+        def _details(d):
+            if arc_plane is not None:
+                return {**d, "plane": arc_plane}
+            return d
 
         # 行程检查需要工件坐标系
         if self.state.wcs is None:
@@ -1825,7 +1841,7 @@ class Analyzer:
             issue_indexes.append(self._issue(
                 "UNKNOWN_WCS", pl,
                 "运动发生在 G54 建立之前，缺少工件坐标偏置映射，跳过行程检查",
-                {}))
+                _details({})))
         else:
             for v in self._bounds_violations(points):
                 c = self.cfg
@@ -1837,7 +1853,7 @@ class Analyzer:
                     f"{v['axis']} 轴机床坐标 {fmt_num(v['value_mm'])} mm 越出行程"
                     f"边界 {fmt_num(v['bound_mm'])} mm（超程 "
                     f"{fmt_num(v['overshoot_mm'])} mm；已叠加 G54 偏置）",
-                    v))
+                    _details(v)))
             self._grow_bbox(points, machine=True)
 
         self._grow_bbox(points, machine=False)
@@ -1863,11 +1879,11 @@ class Analyzer:
                     f"快速移动到达/经过 Z={fmt_num(z_ref)} mm（工件坐标），"
                     f"低于安全 Z {fmt_num(self.cfg.safe_z)} mm（低 "
                     f"{fmt_num(self.cfg.safe_z - z_ref)} mm）",
-                    {"ref_z_mm": round(z_ref, 6),
-                     "safe_z_mm": self.cfg.safe_z,
-                     "below_mm": round(self.cfg.safe_z - z_ref, 6),
-                     "end_below_safe_z": end_below,
-                     "horizontal_travel_below_safe_z": horiz_below}))
+                    _details({"ref_z_mm": round(z_ref, 6),
+                              "safe_z_mm": self.cfg.safe_z,
+                              "below_mm": round(self.cfg.safe_z - z_ref, 6),
+                              "end_below_safe_z": end_below,
+                              "horizontal_travel_below_safe_z": horiz_below})))
 
         if motion_mode in ("linear", "arc_cw", "arc_ccw"):
             if not self.state.spindle_on:
@@ -1875,8 +1891,8 @@ class Analyzer:
                     "SPINDLE_NOT_RUNNING", pl,
                     f"{MOTION_CN[motion_mode]}切削发生时主轴处于停止状态"
                     f"（spindle_on=false，最近 S={self.state.spindle_rpm}）",
-                    {"spindle_on": False,
-                     "last_s_rpm": self.state.spindle_rpm},
+                    _details({"spindle_on": False,
+                              "last_s_rpm": self.state.spindle_rpm}),
                     line_dedupe=line_dedupe)
                 issue_indexes.append(idx)
             if not self.state.feed.known:
@@ -1884,7 +1900,7 @@ class Analyzer:
                     "FEED_UNSET", pl,
                     f"{MOTION_CN[motion_mode]}切削前未建立有效进给 F"
                     "（单位不明或从未给定）",
-                    {"feed_known": False},
+                    _details({"feed_known": False}),
                     line_dedupe=line_dedupe)
                 issue_indexes.append(idx)
 
@@ -2207,7 +2223,8 @@ DIALECT = {
         },
         "direction": "G2 顺圆 / G3 逆圆，按“从垂直轴正向看向平面”判定",
         "center_programming": "圆心词为起点到圆心的增量；起终点重合时"
-                              "（圆心词编程）为整圆",
+                              "（圆心词编程）为整圆；省略 XYZ 终点词时"
+                              "终点即起点，同样按整圆执行",
         "r_programming": "R 正=劣弧（扫角<=180°），R 负=优弧；"
                          "R 不能编程整圆",
         "helical": "垂直当前平面的轴随扫角线性联动，段长为三维螺旋长度",

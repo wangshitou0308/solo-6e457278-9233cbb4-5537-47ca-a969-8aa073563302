@@ -148,16 +148,30 @@ def compare_reports(baseline: dict, candidate: dict,
         }
     drill_compare["by_cycle"] = by_cycle
 
-    # 按平面（G17/G18/G19）的弧段数与弧长变化
+    # 按平面（G17/G18/G19）的弧段数、弧长与问题增减
     def arcs_of(r):
         return r.get("arcs", {})
+
+    def _plane_of(issue):
+        return issue.get("details", {}).get("plane")
+
+    plane_issues_a = Counter(
+        p for p in (_plane_of(i) for i in baseline["issues"]) if p)
+    plane_issues_b = Counter(
+        p for p in (_plane_of(i) for i in candidate["issues"]) if p)
+    plane_resolved = Counter(
+        p for p in (_plane_of(i) for i in resolved) if p)
+    plane_introduced = Counter(
+        p for p in (_plane_of(i) for i in introduced) if p)
 
     arc_a, arc_b = arcs_of(baseline), arcs_of(candidate)
     pa = arc_a.get("by_plane", {})
     pb = arc_b.get("by_plane", {})
     arc_by_plane = {}
-    for plane in sorted(set(pa) | set(pb)):
+    for plane in sorted(set(pa) | set(pb) | set(plane_issues_a)
+                        | set(plane_issues_b)):
         a, b = pa.get(plane, {}), pb.get(plane, {})
+        na, nb = plane_issues_a.get(plane, 0), plane_issues_b.get(plane, 0)
         arc_by_plane[plane] = {
             "baseline_count": a.get("count", 0),
             "candidate_count": b.get("count", 0),
@@ -170,6 +184,11 @@ def compare_reports(baseline: dict, candidate: dict,
             "candidate_helical_count": b.get("helical_count", 0),
             "delta_helical_count": (b.get("helical_count", 0)
                                     - a.get("helical_count", 0)),
+            "baseline_issues": na,
+            "candidate_issues": nb,
+            "delta_issues": nb - na,
+            "resolved_issues": plane_resolved.get(plane, 0),
+            "introduced_issues": plane_introduced.get(plane, 0),
         }
     ta, tb = arc_a.get("total", {}), arc_b.get("total", {})
     arc_compare = {
@@ -183,6 +202,12 @@ def compare_reports(baseline: dict, candidate: dict,
             "delta_arc_length_mm": round(
                 tb.get("arc_length_mm", 0.0) - ta.get("arc_length_mm", 0.0),
                 6),
+            "baseline_issues": sum(plane_issues_a.values()),
+            "candidate_issues": sum(plane_issues_b.values()),
+            "delta_issues": (sum(plane_issues_b.values())
+                             - sum(plane_issues_a.values())),
+            "resolved_issues": sum(plane_resolved.values()),
+            "introduced_issues": sum(plane_introduced.values()),
         },
         "blocked": {
             "baseline": arc_a.get("blocked_count", 0),

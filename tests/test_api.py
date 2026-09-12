@@ -415,6 +415,60 @@ class ApiTest(unittest.TestCase):
         self.assertIn(b"G18", nc)
         self.assertIn(b"G19", nc)
 
+    def test_10_no_endpoint_full_circle_and_plane_issue_filter(self):
+        # 无 XYZ 终点词的圆心整圆生成完整弧段
+        _, r = self.req("POST", "/api/analyze", {
+            "config": CONFIG,
+            "gcode": "G21 G90 G54\nM3 S1000\nG0 X20 Y20 Z5\nG2 I10 J0 F500\n"})
+        e = [t for t in r["trajectory"] if t["line_no"] == 4][0]
+        self.assertEqual(e["type"], "arc_cw")
+        self.assertTrue(e["segment"]["arc"]["full_circle"])
+        self.assertAlmostEqual(e["segment"]["length_mm"],
+                               2 * 3.141592653589793 * 10, places=4)
+        self.assertEqual(r["arcs"]["total"]["full_circle_count"], 1)
+
+        # 含 OUT_OF_BOUNDS 的 G18 作业：平面筛选后问题与风险计数保留
+        cfg2 = {"name": "oob", "travel_x": [0, 100], "travel_y": [0, 100],
+                "travel_z": [-10, 14], "safe_z": 2,
+                "max_feed_mm_min": 3000, "max_spindle_rpm": 12000}
+        bad = ("G21 G90 G54\nM3 S1000\nG0 X50 Y10 Z5\n"
+               "G18\nG2 X30 Z5 I-10 K0 F500\n")   # 弧顶 Z=15 越出 z_max=14
+        _, job = self.req("POST", "/api/jobs",
+                          {"config": cfg2, "gcode": bad}, expect=202)
+        self.wait_job(job["id"])
+        _, full = self.req("GET", f"/api/jobs/{job['id']}/report")
+        self.assertEqual(full["risk"]["counts_by_severity"]["critical"], 1)
+
+        _, f = self.req("GET", f"/api/jobs/{job['id']}/report?plane=G18")
+        self.assertEqual([i["code"] for i in f["issues"]], ["OUT_OF_BOUNDS"])
+        self.assertEqual(f["issues"][0]["details"]["plane"], "G18")
+        self.assertEqual(f["risk"]["counts_by_severity"]["critical"], 1)
+        self.assertEqual(f["risk"]["total_issues"], 1)
+        arc_entries = [e for e in f["trajectory"]
+                       if (e.get("segment") or {}).get("arc")]
+        self.assertEqual(arc_entries[0]["issue_codes"], ["OUT_OF_BOUNDS"])
+
+        # 滤其他平面：该弧段问题不出现
+        _, f2 = self.req("GET", f"/api/jobs/{job['id']}/report?plane=G17")
+        self.assertEqual(f2["issues"], [])
+
+        # 对比的分平面问题增减（坏 -> 好：解决 1；好 -> 坏：新增 1）
+        good = ("G21 G90 G54\nM3 S1000\nG0 X50 Y10 Z5\n"
+                "G18\nG2 X40 Z5 I-5 K0 F500\n")
+        _, cmp = self.req("POST", "/api/compare", {
+            "config": cfg2, "label_a": "bad", "gcode_a": bad,
+            "label_b": "good", "gcode_b": good})
+        g18 = cmp["arcs"]["by_plane"]["G18"]
+        self.assertEqual(g18["resolved_issues"], 1)
+        self.assertEqual(g18["introduced_issues"], 0)
+        self.assertEqual(g18["delta_issues"], -1)
+        self.assertEqual(cmp["arcs"]["total"]["resolved_issues"], 1)
+        _, cmp2 = self.req("POST", "/api/compare", {
+            "config": cfg2, "label_a": "good", "gcode_a": good,
+            "label_b": "bad", "gcode_b": bad})
+        self.assertEqual(cmp2["arcs"]["by_plane"]["G18"]["introduced_issues"],
+                         1)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

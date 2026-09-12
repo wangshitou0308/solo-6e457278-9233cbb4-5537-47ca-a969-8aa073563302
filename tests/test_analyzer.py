@@ -483,6 +483,133 @@ class TestPlaneArcs(unittest.TestCase):
         self.assertEqual(arcs["blocked"]["delta"], 0)
 
 
+class TestNoEndpointArcs(unittest.TestCase):
+    """无 XYZ 终点词的圆心整圆（G2 I10 J0）必须生成完整弧段。"""
+
+    HEADER = "G21 G90 G54\nM3 S1000\n"
+
+    def test_full_circle_without_endpoint_words(self):
+        r = analyze_program(
+            self.HEADER + "G0 X20 Y20 Z5\nG2 I10 J0 F500\n", cfg())
+        self.assertEqual(codes(r), [])
+        e = [t for t in r["trajectory"] if t["line_no"] == 4][0]
+        self.assertEqual(e["type"], "arc_cw")
+        self.assertTrue(e["executed"])
+        arc = e["segment"]["arc"]
+        self.assertTrue(arc["full_circle"])
+        self.assertAlmostEqual(abs(arc["sweep_deg"]), 360.0)
+        self.assertAlmostEqual(e["segment"]["length_mm"], 20 * math.pi,
+                               places=4)
+        # 切削长度与弧段统计均计入，不再绕过预检
+        self.assertAlmostEqual(r["path_length_mm"]["cutting"],
+                               20 * math.pi, places=4)
+        self.assertEqual(r["arcs"]["total"]["count"], 1)
+        self.assertEqual(r["arcs"]["total"]["full_circle_count"], 1)
+        # 终点即起点，位置不变
+        st = r["final_state"]
+        self.assertEqual((st["x"]["value_mm"], st["y"]["value_mm"]), (20, 20))
+        # 包围盒按真实弧线覆盖整圆（圆心 (30,20)，半径 10）
+        self.assertEqual(r["bbox_program_mm"]["x_mm"], [20.0, 40.0])
+        self.assertEqual(r["bbox_program_mm"]["y_mm"], [10.0, 30.0])
+
+    def test_modal_arc_without_endpoint_words(self):
+        r = analyze_program(
+            self.HEADER + "G0 X20 Y20 Z5\nG2\nI10 J0 F500\n", cfg())
+        e = [t for t in r["trajectory"] if t["line_no"] == 5][0]
+        self.assertEqual(e["type"], "arc_cw")
+        self.assertIn("模态", e["normalized"])
+        self.assertTrue(e["segment"]["arc"]["full_circle"])
+
+    def test_no_endpoint_full_circle_in_g18(self):
+        r = analyze_program(
+            self.HEADER + "G0 X20 Y20 Z20\nG18\nG2 I10 K0 F500\n", cfg())
+        self.assertEqual(codes(r), [])
+        e = [t for t in r["trajectory"] if t["line_no"] == 5][0]
+        self.assertEqual(e["segment"]["arc"]["plane_code"], "G18")
+        self.assertTrue(e["segment"]["arc"]["full_circle"])
+        self.assertEqual(r["bbox_program_mm"]["x_mm"], [20.0, 40.0])
+        self.assertEqual(r["bbox_program_mm"]["z_mm"], [10.0, 30.0])
+
+    def test_r_without_endpoint_blocked(self):
+        # R 编程整圆（无终点词时终点即起点）仍阻断
+        r = analyze_program(
+            self.HEADER + "G0 X20 Y20 Z5\nG2 R10 F500\n", cfg())
+        self.assertIn("ARC_NO_SOLUTION", codes(r))
+        e = [t for t in r["trajectory"] if t["line_no"] == 4][0]
+        self.assertEqual(e["type"], "blocked")
+
+    def test_mixed_without_endpoint_blocked(self):
+        r = analyze_program(
+            self.HEADER + "G0 X20 Y20 Z5\nG2 I5 R10 F500\n", cfg())
+        iss = [i for i in r["issues"] if i["code"] == "ARC_NO_SOLUTION"]
+        self.assertEqual(len(iss), 1)
+        self.assertEqual(iss[0]["details"]["reason"], "mixed_center_params")
+
+    def test_bare_motion_g_still_setting(self):
+        # 只有 G2（无圆心词/R）仍是纯设定段
+        r = analyze_program("G21 G90 G54\nG2\n", cfg())
+        e = [t for t in r["trajectory"] if t["line_no"] == 2][0]
+        self.assertEqual(e["type"], "setting")
+
+    def test_no_endpoint_arc_process_checks(self):
+        # 无 M3/F 的整圆：主轴/进给检查照常，且带平面信息
+        r = analyze_program("G21 G90 G54\nG0 X20 Y20 Z5\nG2 I10 J0\n", cfg())
+        c = codes(r)
+        self.assertIn("SPINDLE_NOT_RUNNING", c)
+        self.assertIn("FEED_UNSET", c)
+        for code in ("SPINDLE_NOT_RUNNING", "FEED_UNSET"):
+            iss = [i for i in r["issues"] if i["code"] == code][0]
+            self.assertEqual(iss["details"]["plane"], "G17")
+
+
+class TestPlaneIssueTagging(unittest.TestCase):
+    """弧段问题带平面信息；对比给出分平面问题增减。"""
+
+    OOB_CFG = {
+        "travel_x": [0, 100], "travel_y": [0, 100], "travel_z": [-10, 14],
+        "safe_z": 2, "max_feed_mm_min": 3000, "max_spindle_rpm": 12000}
+    BAD = ("G21 G90 G54\nM3 S1000\nG0 X50 Y10 Z5\n"
+           "G18\nG2 X30 Z5 I-10 K0 F500\n")   # 弧顶 Z=15 越出 z_max=14
+    GOOD = ("G21 G90 G54\nM3 S1000\nG0 X50 Y10 Z5\n"
+            "G18\nG2 X40 Z5 I-5 K0 F500\n")  # 弧顶 Z=10，合规
+
+    def _cfg(self):
+        return MachineConfig.from_dict(dict(self.OOB_CFG))
+
+    def test_out_of_bounds_on_arc_carries_plane(self):
+        r = analyze_program(self.BAD, self._cfg())
+        oob = [i for i in r["issues"] if i["code"] == "OUT_OF_BOUNDS"]
+        self.assertEqual(len(oob), 1)
+        self.assertEqual(oob[0]["details"]["plane"], "G18")
+        self.assertAlmostEqual(oob[0]["details"]["value_mm"], 15.0)
+        # 直线段问题不带平面
+        r2 = analyze_program("G21 G90 G54\nG1 X10\n", cfg())
+        for i in r2["issues"]:
+            self.assertNotIn("plane", i["details"])
+
+    def test_compare_arcs_issue_deltas(self):
+        cmp = compare_reports(analyze_program(self.BAD, self._cfg()),
+                              analyze_program(self.GOOD, self._cfg()),
+                              "bad", "good")
+        g18 = cmp["arcs"]["by_plane"]["G18"]
+        self.assertEqual(g18["baseline_issues"], 1)
+        self.assertEqual(g18["candidate_issues"], 0)
+        self.assertEqual(g18["delta_issues"], -1)
+        self.assertEqual(g18["resolved_issues"], 1)
+        self.assertEqual(g18["introduced_issues"], 0)
+        total = cmp["arcs"]["total"]
+        self.assertEqual(total["resolved_issues"], 1)
+        self.assertEqual(total["introduced_issues"], 0)
+        # 反向：好 -> 坏，新增 1
+        cmp2 = compare_reports(analyze_program(self.GOOD, self._cfg()),
+                               analyze_program(self.BAD, self._cfg()),
+                               "good", "bad")
+        g18b = cmp2["arcs"]["by_plane"]["G18"]
+        self.assertEqual(g18b["delta_issues"], 1)
+        self.assertEqual(g18b["introduced_issues"], 1)
+        self.assertEqual(g18b["resolved_issues"], 0)
+
+
 class TestIssueShape(unittest.TestCase):
     def test_issue_carries_states_and_basis(self):
         r = analyze_program("G21 G90 G54\nG1 X10 F9999\n", cfg())
