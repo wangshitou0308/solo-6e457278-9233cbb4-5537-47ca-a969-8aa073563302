@@ -18,7 +18,8 @@ from .analyzer import SEVERITY_ORDER, MOTION_CN  # noqa: F401
 def _fingerprint(issue: dict) -> tuple:
     d = issue.get("details", {})
     key = ["axis", "unsupported_tokens", "malformed_tokens", "reason",
-           "below_mm", "overshoot_mm", "exceed_mm_per_min", "exceed_rpm"]
+           "below_mm", "overshoot_mm", "exceed_mm_per_min", "exceed_rpm",
+           "cycle", "hole_no", "missing", "bad", "unknown"]
     detail_fp = tuple((k, str(d.get(k))) for k in key if k in d)
     return (issue["code"], issue.get("normalized", ""), detail_fp)
 
@@ -91,9 +92,66 @@ def compare_reports(baseline: dict, candidate: dict,
     def bbox_of(r):
         return r.get("bbox_program_mm")
 
+    def drill_of(r):
+        return r.get("drill_cycles", {}).get("summary", {})
+
+    ds_a, ds_b = drill_of(baseline), drill_of(candidate)
+    drill_compare = {
+        "baseline": {
+            "cycle_groups": ds_a.get("cycle_groups", 0),
+            "holes_total": ds_a.get("holes_total", 0),
+            "holes_drilled": ds_a.get("holes_drilled", 0),
+            "holes_blocked": ds_a.get("holes_blocked", 0),
+            "total_drill_depth_mm": ds_a.get("total_drill_depth_mm", 0.0),
+            "expanded_path_mm": ds_a.get("expanded_path_mm",
+                                        {"rapid": 0.0, "cutting": 0.0,
+                                         "total": 0.0}),
+        },
+        "candidate": {
+            "cycle_groups": ds_b.get("cycle_groups", 0),
+            "holes_total": ds_b.get("holes_total", 0),
+            "holes_drilled": ds_b.get("holes_drilled", 0),
+            "holes_blocked": ds_b.get("holes_blocked", 0),
+            "total_drill_depth_mm": ds_b.get("total_drill_depth_mm", 0.0),
+            "expanded_path_mm": ds_b.get("expanded_path_mm",
+                                        {"rapid": 0.0, "cutting": 0.0,
+                                         "total": 0.0}),
+        },
+    }
+    drill_compare["delta"] = {
+        "holes_total": (drill_compare["candidate"]["holes_total"]
+                        - drill_compare["baseline"]["holes_total"]),
+        "holes_drilled": (drill_compare["candidate"]["holes_drilled"]
+                          - drill_compare["baseline"]["holes_drilled"]),
+        "holes_blocked": (drill_compare["candidate"]["holes_blocked"]
+                          - drill_compare["baseline"]["holes_blocked"]),
+        "total_drill_depth_mm": round(
+            drill_compare["candidate"]["total_drill_depth_mm"]
+            - drill_compare["baseline"]["total_drill_depth_mm"], 6),
+        "expanded_path_total_mm": round(
+            drill_compare["candidate"]["expanded_path_mm"]["total"]
+            - drill_compare["baseline"]["expanded_path_mm"]["total"], 6),
+    }
+    # 按循环类型（G81/G82/G83）的孔数变化
+    by_cycle = {}
+    ba = baseline.get("drill_cycles", {}).get("by_cycle", {})
+    bb = candidate.get("drill_cycles", {}).get("by_cycle", {})
+    for cyc in sorted(set(ba) | set(bb)):
+        a, b = ba.get(cyc, {}), bb.get(cyc, {})
+        by_cycle[cyc] = {
+            "baseline_holes": a.get("holes", 0),
+            "candidate_holes": b.get("holes", 0),
+            "delta_holes": b.get("holes", 0) - a.get("holes", 0),
+            "baseline_blocked": a.get("blocked", 0),
+            "candidate_blocked": b.get("blocked", 0),
+            "delta_blocked": b.get("blocked", 0) - a.get("blocked", 0),
+        }
+    drill_compare["by_cycle"] = by_cycle
+
     return {
         "labels": {"baseline": baseline_label, "candidate": candidate_label},
         "machine": candidate["machine"],
+        "drill_cycles": drill_compare,
         "risk": {
             "baseline": baseline["risk"],
             "candidate": candidate["risk"],

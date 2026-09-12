@@ -22,6 +22,18 @@ from .parser import (
     g_code_key,
     parse_program,
 )
+from .cycles import (
+    CYCLE_G,
+    RETURN_G,
+    RETURN_CN,
+    CycleDef,
+    CycleParam,
+    expand_hole,
+    positioning_move,
+    resolve_r,
+    resolve_z,
+    PECK_APPROACH_MM,
+)
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -45,6 +57,10 @@ ISSUE_SEVERITY = {
     "SPINDLE_OVER_LIMIT": "error",         # 主轴转速超限
     "SPINDLE_NOT_RUNNING": "error",        # 主轴未启动即切削
     "RAPID_BELOW_SAFE_Z": "error",         # 低于安全 Z 的快速移动
+    "CYCLE_MISSING_PARAMS": "error",       # 固定循环缺少 Z/R（G83 含 Q）
+    "CYCLE_BAD_PARAM": "error",            # Q<=0、P 或 L 非法、平面顺序矛盾
+    "CYCLE_PLANE_CONFLICT": "error",       # 孔底与 R 平面 / 初始平面顺序矛盾
+    "CYCLE_NO_INHERITABLE_STATE": "error",  # 后续孔位没有可继承的循环/位置状态
 }
 
 ISSUE_TITLE = {
@@ -61,14 +77,21 @@ ISSUE_TITLE = {
     "SPINDLE_OVER_LIMIT": "主轴转速超过机床上限",
     "SPINDLE_NOT_RUNNING": "主轴未启动即发生切削",
     "RAPID_BELOW_SAFE_Z": "快速移动低于安全 Z 高度",
+    "CYCLE_MISSING_PARAMS": "固定循环缺少必要参数（对应孔已阻断）",
+    "CYCLE_BAD_PARAM": "固定循环参数非法（对应孔已阻断）",
+    "CYCLE_PLANE_CONFLICT": "固定循环平面顺序矛盾（对应孔已阻断）",
+    "CYCLE_NO_INHERITABLE_STATE": "后续孔位没有可继承的循环状态（该孔已阻断）",
 }
 
-ALLOWED_LETTERS = {"G", "M", "X", "Y", "Z", "I", "J", "R", "F", "S", "N"}
+ALLOWED_LETTERS = {"G", "M", "X", "Y", "Z", "I", "J", "R", "F", "S", "N",
+                   "Q", "P", "L"}
 MOTION_G = {"0": "rapid", "1": "linear", "2": "arc_cw", "3": "arc_ccw"}
 MOTION_CN = {"rapid": "快速", "linear": "直线",
              "arc_cw": "顺时针圆弧", "arc_ccw": "逆时针圆弧"}
 SETTING_G_UNIT = {"20": "inch", "21": "mm"}
 SETTING_G_MODE = {"90": "absolute", "91": "relative"}
+# 固定循环返回平面模态 G98/G99 的中文名
+RETURN_MODE_G = {"98": "G98", "99": "G99"}
 
 GEOM_TOL = 1e-6      # 几何相对容差
 MM_EPS = 1e-5
@@ -224,6 +247,13 @@ class State:
     feed: Axis = field(default_factory=Axis)  # mm/min
     spindle_rpm: float | None = None
     spindle_on: bool = False
+    # 固定钻孔循环：激活时为 CycleDef，G80/G0-G3/新循环定义时变更
+    cycle: CycleDef | None = None
+    # G98/G99 返回平面偏好（循环外也模态保持，默认 G98）
+    pending_return: str = "initial"
+    pending_return_line: int | None = None
+    pending_return_source: str | None = None
+    pending_return_default: bool = True
 
     def clone(self) -> "State":
         return State(
@@ -237,6 +267,11 @@ class State:
             feed=Axis(self.feed.value, self.feed.known),
             spindle_rpm=self.spindle_rpm,
             spindle_on=self.spindle_on,
+            cycle=self.cycle.clone() if self.cycle is not None else None,
+            pending_return=self.pending_return,
+            pending_return_line=self.pending_return_line,
+            pending_return_source=self.pending_return_source,
+            pending_return_default=self.pending_return_default,
         )
 
     def unit_factor(self) -> float | None:
@@ -261,6 +296,10 @@ class State:
             "feed_mm_per_min": ax(self.feed),
             "spindle_rpm": self.spindle_rpm,
             "spindle_on": self.spindle_on,
+            "canned_cycle": (self.cycle.params_out()
+                             if self.cycle is not None else None),
+            "cycle_return_plane": ("G98" if self.pending_return == "initial"
+                                   else "G99"),
         }
 
 
@@ -427,6 +466,14 @@ class Analyzer:
         self.blank_count = 0
         self.executed_count = 0
         self.blocked_count = 0
+        # 固定循环统计
+        self.cycle_groups: list[dict] = []
+        self._cycle_group_map: dict[str, dict] = {}
+        self.hole_seq = 0          # 全程序孔序（从 1 开始，阻断孔也占位）
+        self.hole_ok = 0
+        self.hole_blocked = 0
+        self.length_cycle_rapid = 0.0
+        self.length_cycle_cutting = 0.0
         self.bmin = [math.inf] * 3
         self.bmax = [-math.inf] * 3
         self.mbmin = [math.inf] * 3
@@ -435,7 +482,14 @@ class Analyzer:
         self.length_rapid = 0.0
         self.length_cutting = 0.0
         self.unknown_length_segments = 0
+        self.length_cycle_rapid = 0.0
+        self.length_cycle_cutting = 0.0
         self._snap_in: dict = {}
+        self._snap_in_cycle: CycleDef | None = None
+        self._snap_in_return = "initial"
+        self._snap_in_return_line: int | None = None
+        self._snap_in_return_source: str | None = None
+        self._snap_in_return_default = True
 
     # -- 问题记录 ----------------------------------------------------------
 
@@ -577,6 +631,13 @@ class Analyzer:
 
     def _process_line(self, pl: ParsedLine):
         self._snap_in = self.state.clone().snapshot()
+        # 圆弧无解回滚时需要原样恢复固定循环定义（snapshot 只含可读副本）
+        self._snap_in_cycle = (self.state.cycle.clone()
+                               if self.state.cycle is not None else None)
+        self._snap_in_return = self.state.pending_return
+        self._snap_in_return_line = self.state.pending_return_line
+        self._snap_in_return_source = self.state.pending_return_source
+        self._snap_in_return_default = self.state.pending_return_default
 
         if pl.is_blank:
             self.blank_count += 1
@@ -650,11 +711,48 @@ class Analyzer:
         applied_g = [g for g in (last_unit, last_mode, "54" if wcs_g else None)
                      if g is not None]
 
-        line_motion_keys = [g_code_key(w) for w in g_words
-                            if g_code_key(w) in MOTION_G]
+        issue_indexes: list[int] = []
+
+        # 分类本行 G 词（G80-G83、G98/G99 为固定循环组，G0-G3 为运动组）
+        keys = [g_code_key(w) for w in g_words]
+        line_cycle_key = next((k for k in reversed(keys) if k in CYCLE_G), None)
+        line_return_key = next((k for k in reversed(keys) if k in RETURN_G),
+                               None)
+        line_motion_keys = [k for k in keys if k in MOTION_G]
         line_motion_key = line_motion_keys[-1] if line_motion_keys else None
-        if line_motion_key is not None:
-            self.state.motion_mode = MOTION_G[line_motion_key]
+
+        # G98/G99：返回平面偏好（循环内外都模态保持）
+        if line_return_key is not None:
+            self.state.pending_return = RETURN_G[line_return_key]
+            self.state.pending_return_line = pl.line_no
+            self.state.pending_return_source = pl.source
+            self.state.pending_return_default = False
+            if self.state.cycle is not None:
+                self.state.cycle.return_mode = RETURN_G[line_return_key]
+                self.state.cycle.return_mode_line = pl.line_no
+                self.state.cycle.return_mode_source = pl.source
+                self.state.cycle.return_mode_default = False
+
+        # 运动组（G0-G3/G80-G83）按同行最后一个判定归属
+        group_keys = [(i, k) for i, k in enumerate(keys)
+                      if k in MOTION_G or k in CYCLE_G or k == "80"]
+        last_group = group_keys[-1][1] if group_keys else None
+        if last_group in MOTION_G:
+            # G0-G3 收尾 => 取消激活的固定循环，进入普通运动
+            if self.state.cycle is not None:
+                self._close_active_cycle(pl)
+            self.state.cycle = None
+            self.state.motion_mode = MOTION_G[last_group]
+            line_motion_key = last_group
+        elif last_group == "80":
+            # G80：取消固定循环（不建立 G0/G1 运动模态）
+            if self.state.cycle is not None:
+                self._close_active_cycle(pl)
+            self.state.cycle = None
+            self.state.motion_mode = None
+        elif line_cycle_key is not None:
+            self.state.motion_mode = None
+            self._activate_cycle(pl, CYCLE_G[line_cycle_key], issue_indexes)
 
         for w in m_words:  # 同行多个 M 按出现顺序执行
             key = g_code_key(w)
@@ -666,7 +764,6 @@ class Analyzer:
         # 4) F / S
         f_raw = pl.f_words[-1].value if pl.f_words else None
         s_raw = pl.s_words[-1].value if pl.s_words else None
-        issue_indexes: list[int] = []
         if f_raw is not None:
             factor = self.state.unit_factor()
             if factor is None:
@@ -705,13 +802,64 @@ class Analyzer:
         axis_words = {w.letter: w.value for w in pl.words if w.letter in "XYZ"}
         ij_words = {w.letter: w.value for w in pl.words if w.letter in "IJ"}
         r_word = next((w.value for w in pl.words if w.letter == "R"), None)
+        q_word = next((w.value for w in pl.words if w.letter == "Q"), None)
+        p_word = next((w.value for w in pl.words if w.letter == "P"), None)
+        l_word = next((w.value for w in pl.words if w.letter == "L"), None)
         coord_words = [(w.letter, w.value) for w in pl.words
-                       if w.letter in ("X", "Y", "Z", "I", "J", "R")]
+                       if w.letter in ("X", "Y", "Z", "I", "J", "R", "Q",
+                                       "P", "L")]
 
-        # 5) 无轴坐标词 => 纯设定段（即使本行写了 G0-G3 也不产生位移）
+        # 5) 固定循环处理（本行定义/重定义循环，或在激活循环上给出触发词）
+        # 触发词：X/Y（新孔位）或 L（重复孔位）；单独的 Z/R/Q/P 只是
+        # 模态参数更新，不立即钻孔（循环定义行即使无 X/Y 也在当前位置执行）
+        cycle_trigger_words = {"X", "Y", "L"}
+        is_definition = line_cycle_key is not None
+        has_trigger = self.state.cycle is not None and any(
+            w.letter in cycle_trigger_words for w in pl.words)
+        if is_definition or has_trigger:
+            if line_motion_key is not None:
+                # G81 G0 X.. 这类混合段以运动组最后者为准；
+                # 最后者为 G0-G3 时走普通运动（上面已取消循环）
+                pass
+            else:
+                self._handle_cycle_line(
+                    pl, applied_g, m_words, line_cycle_key,
+                    axis_words, r_word, q_word, p_word, l_word,
+                    f_raw, s_raw, coord_words, issue_indexes,
+                    trigger=(has_trigger or is_definition))
+                return
+
+        # 激活循环上仅给参数（Z/R/Q/P）而无孔位/重复触发词：
+        # 只更新模态参数，不触发孔加工
+        if (self.state.cycle is not None and not is_definition
+                and not has_trigger
+                and any(w.letter in ("Z", "R", "Q", "P") for w in pl.words)):
+            factor = self.state.unit_factor() or 1.0
+            bad = self._apply_cycle_words(pl, self.state.cycle, factor,
+                                          issue_indexes,
+                                          first_activation=False)
+            if bad:
+                issue_indexes.append(self._issue(
+                    "CYCLE_BAD_PARAM", pl,
+                    "固定循环参数非法：" + self._bad_param_text(bad)
+                    + "；非法参数不登记，循环定义保持不变",
+                    {"cycle": self.state.cycle.cycle, "bad": bad,
+                     "definition_line_no": self.state.cycle.def_line_no}))
+            normalized = self._cycle_normalized(
+                pl, self.state.cycle, None, f_raw, s_raw)
+            self._finish_line(pl, "setting", normalized, executed=True,
+                              issue_indexes=issue_indexes)
+            return
+
+        # 6) 无轴坐标词 => 纯设定段（即使本行写了 G0-G3 也不产生位移）
         if not axis_words:
             normalized = self._normalized(
                 applied_g, m_words, line_motion_key, coord_words, f_raw, s_raw)
+            if "80" in keys:
+                normalized = (normalized + " " if normalized else "") + "G80(取消循环)"
+            if line_return_key is not None:
+                normalized = (normalized + " " if normalized else "") + (
+                    f"G{line_return_key}(返回{RETURN_CN[RETURN_G[line_return_key]]})")
             self._finish_line(pl, "setting", normalized, executed=True,
                               issue_indexes=issue_indexes)
             return
@@ -826,8 +974,595 @@ class Analyzer:
             feed=ax(snapshot["feed_mm_per_min"]),
             spindle_rpm=snapshot["spindle_rpm"],
             spindle_on=snapshot["spindle_on"],
+            cycle=(self._snap_in_cycle.clone()
+                   if self._snap_in_cycle is not None else None),
+            pending_return=self._snap_in_return,
+            pending_return_line=self._snap_in_return_line,
+            pending_return_source=self._snap_in_return_source,
+            pending_return_default=self._snap_in_return_default,
         )
         self.state = s
+
+    # -- 固定钻孔循环 ------------------------------------------------------
+
+    def _group_for(self, cd: CycleDef) -> dict:
+        """取循环定义对应的组记录（同一 def 生命周期共享）。"""
+        g = self._cycle_group_map.get(id(cd))
+        if g is None:
+            g = {
+                "cycle": cd.cycle,
+                "definition_line_no": cd.def_line_no,
+                "definition_source_line": cd.def_source_line,
+                "cancel_line_no": None,
+                "cancel_source_line": None,
+                "initial_plane_z_mm": round6(cd.initial_z),
+                "parameters": cd.params_out(),
+                "holes": [],
+                "hole_count": 0,
+                "executed_holes": 0,
+                "blocked_holes": 0,
+                "total_drill_depth_mm": 0.0,
+                "total_dwell_s": 0.0,
+                "expanded_path_mm": {"rapid": 0.0, "cutting": 0.0,
+                                     "total": 0.0},
+            }
+            self._cycle_group_map[id(cd)] = g
+            self.cycle_groups.append(g)
+        return g
+
+    def _close_active_cycle(self, pl: ParsedLine | None = None):
+        """G80/G0-G3 关闭当前循环组（记录取消行，不改变已展开轨迹）。"""
+        cd = self.state.cycle
+        if cd is None:
+            return
+        g = self._group_for(cd)
+        g["parameters"] = cd.params_out()
+        g["initial_plane_z_mm"] = round6(cd.initial_z)
+        if pl is not None:
+            g["cancel_line_no"] = pl.line_no
+            g["cancel_source_line"] = pl.source
+
+    def _activate_cycle(self, pl: ParsedLine, cycle: str,
+                        issue_indexes: list[int]):
+        """处理本行的 G81/G82/G83（建立/重定义循环，参数合并由
+        _handle_cycle_line 统一完成，避免重复登记来源）。"""
+        prev = self.state.cycle
+        cur_z = self.state.z.value if self.state.z.known else None
+        if prev is not None:
+            self._close_active_cycle(pl)
+            # 同族参数模态继承（Z/R/P 对所有循环，Q 对 G83 有意义）
+            cd = CycleDef(
+                cycle=cycle, def_line_no=pl.line_no,
+                def_source_line=pl.source,
+                initial_z=(prev.initial_z if cur_z is None else cur_z))
+            if prev.z is not None:
+                cd.z = self._inherit_param(prev.z)
+            if prev.r is not None:
+                cd.r = self._inherit_param(prev.r)
+            if prev.p is not None:
+                cd.p = self._inherit_param(prev.p)
+            if cycle == "G83" and prev.q is not None:
+                cd.q = self._inherit_param(prev.q)
+            cd.return_mode = prev.return_mode
+            cd.return_mode_line = prev.return_mode_line
+            cd.return_mode_source = prev.return_mode_source
+            cd.return_mode_default = prev.return_mode_default
+        else:
+            cd = CycleDef(
+                cycle=cycle, def_line_no=pl.line_no,
+                def_source_line=pl.source,
+                initial_z=(cur_z if cur_z is not None else math.nan))
+        # G98/G99 以当前返回平面偏好为准（可能在循环外预先指定）
+        cd.return_mode = self.state.pending_return
+        cd.return_mode_line = self.state.pending_return_line
+        cd.return_mode_source = self.state.pending_return_source
+        cd.return_mode_default = self.state.pending_return_default
+        self.state.cycle = cd
+        self._group_for(cd)
+
+    @staticmethod
+    def _inherit_param(p: CycleParam) -> CycleParam:
+        return CycleParam(value=p.value, line_no=p.line_no,
+                          source_line=p.source_line,
+                          history=[dict(h) for h in p.history])
+
+    def _apply_cycle_words(self, pl, cd: CycleDef, factor: float,
+                           issue_indexes: list[int],
+                           first_activation: bool) -> dict:
+        """把本行的 Z/R/Q/P 合并进循环定义（mm/s），返回非法参数信息。"""
+        bad: dict = {}
+        mode = self.state.distance_mode
+        words = {w.letter: w for w in pl.words}
+
+        def set_param(name, val_mm, raw, history_note=False):
+            old = getattr(cd, name)
+            prog = None if self.state.unit_factor() is None else raw
+            if old is None:
+                setattr(cd, name, CycleParam.from_word(
+                    val_mm, pl.line_no, pl.source, program_value=prog))
+            else:
+                old.update(val_mm, pl.line_no, pl.source, program_value=prog)
+
+        if "R" in words and mode is not None:
+            raw_r = words["R"].value
+            init_z = cd.initial_z if not math.isnan(cd.initial_z) else (
+                self.state.z.value if self.state.z.known else 0.0)
+            r_abs = resolve_r(raw_r, factor, mode, init_z)
+            set_param("r", r_abs, raw_r)
+        if "Z" in words and mode is not None:
+            raw_z = words["Z"].value
+            r_abs = cd.r.value if cd.r is not None else None
+            init_z = (cd.initial_z if not math.isnan(cd.initial_z)
+                      else (self.state.z.value if self.state.z.known else None))
+            z_abs = resolve_z(raw_z, factor, mode, r_abs=r_abs,
+                              initial_z=init_z)
+            set_param("z", z_abs, raw_z)
+        if "Q" in words:
+            raw_q = words["Q"].value
+            q_mm = raw_q * factor
+            if q_mm <= 0:
+                bad["q"] = {"program_value": raw_q, "value_mm": q_mm}
+            else:
+                set_param("q", q_mm, raw_q)
+        if "P" in words:
+            raw_p = words["P"].value
+            if raw_p < 0:
+                bad["p"] = {"program_value": raw_p,
+                            "reason": "P 必须为非负数（整数按 ms、小数按 s）"}
+            else:
+                p_s = raw_p / 1000.0 if raw_p >= 1 else raw_p
+                set_param("p", p_s, raw_p)
+        return bad
+
+    def _handle_cycle_line(self, pl, applied_g, m_words, line_cycle_key,
+                           axis_words, r_word, q_word, p_word, l_word,
+                           f_raw, s_raw, coord_words, issue_indexes,
+                           trigger: bool = True):
+        """循环定义行/触发行：合并参数并按 L 展开孔位。"""
+        cd = self.state.cycle
+        factor = self.state.unit_factor() or 1.0
+        bad = self._apply_cycle_words(
+            pl, cd, factor, issue_indexes,
+            first_activation=(cd.def_line_no == pl.line_no))
+
+        # L：默认 1；必须为正整数
+        reps = 1
+        if l_word is not None:
+            if l_word <= 0 or abs(l_word - round(l_word)) > MM_EPS:
+                bad["l"] = {"program_value": l_word,
+                            "reason": "L 必须为正整数（重复孔位数）"}
+            else:
+                reps = int(round(l_word))
+
+        normalized = self._cycle_normalized(
+            pl, cd, line_cycle_key, f_raw, s_raw)
+
+        # 阻断条件一：非法参数（Q<=0 / P<0 / L 非法）
+        block_codes: list[str] = []
+        if bad:
+            block_codes.append("CYCLE_BAD_PARAM")
+            issue_indexes.append(self._issue(
+                "CYCLE_BAD_PARAM", pl,
+                "固定循环参数非法：" + self._bad_param_text(bad)
+                + "；按保守策略本行对应孔全部阻断，原程序不变",
+                {"cycle": cd.cycle, "bad": bad,
+                 "definition_line_no": cd.def_line_no}, normalized))
+
+        # 阻断条件二：孔底与 R 平面顺序矛盾
+        plane_conflict = (
+            cd.z is not None and cd.r is not None
+            and cd.z.value > cd.r.value + MM_EPS)
+        if plane_conflict:
+            block_codes.append("CYCLE_PLANE_CONFLICT")
+            issue_indexes.append(self._issue(
+                "CYCLE_PLANE_CONFLICT", pl,
+                f"孔底 Z={fmt_num(cd.z.value)} 高于 R 平面 Z={fmt_num(cd.r.value)}，"
+                "平面顺序矛盾（必须 孔底 <= R 平面）；本行对应孔全部阻断",
+                {"cycle": cd.cycle,
+                 "z_bottom_mm": round6(cd.z.value),
+                 "r_plane_mm": round6(cd.r.value),
+                 "definition_line_no": cd.def_line_no}, normalized))
+
+        # 阻断条件三：缺少 Z/R（G83 还需给过正的 Q；Q<=0 已在条件一报告）
+        missing = [m for m in cd.missing()
+                   if not (m == "Q" and "q" in bad)]
+        if cd.cycle == "G83" and cd.q is not None and cd.q.value > 0:
+            missing = [m for m in missing if m != "Q"]
+        if missing:
+            block_codes.append("CYCLE_MISSING_PARAMS")
+            params_detail = {}
+            for name, p in (("Z", cd.z), ("R", cd.r)):
+                params_detail[name] = (
+                    {"line_no": p.line_no, "source_line": p.source_line}
+                    if p is not None else None)
+            issue_indexes.append(self._issue(
+                "CYCLE_MISSING_PARAMS", pl,
+                f"{cd.cycle} 首次启用缺少必要参数 {'/'.join(missing)}"
+                "（循环模态已登记，可在后续程序段补齐参数后再执行）；"
+                "本行对应孔全部阻断，原程序不变",
+                {"cycle": cd.cycle, "missing": missing,
+                 "definition_line_no": cd.def_line_no,
+                 "param_sources": params_detail}, normalized))
+
+        # 阻断条件四：单位 / 定位模式不明
+        unknown_unit = self.state.unit_factor() is None
+        unknown_mode = self.state.distance_mode is None
+        if unknown_unit:
+            issue_indexes.append(self._issue(
+                "UNKNOWN_UNITS", pl,
+                f"{cd.cycle} 固定循环发生在任何 G20/G21 之前，物理尺寸无法"
+                "确定；本行对应孔阻断，不展开轨迹、不更新刀具位置",
+                {}, normalized))
+        if unknown_mode:
+            issue_indexes.append(self._issue(
+                "UNKNOWN_DISTANCE_MODE", pl,
+                f"{cd.cycle} 固定循环在 G90/G91 建立之前触发，无法判定孔位"
+                "绝对/增量定位；本行对应孔阻断",
+                {}, normalized))
+
+        # 阻断条件五：孔位 / 初始平面不可继承
+        inherit_bad = (trigger and not unknown_unit and not unknown_mode
+                       and not block_codes
+                       and (not self.state.x.known or not self.state.y.known
+                            or not self.state.z.known
+                            or math.isnan(cd.initial_z)))
+        if inherit_bad:
+            why = []
+            if not self.state.x.known:
+                why.append("X 位置")
+            if not self.state.y.known:
+                why.append("Y 位置")
+            if not self.state.z.known:
+                why.append("当前 Z（初始平面）")
+            if math.isnan(cd.initial_z):
+                why.append("循环初始平面")
+            issue_indexes.append(self._issue(
+                "CYCLE_NO_INHERITABLE_STATE", pl,
+                f"后续孔位没有可继承的状态：{'、'.join(why)}未知；"
+                "无法确定孔位与初始平面，本行对应孔全部阻断",
+                {"cycle": cd.cycle, "unknown": why,
+                 "definition_line_no": cd.def_line_no}, normalized))
+            block_codes.append("CYCLE_NO_INHERITABLE_STATE")
+
+        g = self._group_for(cd)
+        g["parameters"] = cd.params_out()
+        if not math.isnan(cd.initial_z):
+            g["initial_plane_z_mm"] = round6(cd.initial_z)
+
+        blocked = trigger and (
+            bool(block_codes) or unknown_unit or unknown_mode)
+
+        # 展开孔位（即便阻断也登记孔记录，写明依据；阻断不产生位移）
+        holes_info = self._expand_trigger_holes(
+            pl, cd, reps, axis_words, blocked, block_codes, issue_indexes,
+            normalized, l_word, do_holes=trigger)
+
+        # 同一触发行可能在多个展开动作上重复产生同类工艺问题，按代码去重
+        self._dedupe_cycle_issues(pl, issue_indexes)
+
+        entry_type = "setting"
+        if trigger:
+            entry_type = "cycle_blocked" if blocked else (
+                "cycle_definition" if line_cycle_key is not None
+                else "cycle_trigger")
+
+        self._finish_line(
+            pl, entry_type, normalized, executed=not blocked,
+            segment=holes_info["segment"],
+            physical_known=not blocked and not unknown_unit and not unknown_mode,
+            block_reason=(";".join(block_codes) if blocked else None),
+            issue_indexes=issue_indexes)
+        if blocked:
+            self.blocked_count += 1
+        else:
+            self.executed_count += 1
+
+    def _dedupe_cycle_issues(self, pl: ParsedLine, issue_indexes: list[int]):
+        """同一循环触发行的同类工艺问题只保留首个（如每啄一步都报
+        主轴未转/无进给）。"""
+        seen: set[str] = set()
+        kept: list[int] = []
+        for idx in issue_indexes:
+            code = self.issues[idx].code
+            if code in ("SPINDLE_NOT_RUNNING", "FEED_UNSET", "UNKNOWN_WCS",
+                        "RAPID_BELOW_SAFE_Z") and code in seen:
+                continue
+            seen.add(code)
+            kept.append(idx)
+        issue_indexes[:] = kept
+
+    def _expand_trigger_holes(self, pl, cd: CycleDef, reps: int, axis_words,
+                              blocked, block_codes, issue_indexes,
+                              normalized, l_word, do_holes: bool = True) -> dict:
+        """按 G90/G91 与 L 计算孔位，逐孔展开；返回轨迹 segment 汇总。
+
+        do_holes=False 时只登记/合并参数，不占用孔序（纯参数行）。
+        """
+        mode = self.state.distance_mode
+        factor = self.state.unit_factor() or 1.0
+        start_xy = (self.state.x.value if self.state.x.known else None,
+                    self.state.y.value if self.state.y.known else None)
+
+        if not do_holes:
+            return {"segment": None}
+
+        # 解算本行目标 XY（G91 下相对当前位置）
+        tgt_xy: list[float | None] = [start_xy[0], start_xy[1]]
+        if not blocked and mode is not None:
+            for i, letter in enumerate(("X", "Y")):
+                if letter in axis_words:
+                    raw = axis_words[letter]
+                    if mode == "absolute":
+                        tgt_xy[i] = raw * factor
+                    elif start_xy[i] is not None:
+                        tgt_xy[i] = start_xy[i] + raw * factor
+                    else:
+                        tgt_xy[i] = None
+
+        holes: list[dict] = []
+        all_moves: list[dict] = []
+        g = self._group_for(cd)
+        last_xy = start_xy
+        last_z = self.state.z.value if self.state.z.known else None
+        rapid_len = cut_len = depth_sum = dwell_sum = 0.0
+        hole_nos: list[int] = []
+
+        for k in range(reps):
+            self.hole_seq += 1
+            no = self.hole_seq
+            hole_nos.append(no)
+            g["hole_count"] += 1
+            if mode == "relative" and k > 0 and not blocked:
+                # G91 L>1：连续孔沿 XY 增量重复
+                if "X" in axis_words and tgt_xy[0] is not None:
+                    tgt_xy[0] = tgt_xy[0] + axis_words["X"] * factor
+                if "Y" in axis_words and tgt_xy[1] is not None:
+                    tgt_xy[1] = tgt_xy[1] + axis_words["Y"] * factor
+
+            pos_known = (not blocked and tgt_xy[0] is not None
+                         and tgt_xy[1] is not None and last_z is not None)
+            hole = {
+                "hole_no": no,
+                "cycle": cd.cycle,
+                "repeat_index": k + 1,
+                "trigger_line_no": pl.line_no,
+                "trigger_source_line": pl.source,
+                "definition_line_no": cd.def_line_no,
+                "x_mm": round6(tgt_xy[0]) if not blocked else None,
+                "y_mm": round6(tgt_xy[1]) if not blocked else None,
+                "l_repeat": (int(round(l_word)) if l_word is not None else 1),
+                "status": "blocked" if blocked else "drilled",
+                "block_codes": block_codes if blocked else [],
+                "moves": [],
+                "parameter_sources": self._cycle_param_sources(cd),
+            }
+
+            if blocked:
+                self.hole_blocked += 1
+                g["blocked_holes"] += 1
+                hole["basis"] = self._block_basis_text(block_codes)
+                holes.append(hole)
+                g["holes"].append(hole)
+                continue
+
+            # 孔间定位段（从上个孔返回高度到新孔位 XY）
+            entry_z = last_z
+            if last_xy is not None:
+                pm = positioning_move(last_xy, (tgt_xy[0], tgt_xy[1]), entry_z)
+                self._check_cycle_move(pl, pm, issue_indexes, no,
+                                       internal=False)
+                all_moves.append(pm)
+                rapid_len += pm["length_mm"]
+
+            exp = expand_hole(cd, (tgt_xy[0], tgt_xy[1]), entry_z)
+            for mv in exp["moves"]:
+                internal = bool(mv.get("internal_cycle"))
+                self._check_cycle_move(pl, mv, issue_indexes, no,
+                                       internal=internal)
+            all_moves.extend(exp["moves"])
+            rapid_len += exp["rapid_len_mm"]
+            cut_len += exp["cutting_len_mm"]
+            depth_sum += exp["drill_depth_mm"]
+            dwell_sum += exp["dwell_s"]
+
+            hole["moves"] = exp["moves"]
+            hole["initial_plane_z_mm"] = round6(cd.initial_z)
+            hole["r_plane_z_mm"] = round6(cd.r.value)
+            hole["z_bottom_mm"] = round6(cd.z.value)
+            hole["return_plane"] = ("G98" if cd.return_mode == "initial"
+                                    else "G99")
+            hole["drill_depth_mm"] = exp["drill_depth_mm"]
+            hole["dwell_s"] = exp["dwell_s"]
+            hole["retract_z_mm"] = round6(exp["retract_z"])
+            hole["expanded_path_mm"] = {
+                "rapid": exp["rapid_len_mm"],
+                "cutting": exp["cutting_len_mm"],
+                "total": round(exp["rapid_len_mm"] + exp["cutting_len_mm"], 6)}
+            holes.append(hole)
+            g["holes"].append(hole)
+            self.hole_ok += 1
+            g["executed_holes"] += 1
+
+            # 模态位置更新到孔位 + 返回高度
+            self.state.x = Axis(tgt_xy[0], True)
+            self.state.y = Axis(tgt_xy[1], True)
+            self.state.z = Axis(exp["retract_z"], True)
+            last_xy = (tgt_xy[0], tgt_xy[1])
+            last_z = exp["retract_z"]
+
+        g["total_drill_depth_mm"] = round(
+            g["total_drill_depth_mm"] + depth_sum, 6)
+        g["total_dwell_s"] = round(g["total_dwell_s"] + dwell_sum, 6)
+        g["expanded_path_mm"]["rapid"] = round(
+            g["expanded_path_mm"]["rapid"] + rapid_len, 6)
+        g["expanded_path_mm"]["cutting"] = round(
+            g["expanded_path_mm"]["cutting"] + cut_len, 6)
+        g["expanded_path_mm"]["total"] = round(
+            g["expanded_path_mm"]["rapid"] + g["expanded_path_mm"]["cutting"],
+            6)
+
+        if not blocked:
+            self.length_cycle_rapid += rapid_len
+            self.length_cycle_cutting += cut_len
+            # 展开轨迹并入全局路径长度（行程/包围盒在逐动作检查时已累计）
+            self.length_rapid += rapid_len
+            self.length_cutting += cut_len
+
+        segment = {
+            "kind": "canned_cycle",
+            "cycle": cd.cycle,
+            "hole_nos": hole_nos,
+            "start_mm": ([round6(v) for v in
+                          (start_xy[0], start_xy[1],
+                           self._snap_in["z"]["value_mm"])]
+                         if start_xy[0] is not None
+                         and start_xy[1] is not None else None),
+            "holes": holes,
+            "moves_mm": all_moves,
+            "length_mm": round(rapid_len + cut_len, 6),
+            "rapid_length_mm": round(rapid_len, 6),
+            "cutting_length_mm": round(cut_len, 6),
+            "drill_depth_mm": round(depth_sum, 6),
+            "dwell_s": round(dwell_sum, 6),
+        }
+        return {"segment": segment}
+
+    def _check_cycle_move(self, pl, mv: dict, issue_indexes, hole_no: int,
+                          internal: bool):
+        """对一个展开动作复用行程/包围盒/安全Z/进给/主轴检查。"""
+        pts = [tuple(mv["start_mm"]), tuple(mv["end_mm"])]
+        kind = "rapid" if mv["motion"] == "rapid" else "linear"
+        seg = {
+            "kind": kind,
+            "start": pts[0], "end": pts[1], "points": pts,
+            "length_mm": mv["length_mm"],
+        }
+        before = len(issue_indexes)
+        # 循环内部快速动作（G83 排屑回退/再下钻、到 R 的垂直接近）豁免
+        # 安全 Z 告警，但仍做行程/包围盒检查；切削动作做主轴/进给检查。
+        self._run_segment_checks(
+            pl, kind, seg, issue_indexes,
+            cycle_context=(internal or kind == "rapid"))
+        # 孔间定位段（非内部快速）补充安全 Z 检查
+        # （G99 在 R 平面横移可能低于安全 Z）
+        if not internal and kind == "rapid":
+            self._rapid_safe_z_check(pl, seg, issue_indexes, hole_no)
+        # 给本次移动产生的问题补上孔序/动作
+        for idx in issue_indexes[before:]:
+            iss = self.issues[idx]
+            iss.details.setdefault(
+                "cycle", self.state.cycle.cycle if self.state.cycle else None)
+            iss.details.setdefault("hole_no", hole_no)
+            iss.details.setdefault("cycle_action", mv.get("action"))
+
+    def _rapid_safe_z_check(self, pl, seg, issue_indexes, hole_no):
+        """循环孔间定位段的安全 Z 检查（G99 在 R 平面横移可能低于安全 Z）。"""
+        s0, s1 = seg["start"], seg["end"]
+        if any(v is None for v in (s0[0], s0[1], s1[0], s1[1], s1[2])):
+            return
+        xy_move = math.hypot(s1[0] - s0[0], s1[1] - s0[1]) > MM_EPS
+        if not xy_move:
+            return
+        zs = [p[2] for p in seg["points"] if p[2] is not None]
+        end_below = s1[2] < self.cfg.safe_z - MM_EPS
+        horiz_below = min(zs) < self.cfg.safe_z - MM_EPS
+        if end_below or horiz_below:
+            z_ref = s1[2] if end_below else min(zs)
+            issue_indexes.append(self._issue(
+                "RAPID_BELOW_SAFE_Z", pl,
+                f"固定循环孔间快速定位到达/经过 Z={fmt_num(z_ref)} mm"
+                f"（工件坐标，孔序 {hole_no}），低于安全 Z "
+                f"{fmt_num(self.cfg.safe_z)} mm"
+                f"（低 {fmt_num(self.cfg.safe_z - z_ref)} mm；"
+                f"通常因 G99 在 R 平面横移导致）",
+                {"ref_z_mm": round(z_ref, 6),
+                 "safe_z_mm": self.cfg.safe_z,
+                 "below_mm": round(self.cfg.safe_z - z_ref, 6),
+                 "end_below_safe_z": end_below,
+                 "horizontal_travel_below_safe_z": horiz_below,
+                 "hole_no": hole_no,
+                 "in_canned_cycle": True}))
+
+    @staticmethod
+    def _block_basis_text(block_codes) -> str:
+        parts = {
+            "CYCLE_BAD_PARAM": "循环参数非法（Q<=0、P 为负或 L 非正整数）",
+            "CYCLE_PLANE_CONFLICT": "孔底与 R 平面顺序矛盾",
+            "CYCLE_MISSING_PARAMS": "首次启用缺少 Z/R（G83 还需 Q）",
+            "CYCLE_NO_INHERITABLE_STATE": "后续孔位没有可继承的状态",
+        }
+        return "；".join(parts.get(c, c) for c in block_codes)
+
+    @staticmethod
+    def _bad_param_text(bad: dict) -> str:
+        bits = []
+        if "q" in bad:
+            bits.append(f"Q={fmt_num(bad['q']['program_value'])}（G83 每步"
+                        "深度必须为正数）")
+        if "p" in bad:
+            bits.append(f"P={fmt_num(bad['p']['program_value'])}（暂停时间"
+                        "必须为非负数）")
+        if "l" in bad:
+            bits.append(f"L={fmt_num(bad['l']['program_value'])}（重复次数"
+                        "必须为正整数）")
+        return "；".join(bits)
+
+    def _cycle_param_sources(self, cd: CycleDef) -> dict:
+        """逐孔参数来源（定义行 / 最近触发行 / 默认值）。"""
+        def src(p):
+            if p is None:
+                return None
+            return {"value_mm": round6(p.value), "line_no": p.line_no,
+                    "source_line": p.source_line}
+
+        out = {
+            "Z_bottom": src(cd.z),
+            "R_plane": src(cd.r),
+            "Q_peck": src(cd.q),
+            "P_dwell_s": src(cd.p),
+            "initial_plane_z_mm": (round6(cd.initial_z)
+                                   if not math.isnan(cd.initial_z) else None),
+            "return_plane": {
+                "code": "G98" if cd.return_mode == "initial" else "G99",
+                "line_no": cd.return_mode_line,
+                "source_line": cd.return_mode_source,
+                "default": cd.return_mode_default,
+            },
+        }
+        return out
+
+    def _cycle_normalized(self, pl, cd: CycleDef, line_cycle_key,
+                          f_raw, s_raw) -> str:
+        """循环行的规范化文本（含循环代号、返回平面、本行词与继承标注）。"""
+        out: list[str] = []
+        if line_cycle_key is not None:
+            out.append(CYCLE_G[line_cycle_key])
+        ret_g = "G98" if cd.return_mode == "initial" else "G99"
+        if not cd.return_mode_default:
+            out.append(ret_g)
+        for w in pl.words:
+            if w.letter in ("N", "G"):
+                continue
+            if w.letter in ("X", "Y", "Z", "R", "Q", "P", "L", "F", "S"):
+                out.append(f"{w.letter}{fmt_num(w.value)}")
+        for w in pl.m_words:
+            out.append("M" + fmt_num(w.value))
+        # 继承参数标注
+        inherited = []
+        if cd.z is not None and cd.z.line_no != pl.line_no:
+            inherited.append(f"Z(继承L{cd.z.line_no})")
+        if cd.r is not None and cd.r.line_no != pl.line_no:
+            inherited.append(f"R(继承L{cd.r.line_no})")
+        if cd.cycle == "G83" and cd.q is not None and cd.q.line_no != pl.line_no:
+            inherited.append(f"Q(继承L{cd.q.line_no})")
+        if cd.p is not None and cd.p.line_no != pl.line_no:
+            inherited.append(f"P(继承L{cd.p.line_no})")
+        if cd.return_mode_default:
+            inherited.append(f"{ret_g}(默认)")
+        text = " ".join(out)
+        if inherited:
+            text += "  [" + "，".join(inherited) + "]"
+        return text
 
     # -- 圆弧 --------------------------------------------------------------
 
@@ -902,7 +1637,8 @@ class Analyzer:
 
     # -- 段级检查 ----------------------------------------------------------
 
-    def _run_segment_checks(self, pl, motion_mode, segment, issue_indexes):
+    def _run_segment_checks(self, pl, motion_mode, segment, issue_indexes,
+                            cycle_context: bool = False):
         points = segment["points"]
 
         # 行程检查需要工件坐标系
@@ -928,7 +1664,7 @@ class Analyzer:
 
         self._grow_bbox(points, machine=False)
 
-        if motion_mode == "rapid":
+        if motion_mode == "rapid" and not cycle_context:
             zs = [p[2] for p in points if p[2] is not None]
             s0, s1 = segment["start"], segment["end"]
             xy_known = all(v is not None for v in
@@ -939,7 +1675,9 @@ class Analyzer:
             horiz_below = (xy_move and zs
                            and min(zs) < self.cfg.safe_z - MM_EPS)
             # 纯垂直抬刀必然经过当前低 Z，不报警；
-            # 报警条件：快速终点低于安全 Z，或安全 Z 以下存在水平快速移动
+            # 报警条件：快速终点低于安全 Z，或安全 Z 以下存在水平快速移动。
+            # 固定循环内部（G83 排屑回退、下到 R 等）属于钻削工艺动作，
+            # 不在此列；循环间定位段仍参与检查。
             if end_below or horiz_below:
                 z_ref = s1[2] if end_below else min(zs)
                 issue_indexes.append(self._issue(
@@ -1017,6 +1755,8 @@ class Analyzer:
     def _segment_out(self, segment):
         if segment is None:
             return None
+        if segment.get("kind") == "canned_cycle":
+            return self._cycle_segment_out(segment)
         out = {
             "kind": segment["kind"],
             "start_mm": [round6(v) for v in segment["start"]],
@@ -1028,6 +1768,34 @@ class Analyzer:
             out["arc"] = segment["arc"]
         return out
 
+    def _cycle_segment_out(self, segment) -> dict:
+        def move_out(mv):
+            return {
+                "action": mv.get("action"),
+                "motion": mv.get("motion"),
+                "internal_cycle": bool(mv.get("internal_cycle")),
+                "note": mv.get("note"),
+                "start_mm": list(mv["start_mm"]),
+                "end_mm": list(mv["end_mm"]),
+                "points_mm": [list(p) for p in mv["points_mm"]],
+                "length_mm": mv["length_mm"],
+                "dwell_s": mv.get("dwell_s"),
+            }
+
+        return {
+            "kind": "canned_cycle",
+            "cycle": segment["cycle"],
+            "hole_nos": segment["hole_nos"],
+            "start_mm": segment["start_mm"],
+            "length_mm": segment["length_mm"],
+            "rapid_length_mm": segment["rapid_length_mm"],
+            "cutting_length_mm": segment["cutting_length_mm"],
+            "drill_depth_mm": segment["drill_depth_mm"],
+            "dwell_s": segment["dwell_s"],
+            "holes": segment["holes"],
+            "moves_mm": [move_out(m) for m in segment["moves_mm"]],
+        }
+
     def _bbox_out(self, bmin, bmax):
         if any(math.isinf(v) for v in bmin):
             return None
@@ -1038,6 +1806,77 @@ class Analyzer:
             "size_mm": [round(bmax[0] - bmin[0], 6),
                         round(bmax[1] - bmin[1], 6),
                         round(bmax[2] - bmin[2], 6)],
+        }
+
+    def _drill_cycles_out(self) -> dict:
+        groups = []
+        for g in self.cycle_groups:
+            groups.append({
+                "cycle": g["cycle"],
+                "definition_line_no": g["definition_line_no"],
+                "definition_source_line": g["definition_source_line"],
+                "cancel_line_no": g["cancel_line_no"],
+                "cancel_source_line": g["cancel_source_line"],
+                "initial_plane_z_mm": g["initial_plane_z_mm"],
+                "parameters": g["parameters"],
+                "hole_count": g["hole_count"],
+                "executed_holes": g["executed_holes"],
+                "blocked_holes": g["blocked_holes"],
+                "total_drill_depth_mm": g["total_drill_depth_mm"],
+                "total_dwell_s": g["total_dwell_s"],
+                "expanded_path_mm": g["expanded_path_mm"],
+                "holes": g["holes"],
+            })
+
+        def agg(field_):
+            return round(sum(grp[field_] for grp in self.cycle_groups), 6)
+
+        def agg_expanded(groups, key):
+            return round(sum(grp["expanded_path_mm"][key] for grp in groups),
+                         6)
+
+        by_cycle: dict = {}
+        for grp in self.cycle_groups:
+            d = by_cycle.setdefault(grp["cycle"], {
+                "groups": 0, "holes": 0, "drilled": 0, "blocked": 0,
+                "drill_depth_mm": 0.0, "expanded_rapid_mm": 0.0,
+                "expanded_cutting_mm": 0.0})
+            d["groups"] += 1
+            d["holes"] += grp["hole_count"]
+            d["drilled"] += grp["executed_holes"]
+            d["blocked"] += grp["blocked_holes"]
+            d["drill_depth_mm"] = round(
+                d["drill_depth_mm"] + grp["total_drill_depth_mm"], 6)
+            d["expanded_rapid_mm"] = round(
+                d["expanded_rapid_mm"] + grp["expanded_path_mm"]["rapid"], 6)
+            d["expanded_cutting_mm"] = round(
+                d["expanded_cutting_mm"] + grp["expanded_path_mm"]["cutting"],
+                6)
+
+        return {
+            "supported_cycles": {
+                "G80": "取消固定循环（不建立运动模态）",
+                "G81": "钻孔循环：快速到 R，进给到孔底，快速退回",
+                "G82": "锪孔循环：同 G81，孔底暂停 P（整数 ms/小数 s）",
+                "G83": "深孔啄钻：按 Q 分步进给，每步退回 R 排屑",
+                "G98": "孔后返回初始平面（未写明时的默认）",
+                "G99": "孔后返回 R 平面",
+            },
+            "summary": {
+                "cycle_groups": len(self.cycle_groups),
+                "holes_total": self.hole_seq,
+                "holes_drilled": self.hole_ok,
+                "holes_blocked": self.hole_blocked,
+                "total_drill_depth_mm": agg("total_drill_depth_mm"),
+                "total_dwell_s": agg("total_dwell_s"),
+                "expanded_path_mm": {
+                    "rapid": agg_expanded(self.cycle_groups, "rapid"),
+                    "cutting": agg_expanded(self.cycle_groups, "cutting"),
+                    "total": agg_expanded(self.cycle_groups, "total"),
+                },
+            },
+            "by_cycle": by_cycle,
+            "groups": groups,
         }
 
     def _build_report(self, physical_lines: int) -> dict:
@@ -1057,9 +1896,14 @@ class Analyzer:
                 "blank_or_comment_lines": self.blank_count,
                 "executed_lines": self.executed_count,
                 "blocked_lines": self.blocked_count,
+                "drill_holes": self.hole_ok,
+                "drill_holes_blocked": self.hole_blocked,
+                "drill_holes_total": self.hole_seq,
+                "drill_cycle_groups": len(self.cycle_groups),
             },
             "machine": self.cfg.to_dict(),
             "final_state": self.state.snapshot(),
+            "drill_cycles": self._drill_cycles_out(),
             "bbox_program_mm": self._bbox_out(self.bmin, self.bmax),
             "bbox_machine_mm": (
                 self._bbox_out(self.mbmin, self.mbmax)
@@ -1073,6 +1917,8 @@ class Analyzer:
                 "total": round(self.length_rapid + self.length_cutting, 6),
                 "reliable": self.unknown_length_segments == 0,
                 "unknown_segments": self.unknown_length_segments,
+                "canned_cycle_rapid": round(self.length_cycle_rapid, 6),
+                "canned_cycle_cutting": round(self.length_cycle_cutting, 6),
             },
             "risk": {
                 "score": score,
@@ -1093,6 +1939,14 @@ class Analyzer:
                          "不改变任何模态",
                 "safe_z": "安全 Z 按工件(程序)坐标判定",
                 "feed": "F 按出现时的单位换算为 mm/min 后模态保持",
+                "canned_cycle": (
+                    "G81/G82/G83 为模态固定循环，G80 或 G0-G3 取消；"
+                    "Z/R/Q/P 模态继承，L 为孔位重复次数（默认 1，正整数）；"
+                    "G90 下 Z/R 绝对、L 为同位重复，G91 下 Z 相对 R、R 相对初始"
+                    "平面、L 沿 XY 增量展开连续孔；G98 返回初始平面（默认），"
+                    "G99 返回 R 平面；首次启用缺 Z/R、G83 的 Q 非正、P/L 非法"
+                    "或孔底高于 R 时阻断对应孔；G83 循环内部排屑快速移动豁免"
+                    "安全 Z 告警，孔间定位仍检查"),
             },
         }
 
@@ -1111,18 +1965,50 @@ DIALECT = {
         "G20": "英制单位", "G21": "公制单位",
         "G90": "绝对定位", "G91": "增量定位",
         "G54": "工件坐标系 1（偏置由配置提供）",
+        "G80": "取消固定钻孔循环",
+        "G81": "钻孔循环（快速到 R，进给到孔底，快速退回）",
+        "G82": "锪孔循环（同 G81，孔底暂停 P）",
+        "G83": "深孔啄钻（按 Q 分步下钻，每步退回 R 排屑）",
+        "G98": "固定循环后返回初始平面（默认）",
+        "G99": "固定循环后返回 R 平面",
+    },
+    "canned_cycles": {
+        "G81": {"params": "X Y Z R F L",
+                "action": "定位 -> 快速到 R -> 进给到 Z -> 快速退回"},
+        "G82": {"params": "X Y Z R P F L",
+                "action": "同 G81，孔底暂停 P（整数=ms，小数=s）"},
+        "G83": {"params": "X Y Z R Q F L",
+                "action": "按 Q 分步啄钻，每步快速退回 R 排屑，"
+                          "再快速下到距上次孔底 0.1 mm 后进给"},
+        "G98": "孔后返回初始平面（未写明 G98/G99 时的默认）",
+        "G99": "孔后返回 R 平面（连续孔间在 R 高度横移）",
+        "L": "孔位重复次数，默认 1，必须为正整数；G91 下沿 XY 增量"
+             "展开为连续孔，G90 下为同位置重复",
+        "R_semantics": "G90 绝对 R 坐标；G91 相对循环建立时的初始平面",
+        "Z_semantics": "G90 绝对孔底坐标；G91 相对 R 平面的孔底增量",
+        "Q_semantics": "G83 每步进给深度，恒为正的无符号增量（mm）",
+        "P_semantics": "G82 孔底暂停：整数按毫秒、小数按秒；负数非法",
+        "block_rules": [
+            "首次启用缺少 Z 或 R（G83 还需正的 Q）-> 阻断对应孔",
+            "G83 的 Q<=0、P 为负、L 非正整数 -> 阻断对应孔",
+            "孔底高于 R 平面 -> CYCLE_PLANE_CONFLICT，阻断对应孔",
+            "后续孔位缺少可继承的 XY/初始平面状态 -> 阻断对应孔",
+        ],
     },
     "supported_m": {"M3": "主轴正转", "M5": "主轴停止"},
-    "supported_words": ["X", "Y", "Z", "I", "J", "R", "F", "S", "N(忽略)"],
+    "supported_words": ["X", "Y", "Z", "I", "J", "R", "F", "S", "N(忽略)",
+                        "Q(固定循环步进)", "P(固定循环暂停)",
+                        "L(固定循环重复次数)"],
     "comments": ["(圆括号注释)", ";分号注释"],
     "unsupported_policy": "任何未列出的 G/M 指令及其他地址词均显式报告，"
                           "并整段阻断，不猜测执行",
     "unsupported_examples": [
         "G17/G18/G19 平面选择", "G28/G30 回零",
         "G40-G43 刀补", "G54.1/G55-G59 其他工件坐标系",
-        "G80-G89 固定循环", "圆弧 K 参数（仅 G17，用 I/J）",
+        "G84-G89 其他固定循环（仅支持 G80-G83）",
+        "圆弧 K 参数（仅 G17，用 I/J）",
         "M2/M30 程序结束", "M4 反转", "M6 换刀", "M7-M9 冷却",
-        "T 刀号", "H/D 刀补号", "P/Q/L 等参数",
+        "T 刀号", "H/D 刀补号",
     ],
     "severity_levels": SEVERITY_ORDER,
 }

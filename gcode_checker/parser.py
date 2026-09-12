@@ -23,6 +23,12 @@ SUPPORTED_G = {
     "90": "absolute",    # 绝对定位
     "91": "relative",    # 增量定位
     "54": "wcs",         # 工件坐标系 1（偏移由作业配置给出）
+    "80": "cycle_cancel",   # 取消固定循环
+    "81": "cycle_drill",    # 钻孔循环（普通）
+    "82": "cycle_dwell",    # 钻孔循环（孔底暂停）
+    "83": "cycle_peck",     # 深孔钻（分步啄钻）
+    "98": "cycle_ret_init",  # 固定循环返回初始平面
+    "99": "cycle_ret_r",     # 固定循环返回 R 平面
 }
 
 # 本工具支持的 M 指令

@@ -59,11 +59,15 @@ class ApiError(Exception):
 # ---------------------------------------------------------------------------
 
 def filter_report(report: dict, query: dict) -> dict:
-    """按 severity / code / 行范围筛选问题；其余统计同步重算。"""
+    """按 severity / code / 行范围 / 循环类型 / 孔序筛选问题；
+    其余统计同步重算。"""
     severities = _csv_param(query, "severity")
     codes = _csv_param(query, "code")
     line_from = _int_param(query, "line_from")
     line_to = _int_param(query, "line_to")
+    cycles = _csv_param(query, "cycle")
+    hole_from = _int_param(query, "hole_from")
+    hole_to = _int_param(query, "hole_to")
 
     for s in severities:
         if s not in SEVERITY_ORDER:
@@ -75,6 +79,16 @@ def filter_report(report: dict, query: dict) -> dict:
         raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_QUERY",
                        f"未知问题代码 {unknown_codes}",
                        {"allowed": sorted(ISSUE_SEVERITY)})
+    cycles_upper = [c.upper() for c in cycles]
+    bad_cycles = [c for c in cycles_upper if c not in ("G81", "G82", "G83")]
+    if bad_cycles:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_QUERY",
+                       f"未知循环类型 {bad_cycles}",
+                       {"allowed": ["G81", "G82", "G83"]})
+    for name, v in (("hole_from", hole_from), ("hole_to", hole_to)):
+        if v is not None and v < 1:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_QUERY",
+                           f"{name} 必须 >= 1")
 
     issues = report["issues"]
     if severities:
@@ -85,6 +99,17 @@ def filter_report(report: dict, query: dict) -> dict:
         issues = [i for i in issues if i["line_no"] >= line_from]
     if line_to is not None:
         issues = [i for i in issues if i["line_no"] <= line_to]
+    if cycles_upper:
+        issues = [i for i in issues
+                  if i.get("details", {}).get("cycle") in cycles_upper]
+    def _in_hole_range(i):
+        no = i.get("details", {}).get("hole_no")
+        if no is None:
+            return True  # 非循环问题不受孔序筛选影响
+        return ((hole_from is None or no >= hole_from)
+                and (hole_to is None or no <= hole_to))
+    if hole_from is not None or hole_to is not None:
+        issues = [i for i in issues if _in_hole_range(i)]
 
     out = dict(report)
     out["issues"] = issues
@@ -94,16 +119,119 @@ def filter_report(report: dict, query: dict) -> dict:
     out["risk"] = dict(report["risk"])
     out["risk"]["counts_by_severity"] = counts
     out["risk"]["total_issues"] = len(issues)
+    cycle_filter = bool(cycles_upper or hole_from is not None
+                        or hole_to is not None)
     out["filter"] = {
         "severity": severities, "code": codes,
         "line_from": line_from, "line_to": line_to,
+        "cycle": cycles_upper,
+        "hole_from": hole_from, "hole_to": hole_to,
         "matched": len(issues),
         "total_in_report": len(report["issues"]),
     }
+    if cycle_filter and "drill_cycles" in out:
+        out["drill_cycles"] = _filter_drill_cycles(
+            report["drill_cycles"], cycles_upper, hole_from, hole_to)
     if "trajectory" in query:
         # 默认携带逐行轨迹，体量较大；?trajectory=0 可省略
         if query.get("trajectory", ["1"])[0] in ("0", "false", "no"):
             out.pop("trajectory", None)
+    elif cycle_filter and "trajectory" in out:
+        out["trajectory"] = _filter_trajectory_cycles(
+            out["trajectory"], cycles_upper, hole_from, hole_to)
+    return out
+
+
+def _hole_in(no, hole_from, hole_to) -> bool:
+    return ((hole_from is None or no >= hole_from)
+            and (hole_to is None or no <= hole_to))
+
+
+def _filter_drill_cycles(dc: dict, cycles, hole_from, hole_to) -> dict:
+    """按循环类型/孔序筛选固定循环段与孔记录。"""
+    groups = []
+    for g in dc.get("groups", []):
+        if cycles and g["cycle"] not in cycles:
+            continue
+        holes = [h for h in g.get("holes", [])
+                 if _hole_in(h["hole_no"], hole_from, hole_to)]
+        ng = dict(g)
+        ng["holes"] = holes
+        ng["hole_count"] = len(holes)
+        ng["executed_holes"] = sum(1 for h in holes
+                                   if h.get("status") == "drilled")
+        ng["blocked_holes"] = sum(1 for h in holes
+                                  if h.get("status") == "blocked")
+        ng["total_drill_depth_mm"] = round(
+            sum(h.get("drill_depth_mm") or 0.0 for h in holes), 6)
+        ng["total_dwell_s"] = round(
+            sum(h.get("dwell_s") or 0.0 for h in holes), 6)
+        rapid = sum((h.get("expanded_path_mm") or {}).get("rapid", 0.0)
+                    for h in holes if h.get("status") == "drilled")
+        cutting = sum((h.get("expanded_path_mm") or {}).get("cutting", 0.0)
+                      for h in holes if h.get("status") == "drilled")
+        ng["expanded_path_mm"] = {"rapid": round(rapid, 6),
+                                  "cutting": round(cutting, 6),
+                                  "total": round(rapid + cutting, 6)}
+        groups.append(ng)
+
+    def holes_of(status=None):
+        n = 0
+        for g in groups:
+            for h in g["holes"]:
+                if status is None or h.get("status") == status:
+                    n += 1
+        return n
+
+    total = holes_of()
+    drilled = holes_of("drilled")
+    blocked = holes_of("blocked")
+    depth = round(sum(g["total_drill_depth_mm"] for g in groups), 6)
+    dwell = round(sum(g["total_dwell_s"] for g in groups), 6)
+    rapid = round(sum(g["expanded_path_mm"]["rapid"] for g in groups), 6)
+    cutting = round(sum(g["expanded_path_mm"]["cutting"] for g in groups), 6)
+    out = dict(dc)
+    out["groups"] = groups
+    out["summary"] = {
+        "cycle_groups": len(groups),
+        "holes_total": total,
+        "holes_drilled": drilled,
+        "holes_blocked": blocked,
+        "total_drill_depth_mm": depth,
+        "total_dwell_s": dwell,
+        "expanded_path_mm": {"rapid": rapid, "cutting": cutting,
+                             "total": round(rapid + cutting, 6)},
+        "filtered": True,
+    }
+    if cycles:
+        out["by_cycle"] = {k: v for k, v in dc.get("by_cycle", {}).items()
+                           if k in cycles}
+    return out
+
+
+def _filter_trajectory_cycles(trajectory, cycles, hole_from, hole_to):
+    """同步裁剪逐行轨迹中固定循环段的孔/动作明细。"""
+    out = []
+    for e in trajectory:
+        seg = e.get("segment")
+        if seg is None or seg.get("kind") != "canned_cycle":
+            out.append(e)
+            continue
+        if cycles and seg.get("cycle") not in cycles:
+            continue
+        holes = [h for h in seg.get("holes", [])
+                 if _hole_in(h["hole_no"], hole_from, hole_to)]
+        if not holes:
+            continue
+        keep_nos = {h["hole_no"] for h in holes}
+        ne = dict(e)
+        ns = dict(seg)
+        ns["holes"] = holes
+        ns["hole_nos"] = [n for n in ns.get("hole_nos", []) if n in keep_nos]
+        ns["moves_mm"] = [m for m in ns.get("moves_mm", [])
+                          if "hole_no" not in m]
+        ne["segment"] = ns
+        out.append(ne)
     return out
 
 
