@@ -1264,5 +1264,175 @@ class TestLengthCompensation(unittest.TestCase):
                          {"G43": 0, "G44": 0, "G49": 0})
 
 
+def tcfg(**over):
+    base = {
+        "name": "tool",
+        "travel_x": [0, 300], "travel_y": [0, 200], "travel_z": [-50, 120],
+        "safe_z": 10, "max_feed_mm_min": 3000, "max_spindle_rpm": 12000,
+        "wcs_offsets": {"G54": {"x": 0, "y": 0, "z": 0}},
+        "tools": {"1": {"h": 1, "d": 1}, "2": {"h": 2, "d": 2}},
+        "initial_tool": 1,
+        "tool_change_point": {"x": 0, "y": 0, "z": 100},
+        "tool_change_tolerance": {"x": 0.5, "y": 0.5, "z": 0.5},
+        "length_offsets": {"1": 10.0, "2": 8.0},
+        "radius_offsets": {"1": 5.0, "2": 3.0},
+    }
+    base.update(over)
+    return MachineConfig.from_dict(base)
+
+
+class TestToolChange(unittest.TestCase):
+    CLEAN = (
+        "G21 G90 G54\n"
+        "M3 S6000\nG0 X0 Y0\nG43 H1\nG1 Z-2 F300\nG1 X40 F600\nG49\n"
+        "G0 X0 Y0 Z100\nM5\n"
+        "T2 M6\n"
+        "M3 S5000\nG43 H2\nG1 Z-4 F300\nG1 X80 F600\nG49\n"
+        "G0 X0 Y0 Z100\nM5\n")
+
+    def test_clean_change_switches_current_tool(self):
+        r = analyze_program(self.CLEAN, tcfg())
+        tool_issues = [i for i in r["issues"]
+                       if i["code"].startswith("TOOL")]
+        self.assertEqual(tool_issues, [])
+        self.assertEqual(r["final_state"]["tool"]["current_t"], 2)
+        self.assertEqual(r["tools"]["tool_change_count"], 1)
+        ev = [(e["kind"], e["t"], e.get("previous_t"))
+              for e in r["tools"]["events"]]
+        self.assertEqual(ev, [("preselect", 2, None),
+                              ("change", 2, 1)])
+        # 切削段记录当前刀
+        cut = [e for e in r["trajectory"]
+               if e.get("segment", {}).get("kind") == "linear"]
+        self.assertTrue(cut)
+
+    def test_m6_with_motion_blocked(self):
+        r = analyze_program("G21 G90 G54\nG0 X0 Y0 Z100\nM5\nT2 M6 X10\n",
+                            tcfg())
+        self.assertIn("TOOL_CHANGE_WITH_MOTION", codes(r))
+        self.assertEqual(r["final_state"]["tool"]["current_t"], 1)
+
+    def test_unregistered_and_no_preselect(self):
+        r = analyze_program(
+            "G21 G90 G54\nG0 X0 Y0 Z100\nM5\nT9 M6\n", tcfg())
+        self.assertIn("TOOL_CHANGE_UNREGISTERED", codes(r))
+        self.assertEqual(r["final_state"]["tool"]["current_t"], 1)
+        r2 = analyze_program(
+            "G21 G90 G54\nG0 X0 Y0 Z100\nM5\nM6\n", tcfg())
+        self.assertIn("TOOL_CHANGE_UNREGISTERED", codes(r2))
+        iss = [i for i in r2["issues"]
+               if i["code"] == "TOOL_CHANGE_UNREGISTERED"][0]
+        self.assertEqual(iss["details"]["reason"], "no_preselect")
+
+    def test_spindle_cycle_comp_and_position_preconditions(self):
+        c = tcfg()
+        # 主轴在转
+        r = analyze_program(
+            "G21 G90 G54\nM3 S6000\nG0 X0 Y0 Z100\nT2 M6\n", c)
+        self.assertIn("TOOL_CHANGE_SPINDLE_ON", codes(r))
+        # 循环激活
+        r = analyze_program(
+            "G21 G90 G54\nG0 X0 Y0 Z100\nM5\nG81 R2 Z-8 F250\nT2 M6\n", c)
+        self.assertIn("TOOL_CHANGE_CYCLE_ACTIVE", codes(r))
+        # 刀长补偿生效
+        r = analyze_program(
+            "G21 G90 G54\nG0 X0 Y0 Z100\nM5\nG43 H1\nT2 M6\n", c)
+        self.assertIn("TOOL_CHANGE_LENGTH_COMP_ACTIVE", codes(r))
+        # 位置偏离换刀点
+        r = analyze_program(
+            "G21 G90 G54\nG0 X50 Y0 Z100\nM5\nT2 M6\n", c)
+        iss = [i for i in r["issues"]
+               if i["code"] == "TOOL_CHANGE_POSITION_OUT"][0]
+        self.assertIn("x", iss["details"]["axes_out"])
+        self.assertEqual(r["final_state"]["tool"]["current_t"], 1)
+
+    def test_position_missing_when_change_point_unconfigured(self):
+        r = analyze_program(
+            "G21 G90 G54\nG0 X0 Y0 Z100\nM5\nT2 M6\n",
+            tcfg(tool_change_point=None, tool_change_tolerance=None))
+        self.assertIn("TOOL_CHANGE_POSITION_MISSING", codes(r))
+
+    def test_no_current_tool_when_cutting(self):
+        # 有刀具表但无初始刀：切削/钻孔报 TOOL_NOT_CURRENT
+        r = analyze_program(
+            "G21 G90 G54\nM3 S6000\nG0 X0 Y0 Z20\nG1 Z-2 F300\nG1 X10 F600\n",
+            tcfg(initial_tool=None))
+        self.assertEqual(
+            [i["code"] for i in r["issues"]
+             if i["code"] == "TOOL_NOT_CURRENT"].count("TOOL_NOT_CURRENT"), 2)
+        # 无刀具表的旧配置保持旧行为
+        old = MachineConfig.from_dict({
+            "name": "old", "travel_x": [0, 300], "travel_y": [0, 200],
+            "travel_z": [-50, 60], "safe_z": 2,
+            "max_feed_mm_min": 3000, "max_spindle_rpm": 12000})
+        r2 = analyze_program("G21 G90 G54\nM3 S6000\nG1 X10 F600\n", old)
+        self.assertNotIn("TOOL_NOT_CURRENT", codes(r2))
+
+    def test_register_mismatch_h_and_d(self):
+        # T1 默认 H1，程序用 H2
+        nc = ("G21 G90 G54\nM3 S6000\nG0 X0 Y0 Z100\nG43 H2\n"
+              "G0 X0 Y0 Z20\nG1 Z-2 F300\nG1 X40 F600\nG49\nM5\n")
+        r = analyze_program(nc, tcfg())
+        mm = [i for i in r["issues"]
+              if i["code"] == "TOOL_REGISTER_MISMATCH"]
+        self.assertTrue(any(i["details"]["reason"] == "h_mismatch"
+                            and i["details"]["active_h"] == 2
+                            and i["details"]["default_h"] == 1
+                            for i in mm))
+        # D 不一致（G41 D2，T1 默认 D1）
+        nc2 = ("G21 G90 G54\nM3 S6000\nG0 Z20\nG0 X0 Y0\nG1 Z-2 F300\n"
+               "G41 D2\nG1 X20 Y0 F600\nG1 X20 Y20\nG40\nG1 X40 Y-10\n"
+               "G0 Z20\nM5\n")
+        r2 = analyze_program(nc2, tcfg())
+        dm = [i for i in r2["issues"]
+              if i["code"] == "TOOL_REGISTER_MISMATCH"]
+        self.assertTrue(any(i["details"]["reason"] == "d_mismatch"
+                            and i["details"]["active_d"] == 2
+                            for i in dm))
+
+    def test_drill_hole_records_current_tool(self):
+        nc = ("G21 G90 G54\nM3 S4000\nG0 X0 Y0 Z20\n"
+              "G99 G81 R2 Z-8 F250\nX20 Y0\nG80\n"
+              "G0 X0 Y0 Z100\nM5\nT2 M6\n"
+              "M3 S4000\nG0 X0 Y50 Z20\nG99 G81 R2 Z-8 F250\nG80\nM5\n")
+        r = analyze_program(nc, tcfg())
+        holes = [h for g in r["drill_cycles"]["groups"]
+                 for h in g["holes"]]
+        self.assertEqual([h["t"] for h in holes], [1, 1, 2])
+        self.assertEqual(r["tools"]["by_t"]["T1"]["holes_drilled"], 2)
+        self.assertEqual(r["tools"]["by_t"]["T2"]["holes_drilled"], 1)
+        self.assertEqual(r["tools"]["by_t"]["T2"]["tool_changes"], 1)
+
+    def test_invalid_t_number_blocked(self):
+        self.assertIn("TOOL_NUMBER_INVALID",
+                      codes(analyze_program("G21 G90 G54\nT0\n", tcfg())))
+        self.assertIn("TOOL_NUMBER_INVALID",
+                      codes(analyze_program("G21 G90 G54\nT1 T2\n", tcfg())))
+
+    def test_config_validation(self):
+        for bad in (
+                {"tools": {"1": {"h": 0, "d": 1}}},
+                {"tools": {"x": {"h": 1, "d": 1}}},
+                {"initial_tool": 9},
+                {"tool_change_point": {"x": 0, "y": 0}},
+                {"tool_change_tolerance": {"x": -1}},
+        ):
+            with self.assertRaises(ConfigError):
+                tcfg(**bad)
+
+    def test_compare_summarizes_by_tool(self):
+        a = ("G21 G90 G54\nM3 S6000\nG0 X0 Y0 Z20\n"
+             "G99 G81 R2 Z-8 F250\nX20 Y0\nG80\nM5\n")
+        b = ("G21 G90 G54\nM3 S6000\nG0 X0 Y0 Z20\n"
+             "G99 G81 R2 Z-8 F250\nX20 Y0\nX40 Y0\nG80\nM5\n")
+        cmp = compare_reports(analyze_program(a, tcfg()),
+                              analyze_program(b, tcfg()))
+        row = cmp["tools"]["by_t"]["T1"]
+        self.assertEqual(row["baseline_holes"], 2)
+        self.assertEqual(row["candidate_holes"], 3)
+        self.assertEqual(row["delta_holes"], 1)
+        self.assertIn("block_issue_counts", cmp["tools"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

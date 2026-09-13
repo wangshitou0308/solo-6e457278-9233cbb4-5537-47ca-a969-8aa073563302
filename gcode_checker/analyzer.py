@@ -1002,9 +1002,13 @@ class Analyzer:
         self.state.current_tool = config.initial_tool
         self.issues: list[Issue] = []
         self.entries: list[dict] = []
-        # 换刀分析：T 预选事件、M6 换刀事件，以及按当前刀的切削/钻孔统计
+        # 换刀分析：T 预选事件、M6 换刀事件，以及按当前刀的切削/钻孔统计。
+        # 两个事件流都按真实执行顺序入账（_tool_event_seq 为单调序号），
+        # 程序包 M98 L2 重复调用时 preselect/change 严格交错：
+        # pre#1,change#1,pre#2,change#2（同一源行号也不会错位）。
         self.tool_preselect_events: list[dict] = []
         self.tool_change_events: list[dict] = []
+        self._tool_event_seq = 0
         self.tool_path: dict = {}
         self.tool_holes: dict = {}
         self.tool_changes_by_t: dict = {}
@@ -2181,7 +2185,11 @@ class Analyzer:
     # -- 刀具：T 预选 / M6 换刀 -------------------------------------------
 
     def _stamp_tool_event(self, event: dict):
-        """程序包模式下给 T/M6 事件附来源程序与调用栈（单程序时无操作）。"""
+        """程序包模式下给 T/M6 事件附来源程序与调用栈（单程序时无操作）。
+        所有事件另带单调序号 seq，供预选/换入事件合并时按真实执行顺序
+        交错排列（程序包 M98 L2 重复同一源行时尤为关键）。"""
+        event["seq"] = self._tool_event_seq
+        self._tool_event_seq += 1
         blk = self.current_block
         if blk is None:
             return
@@ -2249,6 +2257,8 @@ class Analyzer:
             "wcs": st.wcs,
         }
         self._stamp_tool_event(event)
+        # 预选立即按真实执行顺序入账（整段阻断时由 _rollback_to 撤销）
+        self.tool_preselect_events.append(event)
         self._line_tool = {"preselect": event, "token": f"T{t_int}",
                            "bare": False}
         return True
@@ -2542,6 +2552,7 @@ class Analyzer:
         t = ev.get("t")
         entry = self.cfg.tool_for(t) if t is not None else None
         out = {
+            "seq": ev.get("seq"),
             "line_no": ev["line_no"],
             "source_line": ev["source_line"],
             "kind": ev["kind"],
@@ -4631,11 +4642,11 @@ class Analyzer:
                 **({"cancels_d": crc_ev["cancels_d"]}
                    if "cancels_d" in crc_ev else {}),
             }
-        # 刀具预选（T）/换刀（M6）事件：成功执行的行才落账
+        # 刀具预选（T）/换刀（M6）事件：事件在指令执行时即按真实顺序入账，
+        # 这里只把事件挂到逐行条目（不再重复入账）。
         lt = self._line_tool or {}
         pre_ev = lt.get("preselect")
         if pre_ev is not None:
-            self.tool_preselect_events.append(pre_ev)
             entry["tool_preselect_event"] = self._tool_event_out(pre_ev)
         ch_ev = lt.get("change")
         if ch_ev is not None:
@@ -5124,13 +5135,14 @@ class Analyzer:
                     row["name"] = entry["name"]
             by_t[f"T{t}"] = row
         no_tool = bucket_for("__none__")
+        # 预选 + 换入事件按真实执行序号交错合并（程序包 M98 L2 重复同一
+        # 源行时为 pre#1,change#1,pre#2,change#2，而非按行号归并）
         events = []
         for ev in self.tool_preselect_events:
             events.append(self._tool_event_out(ev))
         for ev in self.tool_change_events:
             events.append(self._tool_event_out(ev))
-        events.sort(key=lambda e: (e["line_no"], 0 if e["kind"] == "preselect"
-                                   else 1))
+        events.sort(key=lambda e: e.get("seq", 0))
         change_codes = ("TOOL_NUMBER_INVALID", "TOOL_CHANGE_WITH_MOTION",
                         "TOOL_CHANGE_UNREGISTERED", "TOOL_CHANGE_SPINDLE_ON",
                         "TOOL_CHANGE_CYCLE_ACTIVE",

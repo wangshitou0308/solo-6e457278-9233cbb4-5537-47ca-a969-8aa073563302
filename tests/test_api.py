@@ -196,11 +196,13 @@ class ApiTest(unittest.TestCase):
                          {"safe_demo", "problems_demo", "inch_demo",
                           "arc_demo", "plane_arc_demo", "drill_cycle_demo",
                           "wcs_demo", "length_comp_demo", "cutter_comp_demo",
+                          "tool_change_demo",
                           "subprogram_demo",
                           "subprogram_errors_demo"})
         kinds = {e["name"]: e["kind"] for e in ex["examples"]}
         self.assertEqual(kinds["subprogram_demo"], "package")
         self.assertEqual(kinds["safe_demo"], "program")
+        self.assertEqual(kinds["tool_change_demo"], "program")
         resp, nc = self.req("GET", "/api/examples/safe_demo", raw=True)
         self.assertIn("attachment", resp.headers["Content-Disposition"])
         self.assertIn(b"G21", nc)

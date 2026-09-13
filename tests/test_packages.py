@@ -27,6 +27,22 @@ def cfg():
     })
 
 
+def cfg_tools():
+    """带刀具表/换刀点的配置（子程序换刀测试用）。"""
+    return MachineConfig.from_dict({
+        "name": "test-tools",
+        "travel_x": [0, 300], "travel_y": [0, 200], "travel_z": [-50, 120],
+        "safe_z": 10,
+        "max_feed_mm_min": 3000, "max_spindle_rpm": 12000,
+        "tools": {"1": {"h": 1, "d": 1}, "2": {"h": 2, "d": 2}},
+        "initial_tool": 1,
+        "tool_change_point": {"x": 0, "y": 0, "z": 100},
+        "tool_change_tolerance": {"x": 0.5, "y": 0.5, "z": 0.5},
+        "length_offsets": {"1": 10, "2": 8},
+        "radius_offsets": {"1": 5, "2": 3},
+    })
+
+
 SUB = """\
 O100
 G91 G99 G81 X10 Z-10 R-18 L2 F250
@@ -420,6 +436,83 @@ class TestPackageCompare(unittest.TestCase):
                          "O200")
         self.assertEqual(cmp["call_graph_diff"]["edges_removed"][0]["callee"],
                          "O100")
+
+
+class TestPackageToolChange(unittest.TestCase):
+    """程序包内 T/M6 换刀：模态继承、调用栈与事件真实顺序。"""
+
+    CHANGE_SUB = """\
+O100
+T2 M6
+M99
+"""
+
+    def _spec(self, sub=None, repeats=1, main=None):
+        sub = sub if sub is not None else self.CHANGE_SUB
+        if main is None:
+            main = (
+                "G21 G90 G54\n"
+                "G0 X0 Y0 Z100\n"
+                "M5\n"
+                f"M98 P100 L{repeats}\n"
+                "M30\n")
+        return parse_package_spec({
+            "name": "p", "main": main,
+            "subprograms": [{"name": "o100.nc", "content": sub}]})
+
+    def test_m98_l2_events_interleave_in_real_order(self):
+        r = analyze_package(self._spec(repeats=2), cfg_tools())
+        self.assertNotIn(True, [i["code"].startswith("TOOL_CHANGE")
+                                for i in r["issues"]])
+        ev = r["tools"]["events"]
+        # 必须按真实执行顺序交错：pre#1,change#1,pre#2,change#2
+        self.assertEqual(
+            [(e["kind"], e["t"], e.get("repeat_index")) for e in ev],
+            [("preselect", 2, 1), ("change", 2, 1),
+             ("preselect", 2, 2), ("change", 2, 2)])
+        self.assertEqual([e["seq"] for e in ev], [0, 1, 2, 3])
+        self.assertEqual([e["source_program"] for e in ev],
+                         ["O100"] * 4)
+        # 每条事件带来源调用栈
+        for e in ev:
+            self.assertEqual(e["call_stack"][0]["caller"], "main")
+            self.assertEqual(e["call_stack"][0]["program"], "O100")
+            self.assertEqual(e["call_stack"][0]["repeat_total"], 2)
+        # 分类视图仍分别保留
+        self.assertEqual(len(r["tools"]["preselect_events"]), 2)
+        self.assertEqual(len(r["tools"]["change_events"]), 2)
+
+    def test_tool_modality_inherited_into_subprogram(self):
+        # 子程序先 T2 M6 再钻孔：换刀模态在子程序内建立，孔记录当前刀 T2
+        sub = ("O100\n"
+               "T2 M6\n"
+               "M3 S4000\n"
+               "G0 X0 Y30 Z20\n"
+               "G99 G81 R2 Z-8 F250\n"
+               "G80\n"
+               "G0 X0 Y0 Z100\n"
+               "M5\n"
+               "M99\n")
+        r = analyze_package(self._spec(sub=sub), cfg_tools())
+        holes = [h for g in r["drill_cycles"]["groups"]
+                 for h in g["holes"]]
+        self.assertTrue(holes)
+        self.assertTrue(all(h["t"] == 2 for h in holes))
+        self.assertEqual(r["final_state"]["tool"]["current_t"], 2)
+
+    def test_failed_change_in_subprogram_rolls_back(self):
+        # 子程序里 T9 M6（未登记）：整段阻断，无预选/换入事件残留，
+        # 保持原刀 T1
+        sub = "O100\nT9 M6\nM99\n"
+        r = analyze_package(self._spec(sub=sub), cfg_tools())
+        codes_ = [i["code"] for i in r["issues"]]
+        self.assertIn("TOOL_CHANGE_UNREGISTERED", codes_)
+        self.assertEqual(r["tools"]["events"], [])
+        self.assertEqual(r["final_state"]["tool"]["current_t"], 1)
+        ev_issues = [i for i in r["issues"]
+                     if i["code"] == "TOOL_CHANGE_UNREGISTERED"]
+        self.assertEqual(ev_issues[0]["source_program"], "O100")
+        self.assertEqual(ev_issues[0]["call_stack"][0]["caller"], "main")
 
 
 if __name__ == "__main__":

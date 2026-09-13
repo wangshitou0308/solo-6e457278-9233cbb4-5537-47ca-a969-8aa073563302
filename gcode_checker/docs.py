@@ -188,6 +188,11 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 - 报告 `tools` 节含刀具表、初始刀、换刀点/容差、T 预选与 M6 换入事件流、
   按 T 的切削长度（含固定循环切削 `cutting_incl_cycles`）、钻孔数、
   换刀次数与问题数；可用 `?t=T1,T2`（也接受 `?t=1,2`）筛选。
+  合并事件流 `events` 按**真实执行顺序**（单调 `seq`）交错排列：程序包
+  `M98 P100 L2` 两次执行同一子程序的 `T2 M6` 时顺序为
+  preselect#1、change#1、preselect#2、change#2（不按源行号归并），每条
+  事件带 `seq`、`repeat_index/repeat_total`；`preselect_events`/
+  `change_events` 仍分别保留两类事件。
 - 程序包模式下 T 预选与 M6 换入事件、问题都带 `source_program` 与
   `call_stack`（子程序内换刀随调用栈保留），模态（当前刀/预选刀）
   在调用与返回间连续继承。
