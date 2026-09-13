@@ -19,6 +19,7 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 | 定位 | `G90` 绝对、`G91` 增量 |
 | 坐标系 | `G54`-`G59`（各坐标系 X/Y/Z 偏置由机床配置 `wcs_offsets` 分别提供，叠加后做行程检查） |
 | 刀长补偿 | `G43` 加、`G44` 减、`G49` 取消；`H` 寄存器号（正整数）只随 `G43/G44` 生效，偏置由机床配置 `length_offsets` 提供 |
+| 半径补偿 | `G41` 左、`G42` 右、`G40` 取消；`D` 寄存器号（正整数）只随 `G41/G42` 生效，刀具半径由机床配置 `radius_offsets` 提供；左/右按平面正法向 `n=u×v` 判定 |
 | 平面 | `G17` XY（上电默认，联动轴 Z）、`G18` XZ（联动轴 Y）、`G19` YZ（联动轴 X），模态保持 |
 | 运动 | `G0` 快速、`G1` 直线、`G2` 顺圆、`G3` 逆圆（当前平面内插补） |
 | 固定循环 | `G80` 取消、`G81` 钻孔、`G82` 锪孔（`P` 孔底暂停）、`G83` 深孔啄钻（`Q` 分步）；`G98` 返回初始平面（默认）、`G99` 返回 R 平面；`R` R 平面、`L` 重复孔位；**仅允许在 `G17` 平面展开** |
@@ -82,6 +83,68 @@ python3 -m gcode_checker --verbose       # 打印访问日志
   刀尖工件 Z 与主轴基准点机床 Z）、按 H 号汇总的路径/钻孔/问题，以及
   主轴基准点 Z 行程占用；可用 `?h=H1,H2`（也接受 `?h=1,2`）筛选。
 
+### 刀具半径补偿（G41/G42/G40 + D）口径
+
+- 机床配置 **`radius_offsets`** 给出 D 寄存器刀具半径表（mm），如
+  `{"1": 5.0, "2": 3.0}`；键可写 `1` 或 `"D1"`，**D 号必须为正整数**
+  （`D0` 拒绝）、半径必须为非负数值，否则保存配置时按字段拒绝：
+  `radius_offsets.D0：D 号必须为正整数` 或
+  `radius_offsets.D3 必须是数值（刀具半径 mm）`。
+- **左/右按当前平面的正法向 n=u×v 判定**（右手系）：`G17` 看 +Z、
+  `G18` 看 +Y、`G19` 看 +X；沿行进方向 d，`G41` 左法向为 `n×d`
+  （G17 下沿 +X 行进时刀心在 +Y 侧），`G42` 右法向为 `d×n`。
+  补偿在启用时**锁定平面**，补偿中不允许切换 `G17/G18/G19`（须先退出）。
+- **D 只随 G41/G42 生效**：`G41 D1`/`G42 D1` 为**纯设定行不移动刀具**，
+  进入待切入（pending_in）；下一段必须是**非零平面内 G1**作为切入段，
+  刀心沿该段从程序点（无偏置）斜变到满偏置点（切向切入）。无 G41/G42
+  的行上写 `D` 不生效（规范化标注 `D3(无 G41/G42，不生效)`）。
+- **G40 取消**同样为纯设定行（待退出 pending_out），其后必须用
+  **非零平面内 G1** 退出（切向退出）；未补偿时写 G40 幂等无事件，
+  待切入时写 G40 直接取消本次启用。程序结束时仍处于待切入/补偿中/
+  待退出，在 G41/G42 或 G40 原行报告（`reason=eof_no_approach/
+  eof_active/eof_no_exit`）。
+- **偏置规则**：直线偏置为平行直线；圆弧偏置仍为同心圆——`G41+逆圆(G3)`、
+  `G42+顺圆(G2)` 为内偏置（有效半径 R−r_d），`G41+顺圆(G2)`、
+  `G42+逆圆(G3)` 为外偏置（R+r_d）。**内偏置后有效半径 ≤0 报
+  `CUTTER_ARC_RADIUS`，该段阻断回滚**（补偿状态保持）。
+- **相邻偏置段按几何关系连接**：偏置曲线相交且交点在两段窗口内为
+  **内角裁切**（两段都裁到交点，刀心只经过交点一次）；无可达交点时为
+  **外角补弧**（两段保留到角点，补一段以程序角点为圆心、r_d 为半径、
+  切向连续的圆角）；180° 折返、外角补弧扫角 >180° 或切向不连续报
+  `CUTTER_COMP_DISCONTINUOUS`，**不猜测刀心轨迹**。补偿中的 G0、固定
+  钻孔循环、平面切换同样按不连续阻断。
+- **纯垂直 G1**（平面内零位移、仅垂直轴运动）刀心平面坐标保持偏置，
+  垂直轴（螺旋联动轴）不偏移。
+- 每个补偿段在轨迹 `segment.cutter_compensation` 中同时给出：
+  **编程轮廓**（段本身的 `start_mm/end_mm/points_mm`）、**刀心轨迹**
+  （`center_path_mm`，切入/退出段含无偏置斜切端点；
+  `center_path_machine_mm` 为机床坐标）、**连接方式**（`junction`：
+  `inner_trim/outer_arc/collinear`，外角补弧另给 `connector`）、
+  D/侧/半径/平面/模式（`tangent_engage/contour/tangent_exit/
+  vertical_hold`）与**刀具扫掠包围盒** `swept_bbox_program_mm`
+  （刀心±半径）。
+- **机床行程按刀具扫掠范围**（刀心轨迹±刀具半径，并叠加工件坐标系偏置
+  与刀长补偿）判定，越界报 `OUT_OF_BOUNDS`
+  （`details.checked_path=tool_swept_envelope`）；报告顶层另有
+  `cutter_swept_bbox_program_mm` / `cutter_swept_bbox_machine_mm`。
+- 阻断规则（**整段阻断并回滚本行状态，不猜测轨迹**；待切入阻断保持
+  待切入状态，可由后续非零 G1 完成切入）：
+
+  | 代码 | 触发条件 |
+  |---|---|
+  | `CUTTER_COMP_MISSING_D` | `G41/G42` 同段未给 D |
+  | `CUTTER_COMP_D_NOT_FOUND` | D 非正整数或不在 `radius_offsets` |
+  | `CUTTER_COMP_CONFLICT` | G40/G41/G42 同段混用、补偿码重复、同段多个 D、补偿中直接换侧/换 D |
+  | `CUTTER_APPROACH_INVALID` | 切入段不是非零平面内 G1（G0/G2/G3/纯垂直移动/固定循环/位置未知） |
+  | `CUTTER_EXIT_INVALID` | G40 退出段不是非零平面内 G1，或程序结束仍未退出 |
+  | `CUTTER_ARC_RADIUS` | 内偏置后圆弧有效半径非正 |
+  | `CUTTER_COMP_DISCONTINUOUS` | 补偿中 G0/固定循环/平面切换、相邻段无法连续（折返/干涉） |
+
+- 报告 `cutter_compensation` 节含 D 半径表、G40/G41/G42 事件流、按 D
+  汇总的刀心路径长度/切入退出次数/问题，以及刀具扫掠包围盒；
+  可用 `?d=D1,D2`（也接受 `?d=1,2`）筛选问题、逐行轨迹与按 D 汇总
+  （结束命中 D 补偿段的 G40 事件带 `cancels_d` 并随筛选保留）。
+
 ### 圆弧与螺旋插补口径
 
 - 平面为**模态**：`G17/G18/G19` 切换后保持，未写过按控制器上电默认 `G17`。
@@ -128,7 +191,7 @@ python3 -m gcode_checker --verbose       # 打印访问日志
   主轴未转/无进给等工艺问题按**触发行**去重（一个 G83 孔只报一次）。
 
 **未支持示例**（遇到即 `UNSUPPORTED_INSTRUCTION`，整段不执行、不改模态）：
-`G28/30、G40-G42（半径刀补）、G54.1、G84-G89、M4、M6、M7-M9、T、D` 等。
+`G28/30、G54.1、G84-G89、M4、M6、M7-M9、T` 等。
 无法解析的残片（如 `X-`）报 `MALFORMED_LINE`；若同行还有未支持词（如 `G54.1 X-`），
 两类问题都会列出。
 
@@ -218,7 +281,8 @@ python3 -m gcode_checker --verbose       # 打印访问日志
     "G54": {"x": -150, "y": -100, "z": 0},
     "G55": {"x": 50, "y": 20, "z": -5}
   },
-  "length_offsets": {"1": 10.0, "2": -3.0, "3": 2.0}
+  "length_offsets": {"1": 10.0, "2": -3.0, "3": 2.0},
+  "radius_offsets": {"1": 5.0, "2": 3.0}
 }
 ```
 
@@ -231,8 +295,13 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 - `length_offsets` 为 H 寄存器刀长偏置表（mm）：键为正整数 H 号
   （可写 `1` 或 `"H1"`，`H0` 拒绝），值必须是数值，否则按字段拒绝
   （如 `length_offsets.H3 必须是数值`）。
+- `radius_offsets` 为 D 寄存器**刀具半径表**（mm）：键为正整数 D 号
+  （可写 `1` 或 `"D1"`，`D0` 拒绝），值必须为非负数值，否则按字段拒绝
+  （如 `radius_offsets.D3 必须是数值（刀具半径 mm）`）。
+  `G41/G42` 同段的 D 号必须在此表登记。
 - `safe_z` 按**刀尖工件（程序）Z 坐标**判定快速移动；Z 轴行程按叠加
-  工件偏置与刀长补偿后的**主轴基准点机床 Z** 判定。
+  工件偏置与刀长补偿后的**主轴基准点机床 Z** 判定。半径补偿段的行程另按
+  **刀具扫掠范围**（刀心轨迹±刀具半径）判定。
 
 ## 4. 接口
 
@@ -244,7 +313,7 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 | GET | `/api/dialect` | 支持的指令、问题代码、严重度表 |
 | GET | `/api/docs` | 本文档（Markdown） |
 | GET | `/api/examples` | 内置示例 .nc 清单 |
-| GET | `/api/examples/<name>` | 下载示例（safe_demo/problems_demo/inch_demo/arc_demo/plane_arc_demo/wcs_demo/drill_cycle_demo/length_comp_demo；程序包示例 subprogram_demo/subprogram_errors_demo 为 JSON） |
+| GET | `/api/examples/<name>` | 下载示例（safe_demo/problems_demo/inch_demo/arc_demo/plane_arc_demo/wcs_demo/drill_cycle_demo/length_comp_demo/cutter_comp_demo；程序包示例 subprogram_demo/subprogram_errors_demo 为 JSON） |
 
 ### 机床配置
 
@@ -286,6 +355,10 @@ python3 -m gcode_checker --verbose       # 打印访问日志
     （结束该 H 补偿段的 G49 事件带 `cancels_h` 并随筛选保留，问题计数按
     筛选后的问题重算，“缺 H / H 不存在”不归属任何已建立 H），
     风险计数随之重算
+  - `d=D1,D2`（也接受 `d=1,2`）：按半径补偿 D 号筛选；只保留该 D 生效
+    期间产生的问题与轨迹段（切入/轮廓/退出），`cutter_compensation` 汇总
+    只保留命中 D（结束命中 D 补偿段的 G40 事件带 `cancels_d` 并随筛选
+    保留），风险计数随之重算
   - `trajectory=0`：省略逐行轨迹以减小响应；`trajectory=all`：循环/平面/坐标系/H 筛选时保留完整轨迹
 
   指定 `cycle`/`hole_*` 后，报告中的 `drill_cycles`（groups、by_cycle、
@@ -364,7 +437,13 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 （H 偏置表数值差异）、`events`（G43/G44/G49 次数两侧值与 delta）、
 `by_h`（各 H 号的路径长度、钻孔数/钻深、问题的新增/解决/净变化）与
 `spindle_z_travel`（主轴基准点 Z 机床坐标行程的两侧值与 min/max delta）、
-`block_issue_counts`（缺 H/H 不存在/补偿冲突问题计数）。
+`block_issue_counts`（缺 H/H 不存在/补偿冲突问题计数）；
+并在 `cutter_compensation` 中列出半径补偿变化：`offset_table_changes`
+（D 半径表数值差异）、`events`（G41/G42/G40 次数两侧值与 delta）、
+`by_d`（各 D 号的刀心路径长度、补偿段数/切入/退出、问题的新增/解决/
+净变化）、`swept_bbox`（刀具扫掠包围盒工件/机床两侧值与尺寸 delta）、
+`center_path_total_mm`（刀心路径总长变化）与 `block_issue_counts`
+（缺 D/D 不存在/切入退出无效/圆弧半径非正/不连续等问题计数）。
 - `GET /api/comparisons` / `GET /api/comparisons/<id>`：读取保存的对比。
 
 ## 5. 报告结构
@@ -425,6 +504,26 @@ python3 -m gcode_checker --verbose       # 打印访问日志
     "issues": {"LENGTH_COMP_MISSING_H": 0,
                "LENGTH_COMP_H_NOT_FOUND": 1, "LENGTH_COMP_CONFLICT": 0}
   },
+  "cutter_compensation": {
+    "supported": {"G40": "…", "G41": "左侧（正法向 n=u×v）",
+                  "G42": "右侧", "D": "…"},
+    "offsets_mm": {"D1": 5, "D2": 3},                // 机床 D 寄存器半径表
+    "events": [                                       // G41/G42/G40 逐次事件
+      {"line_no": 6, "code": "G41", "side": "left", "d": 1,
+       "radius_mm": 5, "plane": "G17", "wcs": "G54"}],
+    "by_d": { "D1": {"d": 1, "radius_mm": 5,
+      "compensated_segments": 3, "engages": 1, "exits": 1,
+      "center_path_length_mm": 89.07, "issues": 0} },
+    "center_path_total_mm": 89.07,
+    "swept_bbox_program_mm": { …刀心±半径的工件坐标扫掠包围盒… },
+    "swept_bbox_machine_mm": { …叠加 WCS/刀长补偿的机床扫掠盒… },
+    "issues": {"CUTTER_COMP_MISSING_D": 0, "CUTTER_COMP_D_NOT_FOUND": 1,
+               "CUTTER_COMP_CONFLICT": 0, "CUTTER_APPROACH_INVALID": 1,
+               "CUTTER_EXIT_INVALID": 0, "CUTTER_ARC_RADIUS": 0,
+               "CUTTER_COMP_DISCONTINUOUS": 0}
+  },
+  "cutter_swept_bbox_program_mm": { …同扫掠盒（顶层冗余便于读取）… },
+  "cutter_swept_bbox_machine_mm": { … },
   "drill_cycles": {
     "summary": { "cycle_groups": 2, "holes_total": 9, "holes_drilled": 8,
       "holes_blocked": 1, "total_drill_depth_mm": 63.0, "total_dwell_s": 0.5,
@@ -540,7 +639,19 @@ python3 -m gcode_checker --verbose       # 打印访问日志
              "center_3d_mm": [20, 10, -2],
              "radius_mm": 40, "sweep_deg": -90, "full_circle": false,
              "helical": false, "perp_axis": "Z", "perp_change_mm": 0,
-             "arc_length_mm": 62.8 }
+             "arc_length_mm": 62.8 },
+    "cutter_compensation": {            // 半径补偿段（无补偿时本字段缺省）
+      "active": true, "code": "G41", "side": "left", "d": 1,
+      "radius_mm": 5, "plane": "G17",
+      "mode": "tangent_engage|contour|tangent_exit|vertical_hold",
+      "center_path_mm": [ …刀心轨迹（切入/退出含无偏置斜切端点）… ],
+      "center_path_machine_mm": [ …刀心机床坐标… ],
+      "junction": { "kind": "inner_trim|outer_arc|collinear",
+        "point_mm": [ … ], "center_mm": [ … ], "radius_mm": 5,
+        "sweep_deg": -90, "points_mm": [ … ] },
+      "connector": { …外角补弧（outer_arc 时）… },
+      "swept_bbox_program_mm": { …本段刀具扫掠包围盒（刀心±半径）… },
+      "continuous": true }
   }
 }
 ```
@@ -548,6 +659,9 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 补偿-only 行（`G43 H1`/`G44 H2`/`G49`）的条目 `type` 为
 `length_compensation`，并带 `tool_length_event`（含 H 号、方向与数值、
 重算后的刀尖工件 Z、保持不动的主轴基准点机床 Z）。
+半径补偿设定行（`G41 D1`/`G42 D1`/`G40`）的条目 `type` 为
+`cutter_compensation`，并带 `tool_radius_event`（含 D 号、左/右侧、
+半径表值与所在平面；G40 另带 `cancels_d`）；这些行**不移动刀具**。
 
 ## 6. 问题代码与严重度
 
@@ -556,7 +670,7 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 | `MALFORMED_LINE` | critical | 残片/非法数字（如 `X-`），整段阻断 |
 | `UNSUPPORTED_INSTRUCTION` | error | 不在方言表内的指令/地址词，整段阻断 |
 | `ARC_NO_SOLUTION` | critical | 圆心词与 R 混用、圆心词不属于当前平面、R 编程整圆、起终半径不一致、半径 0、弦长 > 2R 等；整段阻断并回滚本行模态 |
-| `OUT_OF_BOUNDS` | critical | 轨迹上任意点（圆弧取真实弧线极值点）叠加当前坐标系偏置后越出行程 |
+| `OUT_OF_BOUNDS` | critical | 轨迹上任意点（圆弧取真实弧线极值点）叠加当前坐标系偏置后越出行程；半径补偿段按刀具扫掠范围（刀心±半径，`details.checked_path=tool_swept_envelope`）判定 |
 | `RAPID_BELOW_SAFE_Z` | error | G0 轨迹上任意点 Z < safe_z（工件坐标） |
 | `SPINDLE_NOT_RUNNING` | error | G1/G2/G3 切削时 `spindle_on=false` |
 | `FEED_OVER_LIMIT` | error | F（换算 mm/min）> max_feed_mm_min |
@@ -574,6 +688,13 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 | `LENGTH_COMP_MISSING_H` | error | `G43/G44` 同段未给 H；整段阻断、不沿用旧补偿 |
 | `LENGTH_COMP_H_NOT_FOUND` | error | H 非正整数或不在机床 `length_offsets` 表；整段阻断 |
 | `LENGTH_COMP_CONFLICT` | error | G43/G44/G49 同段混用、补偿码重复或同段多个 H；整段阻断 |
+| `CUTTER_COMP_MISSING_D` | error | `G41/G42` 同段未给 D；整段阻断 |
+| `CUTTER_COMP_D_NOT_FOUND` | error | D 非正整数或不在机床 `radius_offsets` 表；整段阻断 |
+| `CUTTER_COMP_CONFLICT` | error | G40/G41/G42 同段混用、补偿码重复、同段多个 D 或补偿中直接换侧/换 D；整段阻断 |
+| `CUTTER_APPROACH_INVALID` | error | 切入段不是非零平面内 G1（G0/G2/G3/纯垂直/固定循环/位置未知），或程序结束仍待切入 |
+| `CUTTER_EXIT_INVALID` | error | G40 退出段不是非零平面内 G1，或程序结束时补偿仍激活/待退出 |
+| `CUTTER_ARC_RADIUS` | critical | 半径补偿后圆弧有效半径非正（内偏置过切）；该段阻断回滚 |
+| `CUTTER_COMP_DISCONTINUOUS` | critical | 补偿中 G0/固定循环/切换平面、相邻偏置段折返/干涉无法连续；不猜测刀心轨迹 |
 
 风险分：critical 25 / error 10 / warning 3 / info 1（封顶 100），
 级别 `none/low(≤10)/medium(≤30)/high(≤60)/critical`。
@@ -600,17 +721,27 @@ python3 -m gcode_checker --verbose       # 打印访问日志
    不改写程序；固定循环仅允许在 `G17` 平面展开（`G18/G19` 下对应孔阻断）；
    G83 内部排屑快速动作豁免安全 Z 告警，孔间定位仍检查；
    工艺问题（主轴未转/无进给）按触发行去重。
-7. 服务监听本地回环，数据库为单个 SQLite 文件，全程无任何网络外联。
+7. **刀具半径补偿**（G41 左 / G42 右 / G40 取消，D 只随 G41/G42 生效）：
+   左右按平面正法向 n=u×v 判定（G41 法向 n×d、G42 法向 d×n）；
+   G41/G42 与 G40 均为纯设定行不移动刀具，切入/退出必须是非零平面内 G1；
+   直线偏置为平行线，圆弧为同心圆（内偏置 R−r_d、外偏置 R+r_d），
+   内偏置后半径非正即阻断；相邻偏置段按几何关系做内角裁切或外角补弧，
+   折返/干涉不猜测轨迹；每段同时给编程轮廓、刀心轨迹、连接方式与扫掠盒，
+   行程按刀心±半径的扫掠范围判定；D 非法/未登记、切入退出无效、圆弧
+   半径非正、段不连续均定位原行阻断；待切入/激活/待退出状态下程序结束
+   时在 G41/G42 或 G40 原行报告。
+8. 服务监听本地回环，数据库为单个 SQLite 文件，全程无任何网络外联。
 
 ## 8. curl 快速上手
 
 ```bash
-# 1) 建配置（含 G54/G55 两套工件坐标偏置与 H1/H2 刀长偏置）
+# 1) 建配置（含 G54/G55 两套工件坐标偏置、H1/H2 刀长偏置、D1/D2 刀具半径）
 curl -s localhost:8080/api/machines -H 'Content-Type: application/json' -d '{
   "name":"demo", "travel_x":[0,300], "travel_y":[0,200], "travel_z":[-100,0],
   "safe_z":10, "max_feed_mm_min":3000, "max_spindle_rpm":12000,
   "wcs_offsets":{"G54":{"x":0,"y":0,"z":0},"G55":{"x":100,"y":50,"z":0}},
-  "length_offsets":{"1":10,"2":-3}}'
+  "length_offsets":{"1":10,"2":-3},
+  "radius_offsets":{"1":5,"2":3}}'
 
 # 2) 下载示例并建作业（含钻孔循环示例 drill_cycle_demo）
 curl -s localhost:8080/api/examples/problems_demo -o problems.nc
@@ -643,6 +774,11 @@ curl -s 'localhost:8080/api/jobs/<id>/report?wcs=G55'
 # 6b) 刀长补偿示例（G43/G44/G49/H，含缺 H、H 不存在、同段冲突阻断），按 H 筛选
 curl -s localhost:8080/api/examples/length_comp_demo -o length.nc
 curl -s 'localhost:8080/api/jobs/<id>/report?h=H1'
+
+# 6c) 刀具半径补偿示例（G41/G42/G40/D，内角裁切/外角补弧/切向切入退出，
+#     含 G0 切入、D0/D3 非法、换侧冲突、圆弧退出、补偿未退出等阻断）
+curl -s localhost:8080/api/examples/cutter_comp_demo -o cutter.nc
+curl -s 'localhost:8080/api/jobs/<id>/report?d=D1'
 
 # 7) 程序包静态展开（O/M98/M99/L、调用图、调用栈、按来源筛选、分页预览）
 curl -s localhost:8080/api/examples/subprogram_demo -o pkg.json

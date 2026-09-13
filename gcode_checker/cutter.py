@@ -39,6 +39,7 @@ class Primitive:
     """
 
     kind: str                       # 'line' | 'arc'
+    side: str | None = None         # 'left' | 'right'（相对行进方向）
     # 程序（未偏置）段端点，用于相邻连续性校验与外角圆心
     prog_start: tuple[float, float] | None = None
     prog_end: tuple[float, float] | None = None
@@ -103,7 +104,7 @@ def offset_line(start: tuple[float, float], end: tuple[float, float],
     nrm = side_normal(side, d)
     shift = (r_d * nrm[0], r_d * nrm[1])
     return Primitive(
-        kind="line",
+        kind="line", side=side,
         prog_start=start, prog_end=end,
         p0=(start[0] + shift[0], start[1] + shift[1]),
         direction=d,
@@ -136,7 +137,7 @@ def offset_arc(center: tuple[float, float], radius: float,
     if prog_end is None:
         prog_end = _arc_point(center, radius, a1)
     return Primitive(
-        kind="arc", center=center, radius=r_eff,
+        kind="arc", side=side, center=center, radius=r_eff,
         prog_start=prog_start, prog_end=prog_end,
         a0=a0, a1=a1, sweep=sweep_eff, offset_inward=inward,
         win0=a0, win1=a1)
@@ -289,7 +290,6 @@ def join_primitives(prev: Primitive, nxt: Primitive,
         return lo - 1e-6 <= t <= hi + 1e-6
 
     inner = None
-    outer = None
     for tp, tn in cands:
         before_p = _param_le(prev, tp, t_prev_end)
         after_n = _param_ge(nxt, tn, t_next_start)
@@ -298,24 +298,24 @@ def join_primitives(prev: Primitive, nxt: Primitive,
             if inner is None or _corner_dist(prev, tp, p_corner) < \
                     _corner_dist(prev, inner[0], p_corner):
                 inner = (tp, tn)
-        elif not before_p and not after_n:
-            if outer is None or _corner_dist(prev, tp, p_corner) < \
-                    _corner_dist(prev, outer[0], p_corner):
-                outer = (tp, tn)
 
     if inner is not None:
         return JoinResult("inner", inner[0], inner[1])
 
-    if outer is not None:
-        conn = _make_connector(prev, nxt, p_corner, r_d,
-                               outer[0], outer[1])
-        return JoinResult("outer", t_prev_end, t_next_start, connector=conn)
-
-    # 交点落在段范围外（过切干涉）或无交点：不猜测轨迹
-    if cands:
+    # 无可达内角交点 => 外角补弧：两条偏置曲线在程序角点处分离，
+    # 补一段以角点为圆心、r_d 为半径、切向连续的圆角。
+    # 仅当两个偏置端点都在该圆上（几何恒成立，浮点校验）时构造；
+    # 端点与半径不符说明偏置段过短或几何不连续，抛错。
+    p_from = prev.point(t_prev_end)
+    p_to = nxt.point(t_next_start)
+    r1 = math.hypot(p_from[0] - p_corner[0], p_from[1] - p_corner[1])
+    r2 = math.hypot(p_to[0] - p_corner[0], p_to[1] - p_corner[1])
+    if abs(r1 - r_d) > 1e-5 or abs(r2 - r_d) > 1e-5:
         raise JoinError(
-            "偏置曲线交点超出段范围（相邻段几何干涉/过切），无法连续")
-    raise JoinError("相邻偏置段既无内角交点也无外角补接可能，无法连续")
+            f"偏置端点不在程序角点的刀具半径圆上（{r1:.6g}/{r2:.6g} vs "
+            f"r_d={r_d:.6g}），相邻段无法连续")
+    conn = _make_connector(prev, nxt, p_corner, r_d)
+    return JoinResult("outer", t_prev_end, t_next_start, connector=conn)
 
 
 def _param_le(prim: Primitive, t: float, ref: float) -> bool:
@@ -340,20 +340,19 @@ def _corner_dist(prim: Primitive, t: float,
 
 
 def _make_connector(prev: Primitive, nxt: Primitive,
-                    corner: tuple[float, float], r_d: float,
-                    tp: float, tn: float) -> Connector:
+                    corner: tuple[float, float], r_d: float) -> Connector:
     """外角补接圆角：圆心为程序角点，半径 r_d，连接前段偏置终点到
-    后段偏置起点。起止角度由两偏置曲线在角点处的位置确定，扫向取
-    与两段切向转动一致的短弧。"""
+    后段偏置起点。扫向按切向连续选择（起点切向=前段切向、
+    终点切向=后段切向），扫角取外角短弧。"""
     p_from = prev.point(prev.win1)
     p_to = nxt.point(nxt.win0)
     a_from = math.atan2(p_from[1] - corner[1], p_from[0] - corner[0])
     a_to = math.atan2(p_to[1] - corner[1], p_to[0] - corner[0])
     d_prev = prev.tangent(prev.win1)
     d_next = nxt.tangent(nxt.win0)
-    turn = d_prev[0] * d_next[1] - d_prev[1] * d_next[0]
-    # 圆角行进方向：左转(cross>0)用 CCW，右转用 CW；取该方向上的短弧
-    sgn = 1.0 if turn > 0 else -1.0
+    # 圆在 a_from 处 CCW 切向为 (-sin, cos)；选 sgn 使其等于 d_prev
+    t_ccw = (-math.sin(a_from), math.cos(a_from))
+    sgn = 1.0 if (t_ccw[0] * d_prev[0] + t_ccw[1] * d_prev[1]) > 0.999 else -1.0
     if sgn > 0:
         sweep = a_to - a_from
         while sweep <= SWEEP_EPS:
@@ -362,6 +361,15 @@ def _make_connector(prev: Primitive, nxt: Primitive,
         sweep = a_to - a_from
         while sweep >= -SWEEP_EPS:
             sweep -= 2 * math.pi
+    # 校验终点切向与后段切向连续（不连续说明外角 >π，几何干涉，不猜测）
+    t_end = (-sgn * math.sin(a_to), sgn * math.cos(a_to))
+    if t_end[0] * d_next[0] + t_end[1] * d_next[1] < 0.999:
+        raise JoinError(
+            f"外角补弧终点切向与下段不连续（外角过大/折返），无法连续")
+    if abs(sweep) > math.pi + 1e-6:
+        raise JoinError(
+            f"外角补弧扫角 {math.degrees(abs(sweep)):.3f}° 超过 180°，"
+            "相邻段几何干涉，无法连续")
     n = max(4, int(math.ceil(abs(sweep) / (math.pi / 2) * 8)))
     pts = []
     for k in range(n + 1):

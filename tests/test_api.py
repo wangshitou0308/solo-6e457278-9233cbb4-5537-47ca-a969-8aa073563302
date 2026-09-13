@@ -195,7 +195,8 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(set(names),
                          {"safe_demo", "problems_demo", "inch_demo",
                           "arc_demo", "plane_arc_demo", "drill_cycle_demo",
-                          "wcs_demo", "length_comp_demo", "subprogram_demo",
+                          "wcs_demo", "length_comp_demo", "cutter_comp_demo",
+                          "subprogram_demo",
                           "subprogram_errors_demo"})
         kinds = {e["name"]: e["kind"] for e in ex["examples"]}
         self.assertEqual(kinds["subprogram_demo"], "package")

@@ -1316,6 +1316,46 @@ class Analyzer:
         if code == "40":
             # G40 行上的 D 不生效（不报错，仅规范化标注）
             bare_d = " ".join(f"D{fmt_num(w.value)}" for w in d_words)
+            if st.cutter_phase == "inactive" or st.cutter_phase == "broken":
+                # 未补偿或轮廓已断：G40 直接取消，不要求退出段、不登记事件
+                if st.cutter_phase == "broken":
+                    st.cutter_phase = "inactive"
+                    st.cutter_side = None
+                    st.cutter_d = None
+                    st.cutter_r = 0.0
+                    st.cutter_plane = None
+                    st.cutter_cancel_line = pl.line_no
+                self._line_cutter = {
+                    "token": token, "bare_d": bare_d, "event": None,
+                    "code": "G40", "side": None, "d": None, "r": 0.0}
+                return True
+            if st.cutter_phase == "pending_out":
+                # 幂等：保持待退出
+                self._line_cutter = {
+                    "token": token, "bare_d": bare_d, "event": None,
+                    "code": "G40", "side": st.cutter_side,
+                    "d": st.cutter_d, "r": st.cutter_r}
+                return True
+            if st.cutter_phase == "pending_in":
+                # 取消本次未完成的切入：回到 inactive
+                cancels_d = st.cutter_d
+                event = {"code": "G40", "side": None, "d": None,
+                         "radius_mm": None, "cancels_d": cancels_d,
+                         "cancels_side": st.cutter_side,
+                         "line_no": pl.line_no, "source_line": pl.source,
+                         "plane": st.plane, "wcs": st.wcs}
+                self.cutter_events.append(event)
+                st.cutter_phase = "inactive"
+                st.cutter_side = None
+                st.cutter_d = None
+                st.cutter_r = 0.0
+                st.cutter_plane = None
+                st.cutter_apply_line = None
+                st.cutter_cancel_line = pl.line_no
+                self._line_cutter = {
+                    "token": token, "bare_d": bare_d, "event": event,
+                    "code": "G40", "side": None, "d": None, "r": 0.0}
+                return True
             event = {"code": "G40", "side": None, "d": None,
                      "radius_mm": None, "cancels_d": st.cutter_d,
                      "cancels_side": st.cutter_side,
@@ -1365,12 +1405,15 @@ class Analyzer:
                 "token": token, "bare_d": "", "event": None,
                 "code": f"G{code}", "side": side, "d": d_int, "r": table}
             return True
-        if st.cutter_phase in ("active", "pending_out") \
+        if st.cutter_phase == "broken":
+            # 断链后允许重新 G41/G42 切入（旧轮廓已不连续，新启用另起一段）
+            pass
+        elif st.cutter_phase in ("active", "pending_out") \
                 or (st.cutter_phase == "pending_in"
                     and (st.cutter_d != d_int or st.cutter_side != side)):
             issue_indexes.append(self._issue(
                 "CUTTER_COMP_CONFLICT", pl,
-                f"半径补偿已生效（{CUTTER_COMP_CN.get(st.cutter_side, '')}），"
+                f"半径补偿已生效或待退出（{st.cutter_phase}），"
                 f"不能直接改用 G{code} D{d_int}；须先用 G40 经非零 G1 退出后"
                 "再重新切入；该段阻断，补偿状态不变",
                 {"comp_codes": [f"G{code}"], "d": d_int,
@@ -4421,6 +4464,24 @@ class Analyzer:
                     "工件 Z 判定，Z 轴行程按叠加工件偏置与刀长补偿后的主轴"
                     "基准点机床 Z 判定；直线/圆弧/螺旋/固定钻孔循环均记录 H 号、"
                     "补偿方向与数值、刀尖工件坐标及主轴基准点机床坐标"),
+                "cutter_compensation": (
+                    "G41 左/G42 右半径补偿，左/右按当前圆弧平面（G17/G18/"
+                    "G19）正法向 n=u×v 判定（G41 左法向 n×d、G42 右法向 "
+                    "d×n）；D 只在与 G41/G42 同段生效，刀具半径取自机床配置 "
+                    "radius_offsets（D 为正整数、半径非负，否则拒绝保存）；"
+                    "G41/G42 与 G40 均为纯设定行不移动刀具，切入/退出必须"
+                    "是非零平面内 G1（切向斜变到满偏置）；直线偏置为平行线、"
+                    "圆弧为同心圆（G41+G3/G42+G2 内偏置 R-r_d，另两种组合"
+                    "外偏置 R+r_d）；相邻偏置段按几何关系做内角裁切或外角"
+                    "补弧，无法连续不猜测轨迹；D 非法/未登记、切入退出无效、"
+                    "补偿后圆弧半径非正、相邻段不连续等定位原行阻断；"
+                    "每段同时输出编程轮廓、刀心轨迹（center_path_mm）、"
+                    "连接方式（junction）与刀具扫掠包围盒"
+                    "（swept_bbox_program_mm）；机床行程按刀心±半径叠加工件"
+                    "偏置与刀长补偿的扫掠范围判定，越界报 OUT_OF_BOUNDS；"
+                    "程序在待切入/激活/待退出状态结束时在 G41/G42 或 G40 "
+                    "原行报告；报告可按 d=D1 筛选，对比列出偏置路径与扫掠"
+                    "包围盒变化"),
                 "feed": "F 按出现时的单位换算为 mm/min 后模态保持",
                 "canned_cycle": (
                     "G81/G82/G83 为模态固定循环，G80 或 G0-G3 取消；"
@@ -4558,6 +4619,58 @@ DIALECT = {
         "report_filter": "报告可按 h=H1 或 h=1 筛选问题、轨迹、孔与按 H 汇总；"
                          "对比结果列出各 H 的补偿使用、路径/钻孔与 Z 行程变化",
     },
+    "cutter_compensation": {
+        "G40": "取消刀具半径补偿（必须用非零平面内 G1 退出）",
+        "G41": "刀具半径补偿左侧：按当前平面正法向 n=u×v 判定"
+               "（G17 看 +Z、G18 看 +Y、G19 看 +X，左侧为 n×d）",
+        "G42": "刀具半径补偿右侧（d×n，与 G41 相反）",
+        "D": "D 寄存器号（正整数），只在与 G41/G42 同段时生效；"
+             "无 G41/G42 的 D 不生效；G40 同行的 D 不生效",
+        "offset_table": "刀具半径由机床配置 radius_offsets 提供（mm），"
+                        "如 {\"1\": 5.0, \"2\": 3.0}；D 号必须为正整数、"
+                        "半径必须为非负数值，否则定位字段并拒绝保存",
+        "planes": "左/右按 G17(XY)/G18(XZ)/G19(YZ) 的正法向判定；"
+                  "补偿在建立时锁定平面，补偿中不允许切换平面（须先 G40 退出）",
+        "engage_exit": "G41/G42 Dn 为纯设定行（不移动刀具），下一段必须是"
+                       "非零平面内 G1 切入；G40 同样为纯设定行，其后必须用"
+                       "非零平面内 G1 退出；切入/退出段刀心从程序点斜变到"
+                       "满偏置点（切向切入/切向退出）",
+        "offset_rules": "直线偏置为平行直线；圆弧偏置仍为同心圆："
+                        "G41+逆圆(G3)、G42+顺圆(G2) 为内偏置（R-r_d），"
+                        "G41+顺圆(G2)、G42+逆圆(G3) 为外偏置（R+r_d）；"
+                        "内偏置后半径非正 -> CUTTER_ARC_RADIUS，整段阻断",
+        "junction": "相邻偏置段按几何关系连接：偏置线相交且都在角点前为"
+                    "内角裁切（两段裁到交点）；偏置线分离为外角补弧"
+                    "（以程序角点为圆心、r_d 为半径补一段圆角）；"
+                    "180° 折返、交点越过段范围（干涉）等无法连续 -> "
+                    "CUTTER_COMP_DISCONTINUOUS，不猜测轨迹",
+        "segments": "每段同时输出编程轮廓（start_mm/end_mm/points_mm）、"
+                    "刀心轨迹（cutter_compensation.center_path_mm，"
+                    "切入/退出含无偏置斜切端点）、连接方式（junction："
+                    "inner_trim/outer_arc/collinear）与刀具扫掠包围盒"
+                    "（swept_bbox_program_mm，刀心±半径）；螺旋段垂直轴"
+                    "不偏移，纯垂直 G1 刀心平面坐标保持",
+        "travel": "机床行程按刀具扫掠范围（刀心轨迹±刀具半径，并叠加"
+                  "工件坐标系偏置与刀长补偿）判定，越界报 OUT_OF_BOUNDS"
+                  "（details.checked_path=tool_swept_envelope）",
+        "block_rules": [
+            "G41/G42 缺 D -> CUTTER_COMP_MISSING_D，整段阻断",
+            "D 非正整数或不在 radius_offsets -> CUTTER_COMP_D_NOT_FOUND，"
+            "整段阻断",
+            "G40/G41/G42 同段混用、补偿码重复、同段多个 D 或补偿中直接"
+            "换侧/换 D -> CUTTER_COMP_CONFLICT，整段阻断",
+            "切入/退出段不是非零平面内 G1（G0/G2/G3/纯垂直移动/固定循环）"
+            "-> CUTTER_APPROACH_INVALID / CUTTER_EXIT_INVALID",
+            "补偿后圆弧有效半径非正 -> CUTTER_ARC_RADIUS，该段阻断",
+            "补偿中 G0、固定循环、切换平面或相邻偏置段无法连续 -> "
+            "CUTTER_COMP_DISCONTINUOUS",
+            "程序结束时仍待切入/激活/待退出 -> 在 G41/G42 或 G40 原行"
+            "报告 CUTTER_APPROACH_INVALID/CUTTER_EXIT_INVALID",
+        ],
+        "report_filter": "报告可按 d=D1 或 d=1 筛选问题、轨迹与按 D 汇总；"
+                         "对比结果列出 D 半径表变化、各 D 偏置路径/切入退出/"
+                         "问题与刀具扫掠包围盒变化",
+    },
     "supported_m": {"M3": "主轴正转", "M5": "主轴停止"},
     "package_flow_m": {
         "O": "子程序号行（仅程序包模式 POST /api/packages）",
@@ -4571,6 +4684,7 @@ DIALECT = {
                     "指令处理。变量/宏表达式（#、[]）在任何模式下均不支持。",
     "supported_words": ["X", "Y", "Z", "I", "J", "K", "R", "F", "S", "N(忽略)",
                         "H(刀长补偿寄存器号，随 G43/G44 生效)",
+                        "D(半径补偿寄存器号，随 G41/G42 生效)",
                         "Q(固定循环步进)", "P(固定循环暂停)",
                         "L(固定循环重复次数)",
                         "O(子程序号，仅程序包模式)"],
@@ -4579,11 +4693,11 @@ DIALECT = {
                           "并整段阻断，不猜测执行",
     "unsupported_examples": [
         "G28/G30 回零",
-        "G40-G42 半径刀补", "G54.1 附加工件坐标系",
+        "G54.1 附加工件坐标系",
         "G84-G89 其他固定循环（仅支持 G80-G83）",
         "M2/M30 程序结束（仅程序包模式支持）", "M4 反转", "M6 换刀",
         "M7-M9 冷却",
-        "T 刀号", "D 半径刀补号",
+        "T 刀号",
     ],
     "severity_levels": SEVERITY_ORDER,
 }
