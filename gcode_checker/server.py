@@ -183,7 +183,7 @@ def filter_report(report: dict, query: dict) -> dict:
         out["wcs"] = _filter_wcs(report["wcs"], wcs_upper)
     if h_filter_active and "length_compensation" in out:
         out["length_compensation"] = _filter_length_comp(
-            report["length_compensation"], h_filter)
+            report["length_compensation"], h_filter, issues)
     # 逐行轨迹：默认随循环/平面/坐标系筛选裁剪；?trajectory=0 省略，
     # ?trajectory=all 不裁剪
     traj_flag = query.get("trajectory", ["1"])[0]
@@ -220,29 +220,55 @@ def _entry_h(e: dict):
 
 
 def _filter_trajectory_h(trajectory, h_nums):
-    """逐行轨迹按刀长补偿 H 号裁剪：保留命中 H 的轨迹段/补偿段；
+    """逐行轨迹按刀长补偿 H 号裁剪：保留命中 H 的轨迹段与 G43/G44 补偿段；
     G49 取消事件不归属任何 H，随筛选保留（标注补偿结束）；
-    无轨迹的设定/注释行原样保留。"""
+    无轨迹/无补偿事件的设定、注释、程序流行原样保留。"""
     out = []
     for e in trajectory:
-        if e.get("segment") is None:
-            out.append(e)
-            continue
         ev = e.get("tool_length_event")
-        if ev is not None and ev.get("code") == "G49":
+        if ev is not None:
+            if ev.get("code") == "G49":
+                if ev.get("cancels_h") in h_nums:
+                    out.append(e)
+            elif ev.get("h") in h_nums:
+                out.append(e)
+            continue
+        if e.get("segment") is None:
             out.append(e)
         elif _entry_h(e) in h_nums:
             out.append(e)
     return out
 
 
-def _filter_length_comp(lc: dict, h_nums) -> dict:
-    """刀长补偿汇总按 H 号裁剪：只保留命中 H 的事件/按 H 汇总。"""
+def _filter_length_comp(lc: dict, h_nums, filtered_issues=None) -> dict:
+    """刀长补偿汇总按 H 号裁剪。
+
+    - 事件保留命中 H 的 G43/G44 事件，并保留全部 G49 取消事件
+      （取消不归属任何 H，用于标明该 H 补偿段的结束）；
+    - by_h 只保留命中 H；问题计数按筛选后的 issues 重算，避免
+      “缺 H / H 不存在”等不归属已建立 H 的阻断问题残留非零计数；
+    - 未补偿段（without_compensation）在按 H 筛选时置 null。
+    """
+    h_set = set(h_nums)
+
+    def keep_event(e):
+        if e.get("code") == "G49":
+            # 只保留结束命中 H 补偿段的取消事件（无补偿时的空 G49 不保留）
+            return e.get("cancels_h") in h_set
+        return e.get("h") in h_set
+
     out = dict(lc)
-    out["events"] = [e for e in lc.get("events", [])
-                     if e.get("h") in h_nums]
+    out["events"] = [e for e in lc.get("events", []) if keep_event(e)]
     out["by_h"] = {f"H{v}": lc.get("by_h", {}).get(f"H{v}")
                    for v in h_nums if f"H{v}" in lc.get("by_h", {})}
+    if filtered_issues is not None:
+        comp_codes = ("LENGTH_COMP_MISSING_H", "LENGTH_COMP_H_NOT_FOUND",
+                      "LENGTH_COMP_CONFLICT")
+        counts = dict.fromkeys(comp_codes, 0)
+        for i in filtered_issues:
+            if i["code"] in counts:
+                counts[i["code"]] += 1
+        out["issues"] = counts
     out["without_compensation"] = None
     out["filtered"] = True
     return out
@@ -456,18 +482,19 @@ def _filter_trajectory_cycles(trajectory, cycles, hole_from, hole_to,
 
 def filter_package_report(report: dict, query: dict) -> dict:
     """程序包报告筛选：?source=O100 按来源程序裁剪逐行轨迹与问题；
-    ?h=H1 按刀长补偿 H 号筛选（与 source 可叠加）；?trajectory=0 省略轨迹。
-    顶层统计保持完整（块级统计另给 filter 说明）。"""
+    ?h=H1 按刀长补偿 H 号筛选（与 source 可叠加）；?trajectory=0 仅省略
+    轨迹，source/h 仍然作用于问题与各汇总节。顶层块级统计保持完整
+    （块级统计另给 filter 说明）。"""
     out = dict(report)
     traj_flag = query.get("trajectory", ["1"])[0]
-    if traj_flag in ("0", "false", "no"):
-        out.pop("trajectory", None)
-        out["filter"] = {"trajectory": "omitted"}
-        return out
+    omit_traj = traj_flag in ("0", "false", "no")
 
     sources = _csv_param(query, "source")
     h_filter = _h_filter_param(query)
     if not sources and not h_filter:
+        if omit_traj:
+            out.pop("trajectory", None)
+            out["filter"] = {"trajectory": "omitted"}
         return out
     if sources:
         valid = {"main"} | {s["program"] for s in
@@ -491,7 +518,7 @@ def filter_package_report(report: dict, query: dict) -> dict:
         traj = _filter_trajectory_h(traj, h_filter)
         if "length_compensation" in out:
             out["length_compensation"] = _filter_length_comp(
-                report["length_compensation"], h_filter)
+                report["length_compensation"], h_filter, issues)
         if "drill_cycles" in out:
             out["drill_cycles"] = _filter_drill_cycles(
                 report["drill_cycles"], None, None, None, None, h_filter)
@@ -499,15 +526,19 @@ def filter_package_report(report: dict, query: dict) -> dict:
     for i in issues:
         counts[i["severity"]] += 1
     out["issues"] = issues
-    out["trajectory"] = traj
+    if omit_traj:
+        out.pop("trajectory", None)
+    else:
+        out["trajectory"] = traj
     out["risk"] = dict(report["risk"])
     out["risk"]["counts_by_severity"] = counts
     out["risk"]["total_issues"] = len(issues)
     out["filter"] = {
         "source": sources,
         "h": [f"H{v}" for v in h_filter],
+        "trajectory": "omitted" if omit_traj else "included",
         "matched_issues": len(issues),
-        "matched_blocks": len(traj),
+        "matched_blocks": (None if omit_traj else len(traj)),
         "total_issues_in_report": len(report["issues"]),
         "total_blocks_in_report": len(report["trajectory"]),
     }

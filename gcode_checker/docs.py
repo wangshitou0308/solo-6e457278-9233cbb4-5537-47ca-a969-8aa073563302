@@ -283,7 +283,9 @@ python3 -m gcode_checker --verbose       # 打印访问日志
     坐标系，固定循环分组按孔的 `wcs` 裁剪，风险计数随之重算
   - `h=H1,H2`（也接受 `h=1,2`）：按刀长补偿 H 号筛选；只保留该 H 生效
     期间产生的问题、轨迹段与孔，`length_compensation` 汇总只保留命中 H
-    （G49 取消事件随筛选保留），风险计数随之重算
+    （结束该 H 补偿段的 G49 事件带 `cancels_h` 并随筛选保留，问题计数按
+    筛选后的问题重算，“缺 H / H 不存在”不归属任何已建立 H），
+    风险计数随之重算
   - `trajectory=0`：省略逐行轨迹以减小响应；`trajectory=all`：循环/平面/坐标系/H 筛选时保留完整轨迹
 
   指定 `cycle`/`hole_*` 后，报告中的 `drill_cycles`（groups、by_cycle、
@@ -304,8 +306,10 @@ python3 -m gcode_checker --verbose       # 打印访问日志
   `package`/`program` 展开节）；阻断时返回阻断报告（无安全结论）。支持：
   - `source=main,O100`：**按来源程序筛选轨迹**（可多选逗号分隔）；
     逐行轨迹与问题只保留命中来源程序，风险计数随之重算；非法来源返回 400。
-  - `h=H1,H2`：按刀长补偿 H 号筛选（跨全部来源程序，与 `source` 可叠加）。
-  - `trajectory=0`：省略逐行轨迹（顶层 package/call_graph 保留）。
+  - `h=H1,H2`：按刀长补偿 H 号筛选（跨全部来源程序，与 `source` 可叠加）；
+    即使 `trajectory=0` 省略逐行轨迹，问题与各汇总节仍按 H 筛选。
+  - `trajectory=0`：省略逐行轨迹（顶层 package/call_graph 保留；source/h
+    筛选与回显仍然生效）。
 - `GET /api/packages/<id>/report/download`：以 `attachment` 下载程序包
   完整 JSON（展开状态、调用图、调用错误、轨迹与分析结果）。
 - `GET /api/packages/<id>/blocks?limit=100&offset=0&source=O100`：
@@ -409,7 +413,7 @@ python3 -m gcode_checker --verbose       # 打印访问日志
        "offset_mm": 10, "signed_offset_mm": 10, "wcs": "G54",
        "tip_z_workpiece_mm": 10,                      // 重算后的刀尖工件 Z
        "spindle_z_machine_mm": 20,                    // 主轴基准点机床 Z（不动）
-       "tip_z_recomputed": true} ],
+       "tip_z_recomputed": true} ],                   // G49 另带 cancels_h（被取消的 H 号）
     "by_h": { "H1": {"h": 1, "offset_mm": 10,
       "path_length_mm": {"rapid":…, "cutting":…, "total":…,
                          "canned_cycle_rapid":…, "canned_cycle_cutting":…},

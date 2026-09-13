@@ -865,9 +865,12 @@ class Analyzer:
         event = None
 
         if direction is None:
-            # G49：取消补偿；同行 H 不生效
+            # G49：取消补偿；同行 H 不生效。记录被取消的 H/方向，
+            # 供按 H 筛选时只保留结束该 H 补偿段的 G49 事件。
             event = {"code": "G49", "direction": "cancel", "h": None,
-                     "offset_mm": None, "signed_offset_mm": 0.0}
+                     "offset_mm": None, "signed_offset_mm": 0.0,
+                     "cancels_h": st.comp_h,
+                     "cancels_direction": st.comp_direction}
         else:
             if not h_words:
                 issue_indexes.append(self._issue(
@@ -1001,7 +1004,7 @@ class Analyzer:
         spindle_z = None
         if tip_z is not None and off is not None:
             spindle_z = round6(tip_z + off[2] + signed)
-        return {
+        out = {
             "line_no": ev["line_no"],
             "source_line": ev["source_line"],
             "code": ev["code"],
@@ -1014,6 +1017,9 @@ class Analyzer:
             "spindle_z_machine_mm": spindle_z,
             "tip_z_recomputed": ev.get("tip_z_recomputed", False),
         }
+        if ev.get("cancels_h") is not None:
+            out["cancels_h"] = ev["cancels_h"]
+        return out
 
     def _spindle_point(self, p, off=None, signed: float | None = None):
         """刀尖工件坐标 -> 主轴基准点机床坐标（工件偏置 + Z 向刀长补偿）。"""

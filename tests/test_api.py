@@ -699,6 +699,20 @@ class ApiTest(unittest.TestCase):
         self.req("GET", f"/api/jobs/{job['id']}/report?h=H0", expect=400)
         self.req("GET", f"/api/jobs/{job['id']}/report?h=abc", expect=400)
 
+        # 汇总与筛选一致：问题计数重算（缺 H/H 不存在不归属任何已建立 H）、
+        # G49 只保留结束该 H 补偿段的取消事件
+        f3, body = self.req(
+            "GET", f"/api/jobs/{job['id']}/report?h=H1&trajectory=all")
+        lc = body["length_compensation"]
+        self.assertEqual(lc["issues"], {
+            "LENGTH_COMP_MISSING_H": 0,
+            "LENGTH_COMP_H_NOT_FOUND": 0,
+            "LENGTH_COMP_CONFLICT": 0})
+        self.assertEqual([e["code"] for e in lc["events"]],
+                         ["G43", "G49"])
+        self.assertEqual(lc["events"][-1].get("cancels_h"), 1)
+        self.assertEqual(body["risk"]["total_issues"], len(body["issues"]))
+
         # 对比：length_compensation 节列出补偿与 Z 行程变化
         nc2 = ("G21 G90 G54\nM3 S6000\nG0 X0 Y0 Z20\n"
                "G43 H3\nG1 X20 Z5 F500\nG0 Z20\nG49\nM5\n")
@@ -974,6 +988,46 @@ class PackageApiTest(unittest.TestCase):
                         <= {"O100"})
         # 非法 h 400
         self.req("GET", f"/api/packages/{pid}/report?h=H0", expect=400)
+
+    def test_05c_h_filter_applies_with_trajectory_omitted(self):
+        # 多 H 程序：H1（子程序）与 H2（主程序），验证 trajectory=0 时
+        # h 筛选仍然作用于问题与汇总节
+        config = dict(CONFIG, safe_z=-50,
+                      length_offsets={"1": 10, "2": 2})
+        package = {
+            "name": "pkg_lcomp2",
+            "main": ("G21 G90 G54\nM3 S4000\nG0 X0 Y0 Z20\n"
+                     "G43 H1\nM98 P100\nG49\n"
+                     "G43 H2\nG1 X30 Z5 F500\nG49\nM30\n"),
+            "subprograms": [
+                {"name": "o100.nc",
+                 "content": "O100\nG1 X10 Z5 F500\nG0 Z20\nM99\n"}],
+        }
+        _, created = self.req("POST", "/api/packages",
+                              dict(package, config=config), expect=202)
+        pid = created["id"]
+        self.wait_package(pid)
+        _, f = self.req(
+            "GET", f"/api/packages/{pid}/report?h=H1&trajectory=0")
+        # 轨迹已省略，但筛选仍生效并完整回显
+        self.assertNotIn("trajectory", f)
+        self.assertEqual(f["filter"]["h"], ["H1"])
+        self.assertEqual(f["filter"]["trajectory"], "omitted")
+        self.assertIn("source", f["filter"])
+        lc = f["length_compensation"]
+        self.assertTrue(lc["filtered"])
+        self.assertEqual(list(lc["by_h"]), ["H1"])
+        # 只保留 H1 的 G43 与结束 H1 的 G49（H2 段不混入）
+        self.assertEqual([(e["code"], e.get("h"), e.get("cancels_h"))
+                          for e in lc["events"]],
+                         [("G43", 1, None), ("G49", None, 1)])
+        self.assertEqual(f["risk"]["total_issues"], len(f["issues"]))
+        # 仅 trajectory=0 不带筛选：回显不包含 h，汇总完整
+        _, f0 = self.req(
+            "GET", f"/api/packages/{pid}/report?trajectory=0")
+        self.assertEqual(f0["filter"], {"trajectory": "omitted"})
+        self.assertIn("H1", f0["length_compensation"]["by_h"])
+        self.assertIn("H2", f0["length_compensation"]["by_h"])
 
     def test_06_blocked_package(self):
         created = self.create_package(PACKAGE_BAD)
