@@ -96,6 +96,11 @@ ISSUE_SEVERITY = {
     "TOOL_CHANGE_POSITION_OUT": "error",  # 主轴基准点不在换刀容差内
     "TOOL_NOT_CURRENT": "error",          # 未建立当前刀便切削/钻孔
     "TOOL_REGISTER_MISMATCH": "warning",  # H/D 与当前刀默认寄存器不一致（不自动替换）
+    "MACHINE_COORD_CONFLICT": "error",    # 同段多个机床坐标指令（G53/G28/G30 混用/重复）
+    "MACHINE_COORD_NO_AXIS": "error",     # G28/G30 未指定轴
+    "MACHINE_COORD_NO_REFERENCE": "error",  # 机床配置缺少 G28/G30 参考点
+    "MACHINE_COORD_MIXED_MOTION": "error",  # 与圆弧/固定循环混用，或 G53 未与 G0/G1 同段
+    "MACHINE_COORD_CUTTER_COMP": "error",  # 半径补偿进行中不允许机床坐标运动
 }
 
 ISSUE_TITLE = {
@@ -139,6 +144,11 @@ ISSUE_TITLE = {
     "TOOL_CHANGE_POSITION_OUT": "主轴基准点不在换刀点容差范围内（该段已阻断）",
     "TOOL_NOT_CURRENT": "未建立当前刀具便发生切削/钻孔",
     "TOOL_REGISTER_MISMATCH": "H/D 寄存器与当前刀默认寄存器不一致（仅提示，不自动替换）",
+    "MACHINE_COORD_CONFLICT": "同程序段出现多个机床坐标指令（该段已阻断）",
+    "MACHINE_COORD_NO_AXIS": "G28/G30 回参考点未指定轴（该段已阻断）",
+    "MACHINE_COORD_NO_REFERENCE": "机床配置缺少 G28/G30 参考点（该段已阻断）",
+    "MACHINE_COORD_MIXED_MOTION": "机床坐标指令与圆弧/固定循环混用或 G53 缺少 G0/G1（该段已阻断）",
+    "MACHINE_COORD_CUTTER_COMP": "半径补偿进行中不允许机床坐标运动（该段已阻断）",
 }
 
 ALLOWED_LETTERS = {"G", "M", "X", "Y", "Z", "I", "J", "K", "R", "F", "S", "N",
@@ -172,6 +182,13 @@ CENTER_WORD_ORDER = {"I": 0, "J": 1, "K": 2}
 # 换刀：T 只预选刀具，M6 才把预选刀换为当前刀（不得同段运动）
 TOOL_CHANGE_M = "6"
 TOOL_CHANGE_AXES = ("x", "y", "z")
+
+# 机床坐标运动（非模态）：G53 机床坐标直达、G28/G30 经中间点回参考点
+MACHINE_COORD_G = {"53": "G53", "28": "G28", "30": "G30"}
+MC_CODES = ("G53", "G28", "G30")
+MC_ISSUE_CODES = ("MACHINE_COORD_CONFLICT", "MACHINE_COORD_NO_AXIS",
+                  "MACHINE_COORD_NO_REFERENCE", "MACHINE_COORD_MIXED_MOTION",
+                  "MACHINE_COORD_CUTTER_COMP")
 
 # 程序包模式下的程序流指令（见 packages.py；普通单程序分析中它们仍属于
 # 未支持指令，保持旧行为）
@@ -227,6 +244,38 @@ class ConfigError(ValueError):
         super().__init__("; ".join(errors))
 
 
+def _machine_point_field(d: dict, key: str, errors: list[str]) -> dict | None:
+    """解析机床坐标点字段 {"x":..,"y":..,"z":..}（mm，三轴齐全）。
+
+    非法时把错误定位到具体字段（如 g28_reference_point.x）并返回 None。
+    """
+    raw = d.get(key)
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        errors.append(
+            f'{key} 必须是对象，形如 {{"x": 0, "y": 0, "z": 100}}'
+            "（机床坐标 mm）")
+        return None
+    extra = sorted(set(raw) - {"x", "y", "z"})
+    if extra:
+        errors.append(f"{key} 含未知字段 {extra}（仅支持 x/y/z）")
+    pt = {}
+    for ax in ("x", "y", "z"):
+        if ax in raw and raw[ax] is not None:
+            try:
+                pt[ax] = float(raw[ax])
+            except (TypeError, ValueError):
+                errors.append(
+                    f"{key}.{ax} 必须是数值（机床坐标 mm），收到 {raw[ax]!r}")
+    if len(pt) == 3:
+        return pt
+    if pt:
+        errors.append(
+            f"{key} 必须同时给出 x/y/z 三个坐标（当前仅给 {sorted(pt)}）")
+    return None
+
+
 @dataclass
 class MachineConfig:
     name: str = "未命名机床"
@@ -259,6 +308,10 @@ class MachineConfig:
     tool_change_point: dict | None = None
     # 换刀位置容差 {轴: 容差 mm}；主轴基准点各轴均落在换刀点±容差内才允许 M6
     tool_change_tolerance: dict = field(default_factory=dict)
+    # G28 参考点（机床坐标 {"x":..,"y":..,"z":..}）；G28 回参考点的目标
+    g28_reference_point: dict | None = None
+    # G30 第二参考点（可选，机床坐标 {"x":..,"y":..,"z":..}）
+    g30_reference_point: dict | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "MachineConfig":
@@ -557,6 +610,13 @@ class MachineConfig:
         if tool_change_point is not None and not tool_change_tolerance:
             # 给了换刀点但没给容差：默认三轴 0（必须精确到达）
             tool_change_tolerance = {"x": 0.0, "y": 0.0, "z": 0.0}
+
+        # G28 参考点 / G30 第二参考点（机床坐标 {"x":..,"y":..,"z":..}）；
+        # 均为可选：程序用 G28/G30 而对应参考点未配置时按段阻断
+        g28_reference_point = _machine_point_field(
+            d, "g28_reference_point", errors)
+        g30_reference_point = _machine_point_field(
+            d, "g30_reference_point", errors)
 
         for lo, hi, ax in ((x_min, x_max, "X"), (y_min, y_max, "Y"),
                            (z_min, z_max, "Z")):

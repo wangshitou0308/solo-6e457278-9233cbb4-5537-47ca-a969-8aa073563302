@@ -31,6 +31,9 @@ SUPPORTED_G = {
     "21": "mm",          # 公制
     "90": "absolute",    # 绝对定位
     "91": "relative",    # 增量定位
+    "53": "machine_coord",  # 机床坐标运动（非模态，仅与 G0/G1 同段）
+    "28": "return_reference",   # 回 G28 参考点（经中间点）
+    "30": "return_reference_2",  # 回 G30 第二参考点（经中间点）
     "54": "wcs",         # 工件坐标系 G54（偏置由机床配置给出）
     "55": "wcs",         # 工件坐标系 G55
     "56": "wcs",         # 工件坐标系 G56
