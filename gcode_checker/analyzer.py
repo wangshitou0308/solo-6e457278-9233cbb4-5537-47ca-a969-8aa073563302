@@ -84,6 +84,18 @@ ISSUE_SEVERITY = {
     "CUTTER_EXIT_INVALID": "error",        # G40 退出段不是非零平面内 G1
     "CUTTER_ARC_RADIUS": "critical",       # 补偿后圆弧有效半径非正
     "CUTTER_COMP_DISCONTINUOUS": "critical",  # 相邻偏置段无法连续/G0/固定循环/换平面
+    "TOOL_NUMBER_INVALID": "error",       # T 号非正整数或同段多个 T
+    "TOOL_CHANGE_WITH_MOTION": "error",    # 含 M6 的程序段同时运动/给运动词
+    "TOOL_CHANGE_UNREGISTERED": "error",  # M6 换入未登记刀具（含无预选）
+    "TOOL_CHANGE_SPINDLE_ON": "error",    # M6 时主轴仍在转动
+    "TOOL_CHANGE_CYCLE_ACTIVE": "error",  # M6 时固定循环未取消
+    "TOOL_CHANGE_LENGTH_COMP_ACTIVE": "error",  # M6 时刀长补偿未取消
+    "TOOL_CHANGE_CUTTER_COMP_ACTIVE": "error",  # M6 时半径补偿未取消
+    "TOOL_CHANGE_POSITION_UNKNOWN": "error",  # M6 时主轴基准点机床坐标未知
+    "TOOL_CHANGE_POSITION_MISSING": "error",  # 机床配置未给换刀点/容差
+    "TOOL_CHANGE_POSITION_OUT": "error",  # 主轴基准点不在换刀容差内
+    "TOOL_NOT_CURRENT": "error",          # 未建立当前刀便切削/钻孔
+    "TOOL_REGISTER_MISMATCH": "warning",  # H/D 与当前刀默认寄存器不一致（不自动替换）
 }
 
 ISSUE_TITLE = {
@@ -115,10 +127,22 @@ ISSUE_TITLE = {
     "CUTTER_EXIT_INVALID": "半径补偿退出段无效：G40 必须用非零平面内 G1 退出（相关轮廓已阻断）",
     "CUTTER_ARC_RADIUS": "半径补偿后圆弧有效半径非正（相关轮廓已阻断）",
     "CUTTER_COMP_DISCONTINUOUS": "半径补偿轨迹无法连续（相关轮廓已阻断）",
+    "TOOL_NUMBER_INVALID": "T 刀号非法（该段已阻断）",
+    "TOOL_CHANGE_WITH_MOTION": "含 M6 换刀的程序段不得同时运动（该段已阻断）",
+    "TOOL_CHANGE_UNREGISTERED": "M6 换入的刀具未登记或未预选（保持原刀）",
+    "TOOL_CHANGE_SPINDLE_ON": "M6 换刀时主轴必须停止（该段已阻断，保持原刀）",
+    "TOOL_CHANGE_CYCLE_ACTIVE": "M6 换刀前必须取消固定循环（该段已阻断）",
+    "TOOL_CHANGE_LENGTH_COMP_ACTIVE": "M6 换刀前必须用 G49 取消刀长补偿（该段已阻断）",
+    "TOOL_CHANGE_CUTTER_COMP_ACTIVE": "M6 换刀前必须用 G40 取消半径补偿（该段已阻断）",
+    "TOOL_CHANGE_POSITION_UNKNOWN": "M6 换刀时主轴基准点机床坐标未知（该段已阻断）",
+    "TOOL_CHANGE_POSITION_MISSING": "机床配置缺少换刀点/容差，无法核对换刀位置",
+    "TOOL_CHANGE_POSITION_OUT": "主轴基准点不在换刀点容差范围内（该段已阻断）",
+    "TOOL_NOT_CURRENT": "未建立当前刀具便发生切削/钻孔",
+    "TOOL_REGISTER_MISMATCH": "H/D 寄存器与当前刀默认寄存器不一致（仅提示，不自动替换）",
 }
 
 ALLOWED_LETTERS = {"G", "M", "X", "Y", "Z", "I", "J", "K", "R", "F", "S", "N",
-                   "Q", "P", "L", "H", "D"}
+                   "Q", "P", "L", "H", "D", "T"}
 MOTION_G = {"0": "rapid", "1": "linear", "2": "arc_cw", "3": "arc_ccw"}
 MOTION_CN = {"rapid": "快速", "linear": "直线",
              "arc_cw": "顺时针圆弧", "arc_ccw": "逆时针圆弧"}
@@ -145,6 +169,9 @@ PLANE_SPEC = {
 }
 PLANE_AXIS_NAMES = ("X", "Y", "Z")
 CENTER_WORD_ORDER = {"I": 0, "J": 1, "K": 2}
+# 换刀：T 只预选刀具，M6 才把预选刀换为当前刀（不得同段运动）
+TOOL_CHANGE_M = "6"
+TOOL_CHANGE_AXES = ("x", "y", "z")
 
 # 程序包模式下的程序流指令（见 packages.py；普通单程序分析中它们仍属于
 # 未支持指令，保持旧行为）
@@ -223,6 +250,15 @@ class MachineConfig:
     length_offsets: dict = field(default_factory=dict)
     # D 寄存器刀具半径表 {d号(正整数): 刀具半径 mm}，G41 左 / G42 右
     radius_offsets: dict = field(default_factory=dict)
+    # 刀具登记表 {刀号(正整数): {"h": 默认H寄存器号, "d": 默认D寄存器号}}；
+    # T 只预选、M6 换入，未登记的刀号不得换入
+    tools: dict = field(default_factory=dict)
+    # 初始刀具（机床开机即处于主轴上的已换入刀号，None=未建立当前刀）
+    initial_tool: int | None = None
+    # 机床坐标系下的换刀点 {"x":..,"y":..,"z":..}（主轴基准点须到达此处换刀）
+    tool_change_point: dict | None = None
+    # 换刀位置容差 {轴: 容差 mm}；主轴基准点各轴均落在换刀点±容差内才允许 M6
+    tool_change_tolerance: dict = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: dict) -> "MachineConfig":
@@ -374,6 +410,154 @@ class MachineConfig:
                         continue
                     radius_offsets[dno] = rv
 
+        # 刀具登记表 tools={"1": {"h":1,"d":1}, 2: {"h":2,"d":2}}：
+        # 键必须为正整数刀号；每把刀登记默认 H / D 寄存器号（均为正整数）。
+        # 非法时定位字段（如 tools.T3.h）并拒绝保存。
+        tools: dict[int, dict] = {}
+        raw_tools = d.get("tools")
+        if raw_tools is not None:
+            if not isinstance(raw_tools, dict):
+                errors.append(
+                    "tools 必须是对象，形如 "
+                    '{"1": {"h": 1, "d": 1}, "2": {"h": 2, "d": 2}}'
+                    "（刀号 -> 默认 H/D 寄存器）")
+            else:
+                for tk, tv in raw_tools.items():
+                    ts = str(tk).strip().upper()
+                    if ts.startswith("T"):
+                        ts = ts[1:]
+                    try:
+                        tf = float(ts)
+                    except (TypeError, ValueError):
+                        tf = None
+                    if tf is None or not tf.is_integer() or tf <= 0:
+                        errors.append(
+                            f"tools.{tk}：刀号必须为正整数（如 T1），"
+                            f"收到 {tk!r}")
+                        continue
+                    tno = int(tf)
+                    if not isinstance(tv, dict):
+                        errors.append(
+                            f"tools.T{tno} 必须是对象，形如 "
+                            '{"h": 1, "d": 1}（该刀默认 H/D 寄存器）')
+                        continue
+                    extra = sorted(set(tv) - {"h", "d", "name", "comment"})
+                    if extra:
+                        errors.append(
+                            f"tools.T{tno} 含未知字段 {extra}"
+                            "（仅支持 h/d/name/comment）")
+                    entry = {}
+                    for reg in ("h", "d"):
+                        rv = tv.get(reg)
+                        try:
+                            rf = float(rv)
+                        except (TypeError, ValueError):
+                            errors.append(
+                                f"tools.T{tno}.{reg} 必须是正整数"
+                                f"（该刀默认 {reg.upper()} 寄存器），"
+                                f"收到 {rv!r}")
+                            rf = None
+                        if rf is None or not rf.is_integer() or rf <= 0:
+                            if rv is not None:
+                                errors.append(
+                                    f"tools.T{tno}.{reg} 必须是正整数"
+                                    f"（该刀默认 {reg.upper()} 寄存器），"
+                                    f"收到 {rv!r}")
+                            continue
+                        entry[reg] = int(rf)
+                    if "h" not in entry or "d" not in entry:
+                        continue
+                    if "name" in tv and tv["name"] is not None:
+                        entry["name"] = str(tv["name"])
+                    if "comment" in tv and tv["comment"] is not None:
+                        entry["comment"] = str(tv["comment"])
+                    tools[tno] = entry
+
+        # 初始刀具 initial_tool：正整数且须在 tools 表登记；为 None/缺省
+        # 表示开机未建立当前刀（此后首次切削/钻孔报 TOOL_NOT_CURRENT）。
+        initial_tool: int | None = None
+        if d.get("initial_tool") is not None:
+            iv = d["initial_tool"]
+            its = str(iv).strip().upper()
+            if its.startswith("T"):
+                its = its[1:]
+            try:
+                iff = float(its)
+            except (TypeError, ValueError):
+                iff = None
+            if iff is None or not iff.is_integer() or iff <= 0:
+                errors.append(
+                    f"initial_tool 必须为正整数刀号（如 1 或 'T1'），"
+                    f"收到 {iv!r}")
+            else:
+                initial_tool = int(iff)
+                if initial_tool not in tools:
+                    errors.append(
+                        f"initial_tool=T{initial_tool} 未在 tools 刀具表登记")
+
+        # 机床坐标系下的换刀点 tool_change_point={"x":..,"y":..,"z":..}
+        tool_change_point: dict | None = None
+        raw_tcp = d.get("tool_change_point")
+        if raw_tcp is not None:
+            if not isinstance(raw_tcp, dict):
+                errors.append(
+                    'tool_change_point 必须是对象，形如 '
+                    '{"x": 0, "y": 0, "z": 100}（机床坐标 mm）')
+            else:
+                extra = sorted(set(raw_tcp) - {"x", "y", "z"})
+                if extra:
+                    errors.append(
+                        f"tool_change_point 含未知字段 {extra}"
+                        "（仅支持 x/y/z）")
+                pt = {}
+                for ax in ("x", "y", "z"):
+                    if ax in raw_tcp and raw_tcp[ax] is not None:
+                        try:
+                            pt[ax] = float(raw_tcp[ax])
+                        except (TypeError, ValueError):
+                            errors.append(
+                                f"tool_change_point.{ax} 必须是数值"
+                                f"（机床坐标 mm），收到 {raw_tcp[ax]!r}")
+                if len(pt) == 3:
+                    tool_change_point = pt
+                elif pt:
+                    errors.append(
+                        "tool_change_point 必须同时给出 x/y/z 三个坐标"
+                        f"（当前仅给 {sorted(pt)}）")
+
+        # 换刀位置容差 tool_change_tolerance={"x":..,"y":..,"z":..}（非负 mm）
+        tool_change_tolerance: dict = {}
+        raw_tol = d.get("tool_change_tolerance")
+        if raw_tol is not None:
+            if not isinstance(raw_tol, dict):
+                errors.append(
+                    'tool_change_tolerance 必须是对象，形如 '
+                    '{"x": 0.05, "y": 0.05, "z": 0.05}（mm）')
+            else:
+                extra = sorted(set(raw_tol) - {"x", "y", "z"})
+                if extra:
+                    errors.append(
+                        f"tool_change_tolerance 含未知字段 {extra}"
+                        "（仅支持 x/y/z）")
+                for ax in ("x", "y", "z"):
+                    if ax in raw_tol and raw_tol[ax] is not None:
+                        try:
+                            tv = float(raw_tol[ax])
+                        except (TypeError, ValueError):
+                            errors.append(
+                                f"tool_change_tolerance.{ax} 必须是非负数值"
+                                f"（mm），收到 {raw_tol[ax]!r}")
+                            continue
+                        if tv < 0:
+                            errors.append(
+                                f"tool_change_tolerance.{ax} 不能为负"
+                                f"（收到 {tv}）")
+                            continue
+                        tool_change_tolerance[ax] = tv
+        if tool_change_point is not None and not tool_change_tolerance:
+            # 给了换刀点但没给容差：默认三轴 0（必须精确到达）
+            tool_change_tolerance = {"x": 0.0, "y": 0.0, "z": 0.0}
+
         for lo, hi, ax in ((x_min, x_max, "X"), (y_min, y_max, "Y"),
                            (z_min, z_max, "Z")):
             if hi <= lo:
@@ -397,6 +581,13 @@ class MachineConfig:
             wcs_offsets=wcs_offsets,
             length_offsets=dict(sorted(length_offsets.items())),
             radius_offsets=dict(sorted(radius_offsets.items())),
+            tools=dict(sorted(tools.items())),
+            initial_tool=initial_tool,
+            tool_change_point=tool_change_point,
+            tool_change_tolerance={
+                ax: tool_change_tolerance.get(ax, 0.0)
+                for ax in ("x", "y", "z")}
+                if tool_change_point is not None else {},
         )
 
     def offset_for(self, wcs: str | None):
@@ -420,6 +611,12 @@ class MachineConfig:
             return None
         return self.radius_offsets.get(d)
 
+    def tool_for(self, t: int | None) -> dict | None:
+        """取刀具登记表中的刀具（{"h","d",...}）；未登记返回 None。"""
+        if t is None:
+            return None
+        return self.tools.get(t)
+
     def to_dict(self) -> dict:
         return {
             "name": self.name,
@@ -438,6 +635,12 @@ class MachineConfig:
                                for h in sorted(self.length_offsets)},
             "radius_offsets": {str(d): self.radius_offsets[d]
                                for d in sorted(self.radius_offsets)},
+            "tools": {str(t): dict(self.tools[t]) for t in sorted(self.tools)},
+            "initial_tool": self.initial_tool,
+            "tool_change_point": (dict(self.tool_change_point)
+                                  if self.tool_change_point is not None
+                                  else None),
+            "tool_change_tolerance": dict(self.tool_change_tolerance),
             "travel_x": [self.x_min, self.x_max],
             "travel_y": [self.y_min, self.y_max],
             "travel_z": [self.z_min, self.z_max],
@@ -496,6 +699,10 @@ class State:
     cutter_plane: str | None = None
     cutter_apply_line: int | None = None
     cutter_cancel_line: int | None = None
+    # 刀具：T 只预选（selected），M6 才把预选刀换为当前刀（current）。
+    # current=None 表示尚未建立当前刀（initial_tool 或首次成功 M6 建立）。
+    current_tool: int | None = None
+    selected_tool: int | None = None
 
     def clone(self) -> "State":
         return State(
@@ -526,6 +733,8 @@ class State:
             cutter_plane=self.cutter_plane,
             cutter_apply_line=self.cutter_apply_line,
             cutter_cancel_line=self.cutter_cancel_line,
+            current_tool=self.current_tool,
+            selected_tool=self.selected_tool,
         )
 
     def unit_factor(self) -> float | None:
@@ -578,6 +787,10 @@ class State:
                 "plane": self.cutter_plane,
                 "applied_line_no": self.cutter_apply_line,
                 "cancel_line_no": self.cutter_cancel_line,
+            },
+            "tool": {
+                "current_t": self.current_tool,
+                "selected_t": self.selected_tool,
             },
         }
 
@@ -785,8 +998,19 @@ class Analyzer:
         # 问题附来源程序/调用栈
         self.current_block = None
         self.state = State()
+        # 初始刀具（机床开机即处于主轴上的已换入刀号）
+        self.state.current_tool = config.initial_tool
         self.issues: list[Issue] = []
         self.entries: list[dict] = []
+        # 换刀分析：T 预选事件、M6 换刀事件，以及按当前刀的切削/钻孔统计
+        self.tool_preselect_events: list[dict] = []
+        self.tool_change_events: list[dict] = []
+        self.tool_path: dict = {}
+        self.tool_holes: dict = {}
+        self.tool_changes_by_t: dict = {}
+        # 本行 T 预选 / M6 换刀信息（由 _apply_tool_words 设置，
+        # _finish_line 据此挂事件；整段阻断时清空，不留事件痕迹）
+        self._line_tool: dict | None = None
         self.blank_count = 0
         self.executed_count = 0
         self.blocked_count = 0
@@ -872,6 +1096,9 @@ class Analyzer:
         # 同时归属到触发时生效的刀长补偿 H 号（未补偿为 None）；
         # 补偿指令自身的问题可在 details 里显式给出请求的 h。
         details.setdefault("h", self.state.comp_h)
+        # 归属到触发时的当前刀号（未建立当前刀为 None）；
+        # 换刀指令自身的问题可在 details 里显式给出请求的 t。
+        details.setdefault("t", self.state.current_tool)
         iss = Issue(
             code=code,
             severity=ISSUE_SEVERITY[code],
@@ -1951,6 +2178,330 @@ class Analyzer:
                 return e["source_line"]
         return ""
 
+    # -- 刀具：T 预选 / M6 换刀 -------------------------------------------
+
+    def _stamp_tool_event(self, event: dict):
+        """程序包模式下给 T/M6 事件附来源程序与调用栈（单程序时无操作）。"""
+        blk = self.current_block
+        if blk is None:
+            return
+        event["source_program"] = blk.program
+        event["source_file"] = blk.file
+        event["source_line_no"] = blk.line.line_no
+        event["call_stack"] = [dict(f) for f in blk.call_stack]
+        event["depth"] = blk.depth
+        event["repeat_index"] = blk.repeat_index
+        event["repeat_total"] = blk.repeat_total
+
+    def _tool_path_bucket(self, t):
+        """当前刀号的路径/钻孔统计桶（未建立当前刀归到 "__none__"）。"""
+        key = t if t is not None else "__none__"
+        return self.tool_path.setdefault(key, {
+            "rapid": 0.0, "cutting": 0.0,
+            "cycle_rapid": 0.0, "cycle_cutting": 0.0,
+            "drill_depth": 0.0})
+
+    def _tool_words(self, pl: ParsedLine):
+        return [w for w in pl.words if w.letter == "T"]
+
+    def _apply_tool_words(self, pl: ParsedLine,
+                          issue_indexes: list[int]) -> bool:
+        """处理本行 T 词：T 只预选刀具（不换刀、不动刀具）。
+
+        - 同段多个 T 或 T 号非正整数 -> TOOL_NUMBER_INVALID，整段阻断；
+        - T 号允许未登记（预选本身不核对登记），登记与否记录在事件中，
+          待 M6 时再核对；
+        - 预选只改 state.selected_tool（不影响 current_tool），
+          成功时把预选事件暂存到 self._line_tool，由 _finish_line 落账，
+          整段阻断回滚后不留事件。
+        """
+        t_words = self._tool_words(pl)
+        if not t_words:
+            self._line_tool = {"preselect": None, "token": "",
+                               "bare": False}
+            return True
+        if len(t_words) > 1:
+            issue_indexes.append(self._issue(
+                "TOOL_NUMBER_INVALID", pl,
+                f"同一程序段给出 {len(t_words)} 个 T 刀号"
+                f"（{'/'.join('T' + fmt_num(w.value) for w in t_words)}），"
+                "一个程序段只能预选一把刀；该段阻断，预选状态保持",
+                {"reason": "multiple_t",
+                 "t_words": [fmt_num(w.value) for w in t_words]}))
+            return False
+        tw = t_words[0]
+        t_int = int(tw.value) if float(tw.value).is_integer() else None
+        if t_int is None or t_int <= 0:
+            issue_indexes.append(self._issue(
+                "TOOL_NUMBER_INVALID", pl,
+                f"T 刀号必须是正整数（如 T1），收到 T{fmt_num(tw.value)}；"
+                "该段阻断，预选状态保持",
+                {"reason": "t_not_positive_int", "t_raw": tw.value}))
+            return False
+        st = self.state
+        registered = self.cfg.tool_for(t_int) is not None
+        st.selected_tool = t_int
+        event = {
+            "kind": "preselect", "line_no": pl.line_no,
+            "source_line": pl.source, "t": t_int,
+            "registered": registered,
+            "current_t": st.current_tool,
+            "wcs": st.wcs,
+        }
+        self._stamp_tool_event(event)
+        self._line_tool = {"preselect": event, "token": f"T{t_int}",
+                           "bare": False}
+        return True
+
+    def _effective_spindle_on(self, m_words) -> bool:
+        """按本行 M3/M5（同行最后一个生效）计算换刀检查时的主轴状态。"""
+        on = self.state.spindle_on
+        for w in m_words:
+            key = g_code_key(w)
+            if key == "3":
+                on = True
+            elif key == "5":
+                on = False
+        return on
+
+    def _tool_change_position(self):
+        """计算当前主轴基准点机床坐标与到换刀点的偏差；返回
+        (point_machine, diffs) 或在坐标未知时返回 (None, None)。"""
+        st = self.state
+        off = self._current_offset()
+        if (off is None or not st.x.known or not st.y.known
+                or not st.z.known):
+            return None, None
+        machine = [st.x.value + off[0], st.y.value + off[1],
+                   st.z.value + off[2] + st.comp_signed]
+        cp = self.cfg.tool_change_point
+        tol = self.cfg.tool_change_tolerance
+        diffs = {}
+        for ax in TOOL_CHANGE_AXES:
+            diffs[ax] = {
+                "actual_mm": round6(machine[TOOL_CHANGE_AXES.index(ax)]),
+                "target_mm": cp[ax],
+                "tolerance_mm": tol.get(ax, 0.0),
+                "deviation_mm": round6(
+                    machine[TOOL_CHANGE_AXES.index(ax)] - cp[ax])}
+        return machine, diffs
+
+    def _apply_tool_change(self, pl: ParsedLine,
+                           issue_indexes: list[int]) -> bool:
+        """执行本行 M6 换刀的前置核对与换刀。
+
+        T 只预选，M6 才把预选刀设为当前刀。换刀前核对：
+        1. 含 M6 的程序段不得同时运动（G0-G3/G81-G83 或轴词）；
+        2. 预选刀存在且已登记；
+        3. 主轴已停止（同行 M5 可停，同行 M3 仍在转）；
+        4. 固定循环已取消（G80 或 G0-G3）；
+        5. 刀长补偿已取消（G49）、半径补偿已取消（G40 退出完成）；
+        6. 主轴基准点落在机床坐标系换刀点±容差内。
+        任一条件不足：登记问题、整段阻断并回滚，保持原刀与模态。
+        """
+        st = self.state
+        keys = [g_code_key(w) for w in pl.g_words]
+        motion_keys = [k for k in keys if k in MOTION_G]
+        cycle_keys = [k for k in keys if k in CYCLE_G]
+        axis_letters = [w.letter for w in pl.words
+                        if w.letter in ("X", "Y", "Z", "I", "J", "K", "R")]
+        # 条件 1：不得同时运动
+        if motion_keys or cycle_keys or axis_letters:
+            issue_indexes.append(self._issue(
+                "TOOL_CHANGE_WITH_MOTION", pl,
+                "含 M6 换刀的程序段不得同时给出运动（G0-G3/G81-G83）或"
+                "轴坐标/圆心词；换刀必须在单独程序段完成；该段阻断，"
+                "保持原刀与模态",
+                {"reason": "motion_on_same_block",
+                 "motion_g": ["G" + k for k in motion_keys],
+                 "cycle_g": ["G" + k for k in cycle_keys],
+                 "axis_words": axis_letters,
+                 "t": st.selected_tool, "current_t": st.current_tool}))
+
+        # 条件 2：预选刀存在且已登记
+        selected = st.selected_tool
+        if selected is None:
+            issue_indexes.append(self._issue(
+                "TOOL_CHANGE_UNREGISTERED", pl,
+                "M6 换刀前必须先用 Tn 预选刀具（T 只预选、M6 才换刀）；"
+                "当前没有预选刀；该段阻断，保持原刀与模态",
+                {"reason": "no_preselect", "t": None,
+                 "current_t": st.current_tool,
+                 "registered_tools": sorted(self.cfg.tools)}))
+        elif self.cfg.tool_for(selected) is None:
+            issue_indexes.append(self._issue(
+                "TOOL_CHANGE_UNREGISTERED", pl,
+                f"M6 预选刀 T{selected} 未在机床配置 tools 刀具表登记；"
+                "不得换入未登记刀具；该段阻断，保持原刀与模态",
+                {"reason": "tool_not_registered", "t": selected,
+                 "current_t": st.current_tool,
+                 "registered_tools": sorted(self.cfg.tools)}))
+
+        # 条件 3：主轴停止（按本行 M3/M5 生效后的状态）
+        if self._effective_spindle_on(pl.m_words):
+            issue_indexes.append(self._issue(
+                "TOOL_CHANGE_SPINDLE_ON", pl,
+                "M6 换刀时主轴必须处于停止状态（先 M5）；该段阻断，"
+                "保持原刀与模态",
+                {"reason": "spindle_running", "t": selected,
+                 "current_t": st.current_tool,
+                 "last_s_rpm": st.spindle_rpm,
+                 "spindle_on_after_block": True}))
+
+        # 条件 4：固定循环已取消（同行 G80 视为本程序段取消）
+        cycle_canceled_here = "80" in keys
+        if st.cycle is not None and not cycle_canceled_here:
+            issue_indexes.append(self._issue(
+                "TOOL_CHANGE_CYCLE_ACTIVE", pl,
+                f"固定循环 {st.cycle.cycle} 仍处于激活状态，M6 换刀前必须用 "
+                "G80（或 G0-G3）取消循环；该段阻断，保持原刀与模态",
+                {"reason": "canned_cycle_active", "t": selected,
+                 "current_t": st.current_tool,
+                 "active_cycle": st.cycle.cycle,
+                 "cycle_definition_line": st.cycle.def_line_no}))
+
+        # 条件 5a：刀长补偿已取消（同行 G49 在补偿检查时已生效）
+        if st.comp_direction is not None:
+            issue_indexes.append(self._issue(
+                "TOOL_CHANGE_LENGTH_COMP_ACTIVE", pl,
+                f"刀长补偿（{'G43' if st.comp_direction == 'plus' else 'G44'} "
+                f"H{st.comp_h}）仍生效，M6 换刀前必须用 G49 取消刀长补偿；"
+                "该段阻断，保持原刀与模态",
+                {"reason": "length_comp_active", "t": selected,
+                 "current_t": st.current_tool, "h": st.comp_h}))
+
+        # 条件 5b：半径补偿已取消（G40 必须已完成非零 G1 退出）
+        if st.cutter_phase != "inactive":
+            issue_indexes.append(self._issue(
+                "TOOL_CHANGE_CUTTER_COMP_ACTIVE", pl,
+                "刀具半径补偿尚未完全取消（当前状态 "
+                f"{st.cutter_phase}，D{st.cutter_d}），M6 换刀前必须用 G40 "
+                "并经非零平面内 G1 完成退出；该段阻断，保持原刀与模态",
+                {"reason": "cutter_comp_active", "t": selected,
+                 "current_t": st.current_tool,
+                 "phase": st.cutter_phase, "d": st.cutter_d}))
+
+        # 条件 6：主轴基准点落在换刀点容差内
+        if self.cfg.tool_change_point is None:
+            issue_indexes.append(self._issue(
+                "TOOL_CHANGE_POSITION_MISSING", pl,
+                "机床配置未提供 tool_change_point 换刀点与 "
+                "tool_change_tolerance 容差，无法核对换刀位置；该段阻断，"
+                "保持原刀与模态",
+                {"reason": "change_point_not_configured", "t": selected,
+                 "current_t": st.current_tool}))
+        else:
+            point, diffs = self._tool_change_position()
+            if point is None:
+                why = []
+                if st.wcs is None:
+                    why.append("工件坐标系（G54-G59）未建立")
+                elif self._current_offset() is None:
+                    why.append(f"坐标系 {st.wcs} 未配置偏置")
+                if not (st.x.known and st.y.known and st.z.known):
+                    why.append("主轴基准点位置未知（单位/定位模式不明或未建立）")
+                issue_indexes.append(self._issue(
+                    "TOOL_CHANGE_POSITION_UNKNOWN", pl,
+                    "无法确定换刀时的主轴基准点机床坐标："
+                    + "、".join(why) + "；该段阻断，保持原刀与模态",
+                    {"reason": "position_unknown", "t": selected,
+                     "current_t": st.current_tool, "why": why}))
+            else:
+                over = {ax: dd for ax, dd in diffs.items()
+                        if abs(dd["actual_mm"] - dd["target_mm"])
+                        > dd["tolerance_mm"] + MM_EPS}
+                if over:
+                    issue_indexes.append(self._issue(
+                        "TOOL_CHANGE_POSITION_OUT", pl,
+                        "主轴基准点未落在机床坐标系换刀点容差范围内："
+                        + "；".join(
+                            f"{ax.upper()} 实际 {fmt_num(dd['actual_mm'])} "
+                            f"vs 换刀点 {fmt_num(dd['target_mm'])} ±"
+                            f"{fmt_num(dd['tolerance_mm'])}（偏差 "
+                            f"{fmt_num(dd['deviation_mm'])}）"
+                            for ax, dd in over.items())
+                        + "；该段阻断，保持原刀与模态",
+                        {"reason": "position_out_of_tolerance", "t": selected,
+                         "current_t": st.current_tool,
+                         "spindle_point_machine_mm": [round6(v) for v in point],
+                         "change_point_mm": self.cfg.tool_change_point,
+                         "tolerance_mm": self.cfg.tool_change_tolerance,
+                         "axes_out": {ax: over[ax] for ax in over}}))
+
+        if issue_indexes:
+            return False
+
+        # 全部条件满足：把预选刀换为当前刀（预选清空）
+        old_tool = st.current_tool
+        st.current_tool = selected
+        st.selected_tool = None
+        entry = self.cfg.tool_for(selected)
+        event = {
+            "kind": "change", "line_no": pl.line_no,
+            "source_line": pl.source, "t": selected,
+            "registered": True,
+            "default_h": entry["h"], "default_d": entry["d"],
+            "previous_t": old_tool,
+            "wcs": st.wcs,
+            "spindle_point_machine_mm": list(
+                round6(v) for v in (self._tool_change_position()[0] or [])),
+            "change_point_mm": self.cfg.tool_change_point,
+            "tolerance_mm": self.cfg.tool_change_tolerance,
+        }
+        self._stamp_tool_event(event)
+        self.tool_change_events.append(event)
+        self.tool_changes_by_t[selected] = \
+            self.tool_changes_by_t.get(selected, 0) + 1
+        lt = self._line_tool or {"preselect": None, "token": "", "bare": False}
+        lt["change"] = event
+        self._line_tool = lt
+        return True
+
+    def _tool_check_cutting(self, pl: ParsedLine, motion_mode: str,
+                             segment: dict, issue_indexes: list[int],
+                             line_dedupe: bool = False):
+        """切削/钻孔前的刀具核对：
+        - 未建立当前刀便切削/钻孔 -> TOOL_NOT_CURRENT（仅在机床配置维护了
+          刀具表时核对，保持无刀具表配置的旧行为）；
+        - H（刀长补偿）或 D（半径补偿）与当前刀默认寄存器不一致 ->
+          TOOL_REGISTER_MISMATCH（仅提示，不自动替换）。
+        """
+        st = self.state
+        t = st.current_tool
+        if self.cfg.tools and t is None:
+            idx = self._issue(
+                "TOOL_NOT_CURRENT", pl,
+                f"{MOTION_CN.get(motion_mode, motion_mode)}"
+                "切削/钻孔发生时还没有建立当前刀具（需要先用 Tn 预选、"
+                "M6 换刀，或在机床配置 initial_tool 设置初始刀）",
+                {"reason": "no_current_tool"}, line_dedupe=line_dedupe)
+            issue_indexes.append(idx)
+            return
+        entry = self.cfg.tool_for(t)
+        if entry is None:
+            return
+        # H 一致性：刀长补偿生效中的 H 与该刀默认 H 不符
+        if st.comp_h is not None and st.comp_h != entry["h"]:
+            idx = self._issue(
+                "TOOL_REGISTER_MISMATCH", pl,
+                f"当前刀 T{t} 默认刀长寄存器为 H{entry['h']}，"
+                f"但程序生效的是 H{st.comp_h}；仅提示，不自动替换寄存器",
+                {"reason": "h_mismatch", "t": t, "active_h": st.comp_h,
+                 "default_h": entry["h"], "register": "H"},
+                line_dedupe=line_dedupe)
+            issue_indexes.append(idx)
+        # D 一致性：仅在半径补偿真正激活（active）时核对
+        if (st.cutter_phase == "active" and st.cutter_d is not None
+                and st.cutter_d != entry["d"]):
+            idx = self._issue(
+                "TOOL_REGISTER_MISMATCH", pl,
+                f"当前刀 T{t} 默认半径寄存器为 D{entry['d']}，"
+                f"但程序生效的是 D{st.cutter_d}；仅提示，不自动替换寄存器",
+                {"reason": "d_mismatch", "t": t, "active_d": st.cutter_d,
+                 "default_d": entry["d"], "register": "D"},
+                line_dedupe=line_dedupe)
+            issue_indexes.append(idx)
+
     def _comp_out(self):
         """当前刀长补偿（供轨迹输出）：未生效返回 None。"""
         if self.state.comp_direction is None:
@@ -1984,6 +2535,39 @@ class Analyzer:
         }
         if ev.get("cancels_h") is not None:
             out["cancels_h"] = ev["cancels_h"]
+        return out
+
+    def _tool_event_out(self, ev: dict) -> dict:
+        """T 预选 / M6 换刀事件输出（附刀具登记信息）。"""
+        t = ev.get("t")
+        entry = self.cfg.tool_for(t) if t is not None else None
+        out = {
+            "line_no": ev["line_no"],
+            "source_line": ev["source_line"],
+            "kind": ev["kind"],
+            "t": t,
+            "registered": ev.get("registered", entry is not None),
+            "wcs": ev.get("wcs"),
+        }
+        if ev["kind"] == "preselect":
+            out["current_t"] = ev.get("current_t")
+        else:
+            out["previous_t"] = ev.get("previous_t")
+            out["default_h"] = entry["h"] if entry else None
+            out["default_d"] = entry["d"] if entry else None
+            out["spindle_point_machine_mm"] = ev.get(
+                "spindle_point_machine_mm")
+            out["change_point_mm"] = ev.get("change_point_mm")
+            out["tolerance_mm"] = ev.get("tolerance_mm")
+        # 程序包模式：来源程序与调用栈随事件输出
+        if "source_program" in ev:
+            out["source_program"] = ev["source_program"]
+            out["source_file"] = ev.get("source_file")
+            out["source_line_no"] = ev.get("source_line_no")
+            out["call_stack"] = ev.get("call_stack")
+            out["depth"] = ev.get("depth")
+            out["repeat_index"] = ev.get("repeat_index")
+            out["repeat_total"] = ev.get("repeat_total")
         return out
 
     def _spindle_point(self, p, off=None, signed: float | None = None):
@@ -2122,8 +2706,9 @@ class Analyzer:
                     comp_token: str | None = None,
                     bare_h: str = "",
                     crc_token: str | None = None,
-                    bare_d: str = "") -> str:
-        """G(单位/模式/平面/WCS/刀补/运动) -> M -> XYZIJKR -> F S 的规范顺序。"""
+                    bare_d: str = "",
+                    t_token: str | None = None) -> str:
+        """G(单位/模式/平面/WCS/刀补/运动) -> M -> T -> XYZIJKR -> F S 的规范顺序。"""
         out: list[str] = []
         unit_g = next((g for g in applied_g if g in SETTING_G_UNIT), None)
         mode_g = next((g for g in applied_g if g in SETTING_G_MODE), None)
@@ -2145,6 +2730,8 @@ class Analyzer:
             out.append(f"G{motion_g}" + ("(模态)" if motion_is_modal else ""))
         for w in m_words:
             out.append("M" + fmt_num(w.value))
+        if t_token:
+            out.append(t_token)
         for letter, v in coord_words:
             out.append(f"{letter}{fmt_num(v)}")
         if f_val is not None:
@@ -2202,6 +2789,7 @@ class Analyzer:
         self._snap_in_return_default = self.state.pending_return_default
         self._line_comp = None
         self._line_cutter = None
+        self._line_tool = None
         self._snap_in_line_no = pl.line_no
         # 半径补偿回滚所需的行前状态（待连接段/路径累计/扫掠包围盒）
         self._snap_in_cutter_pending = self._cutter_pending
@@ -2276,6 +2864,18 @@ class Analyzer:
             )
             self._finish_line(pl, "blocked", normalized, executed=False,
                               block_reason="unsupported", issue_indexes=[idx])
+            self.blocked_count += 1
+            return
+
+        # 2.5) T 预选刀具的词法核对（同段多个 T / T 号非正整数 -> 整段阻断）。
+        # T 预选本身允许未登记刀具（登记与否记录在事件里），待 M6 再核对。
+        tool_issue_indexes: list[int] = []
+        if not self._apply_tool_words(pl, tool_issue_indexes):
+            self._rollback_to(self._snap_in)
+            normalized = self._blocked_normalized(pl)
+            self._finish_line(pl, "blocked", normalized, executed=False,
+                              block_reason="tool_number",
+                              issue_indexes=tool_issue_indexes)
             self.blocked_count += 1
             return
 
@@ -2356,6 +2956,34 @@ class Analyzer:
             self.blocked_count += 1
             return
         crc_token = (self._line_cutter or {}).get("token")
+
+        # 3.7) M6 换刀：把 T 预选刀换为当前刀。换刀前核对刀具登记、主轴
+        # 停止、固定循环/刀长/半径补偿已取消、主轴基准点落在换刀容差内；
+        # 含 M6 的程序段不得同时运动。条件不足整段阻断并回滚，保持原刀。
+        m6_words = [w for w in m_words if g_code_key(w) == TOOL_CHANGE_M]
+        if m6_words:
+            m6_issue_indexes: list[int] = []
+            # 即便 M6 重复也继续做全部换刀核对，最后统一阻断
+            ok_change = self._apply_tool_change(pl, m6_issue_indexes)
+            if len(m6_words) > 1:
+                m6_issue_indexes.append(self._issue(
+                    "TOOL_CHANGE_WITH_MOTION", pl,
+                    f"同一程序段出现 {len(m6_words)} 个 M6，换刀指令只能给一个；"
+                    "该段阻断，保持原刀与模态",
+                    {"reason": "multiple_m6",
+                     "t": self.state.selected_tool,
+                     "current_t": self.state.current_tool}))
+                ok_change = False
+            if not ok_change:
+                issue_indexes.extend(m6_issue_indexes)
+                self._rollback_to(self._snap_in)
+                normalized = self._blocked_normalized(pl)
+                self._finish_line(pl, "blocked", normalized, executed=False,
+                                  block_reason="tool_change",
+                                  issue_indexes=issue_indexes)
+                self.blocked_count += 1
+                return
+            issue_indexes.extend(m6_issue_indexes)
 
         # 分类本行 G 词（G80-G83、G98/G99 为固定循环组，G0-G3 为运动组）
         keys = [g_code_key(w) for w in g_words]
@@ -2544,19 +3172,23 @@ class Analyzer:
             and self.state.motion_mode in ("arc_cw", "arc_ccw")
             and (ijk_words or r_word is not None))
         if not axis_words and not arc_no_endpoint:
+            t_token = (self._line_tool or {}).get("token") or None
             normalized = self._normalized(
                 applied_g, m_words, line_motion_key, coord_words, f_raw, s_raw,
                 comp_token=comp_token,
                 crc_token=crc_token,
                 bare_h=(self._line_comp or {}).get("bare_h", ""),
-                bare_d=(self._line_cutter or {}).get("bare_d", ""))
+                bare_d=(self._line_cutter or {}).get("bare_d", ""),
+                t_token=t_token)
             if "80" in keys:
                 normalized = (normalized + " " if normalized else "") + "G80(取消循环)"
             if line_return_key is not None:
                 normalized = (normalized + " " if normalized else "") + (
                     f"G{line_return_key}(返回{RETURN_CN[RETURN_G[line_return_key]]})")
             crc_ev = (self._line_cutter or {}).get("event")
-            if crc_ev is not None and crc_ev["code"] in ("G41", "G42"):
+            if (self._line_tool or {}).get("change") is not None:
+                entry_type = "tool_change"
+            elif crc_ev is not None and crc_ev["code"] in ("G41", "G42"):
                 entry_type = "cutter_compensation"
             elif crc_ev is not None and crc_ev["code"] == "G40":
                 entry_type = "cutter_compensation"
@@ -2570,12 +3202,14 @@ class Analyzer:
 
         # 有轴坐标词但没有任何运动模态 -> 不猜测运动
         if self.state.motion_mode is None:
+            t_token = (self._line_tool or {}).get("token") or None
             normalized = self._normalized(
                 applied_g, m_words, None, coord_words, f_raw, s_raw,
                 comp_token=comp_token,
                 crc_token=crc_token,
                 bare_h=(self._line_comp or {}).get("bare_h", ""),
-                bare_d=(self._line_cutter or {}).get("bare_d", ""))
+                bare_d=(self._line_cutter or {}).get("bare_d", ""),
+                t_token=t_token)
             issue_indexes.append(self._issue(
                 "NO_MOTION_MODE", pl,
                 "出现轴坐标词，但本行与此前都没有 G0-G3；不猜测运动，"
@@ -2657,6 +3291,7 @@ class Analyzer:
                                       issue_indexes=issue_indexes)
                     self.blocked_count += 1
                     return
+                arc["t"] = self.state.current_tool
                 segment = arc
             else:
                 length = _dist3(start_pt, end_pt)
@@ -2668,6 +3303,7 @@ class Analyzer:
                     "end": end_pt,
                     "points": [start_pt, end_pt],
                     "length_mm": length,
+                    "t": self.state.current_tool,
                 }
             segment["_line_no"] = pl.line_no
 
@@ -2699,7 +3335,8 @@ class Analyzer:
             comp_token=comp_token,
             crc_token=crc_token,
             bare_h=(self._line_comp or {}).get("bare_h", ""),
-            bare_d=(self._line_cutter or {}).get("bare_d", ""))
+            bare_d=(self._line_cutter or {}).get("bare_d", ""),
+            t_token=((self._line_tool or {}).get("token") or None))
         self._finish_line(
             pl, motion_mode, normalized, executed=True,
             segment=self._segment_out(segment),
@@ -2825,6 +3462,7 @@ class Analyzer:
 
         lc = snapshot.get("tool_length_compensation", {})
         rc = snapshot.get("tool_radius_compensation", {})
+        ts = snapshot.get("tool", {})
         s = State(
             unit=snapshot["unit"],
             distance_mode=snapshot["distance_mode"],
@@ -2852,6 +3490,8 @@ class Analyzer:
             cutter_plane=rc.get("plane"),
             cutter_apply_line=rc.get("applied_line_no"),
             cutter_cancel_line=rc.get("cancel_line_no"),
+            current_tool=ts.get("current_t"),
+            selected_tool=ts.get("selected_t"),
         )
         self.state = s
         # 撤销本行登记的刀长补偿事件（圆弧无解回滚 / 补偿段阻断时）
@@ -2864,6 +3504,16 @@ class Analyzer:
                 and self.cutter_events[-1].get(
                     "line_no") == self._snap_in_line_no:
             self.cutter_events.pop()
+        # 撤销本行的 T 预选 / M6 换刀事件（整段阻断不留刀具轨迹）
+        for store in (self.tool_preselect_events, self.tool_change_events):
+            if (self._snap_in_line_no is not None and store
+                    and store[-1].get("line_no") == self._snap_in_line_no):
+                ev = store.pop()
+                if ev.get("kind") == "change" and ev.get("t") is not None:
+                    cnt = self.tool_changes_by_t.get(ev["t"], 0)
+                    if cnt > 0:
+                        self.tool_changes_by_t[ev["t"]] = cnt - 1
+        self._line_tool = None
         # 恢复本行待连接偏置段（join 失败/圆弧半径非正回滚时）
         self._cutter_pending = self._snap_in_cutter_pending
         # 回滚后刀心路径累计与扫掠包围盒恢复到行前
@@ -3156,11 +3806,22 @@ class Analyzer:
             lc["tip_adjusted"] = False
 
         # 展开孔位（即便阻断也登记孔记录，写明依据；阻断不产生位移）。
+        drilled_before = self.hole_ok
+        blocked_before = self.hole_blocked
+        # 本行触发孔归属的当前刀（阻断孔也记录，便于按 T 筛选）
+        hole_t = self.state.current_tool
         # 工艺问题（主轴未转/无进给）在 _issue 层按触发行去重，
         # G83 多次进给动作不会重复报告。
         holes_info = self._expand_trigger_holes(
             pl, cd, reps, axis_words, blocked, block_codes, issue_indexes,
             normalized, l_word, do_holes=trigger)
+        drilled_delta = self.hole_ok - drilled_before
+        blocked_delta = self.hole_blocked - blocked_before
+        th = self.tool_holes.setdefault(
+            hole_t if hole_t is not None else "__none__",
+            {"drilled": 0, "blocked": 0})
+        th["drilled"] += drilled_delta
+        th["blocked"] += blocked_delta
 
         entry_type = "setting"
         if trigger:
@@ -3239,6 +3900,7 @@ class Analyzer:
                 "trigger_source_line": pl.source,
                 "definition_line_no": cd.def_line_no,
                 "wcs": self.state.wcs,
+                "t": self.state.current_tool,
                 "h": self.state.comp_h,
                 "tool_compensation": self._comp_out(),
                 "x_mm": round6(tgt_xy[0]) if not blocked else None,
@@ -3272,6 +3934,11 @@ class Analyzer:
             entry_z = last_z
             hole_moves: list[dict] = []
             pos_len = 0.0
+            # 钻孔前刀具核对（未建立当前刀 / H、D 与默认寄存器不一致）
+            drill_seg = {"start": (tgt_xy[0], tgt_xy[1], entry_z),
+                         "end": (tgt_xy[0], tgt_xy[1], cd.z.value)}
+            self._tool_check_cutting(pl, "linear", drill_seg, issue_indexes,
+                                     line_dedupe=True)
             if last_xy is not None:
                 pm = positioning_move(last_xy, (tgt_xy[0], tgt_xy[1]), entry_z)
                 pm["hole_no"] = no
@@ -3349,12 +4016,18 @@ class Analyzer:
             hb["cycle_rapid"] += rapid_len
             hb["cycle_cutting"] += cut_len
             hb["drill_depth"] += depth_sum
+            # 按当前刀号统计展开路径与钻孔数
+            tb = self._tool_path_bucket(self.state.current_tool)
+            tb["cycle_rapid"] += rapid_len
+            tb["cycle_cutting"] += cut_len
+            tb["drill_depth"] += depth_sum
 
         # 循环段与每个展开动作都记录坐标系、偏置、刀长补偿 H 与
         # 主轴基准点机床坐标（Z 已叠加刀长补偿）
         wcs_off = self._current_offset()
         comp_signed = self.state.comp_signed
         for mv in all_moves:
+            mv["t"] = self.state.current_tool
             mv["h"] = self.state.comp_h
             mv["tool_compensation"] = self._comp_out()
             mv["start_machine_mm"] = self._spindle_out(
@@ -3368,6 +4041,7 @@ class Analyzer:
             "wcs": self.state.wcs,
             "wcs_configured": wcs_off is not None,
             "offset_mm": self._offset_out(wcs_off),
+            "t": self.state.current_tool,
             "h": self.state.comp_h,
             "tool_compensation": self._comp_out(),
             "comp_start_signed_mm": (self._line_comp or {}).get(
@@ -3520,7 +4194,7 @@ class Analyzer:
         if not cd.return_mode_default:
             out.append(ret_g)
         for w in pl.words:
-            if w.letter in ("N", "G", "H"):
+            if w.letter in ("N", "G", "H", "T"):
                 continue
             if w.letter in ("X", "Y", "Z", "R", "Q", "P", "L", "F", "S"):
                 out.append(f"{w.letter}{fmt_num(w.value)}")
@@ -3530,6 +4204,10 @@ class Analyzer:
             out.append(f"{bare_h}(无 G43/G44，不生效)")
         for w in pl.m_words:
             out.append("M" + fmt_num(w.value))
+        t_token = (self._line_tool or {}).get("token")
+        if t_token:
+            out.append(t_token + ("(预选)" if (self._line_tool or {})
+                                   .get("preselect") else ""))
         # 继承参数标注
         inherited = []
         if cd.z is not None and cd.z.line_no != pl.line_no:
@@ -3826,6 +4504,11 @@ class Analyzer:
                               "horizontal_travel_below_safe_z": horiz_below})))
 
         if motion_mode in ("linear", "arc_cw", "arc_ccw"):
+            # 切削前刀具核对：未建立当前刀（配置维护了刀具表时）、H/D 与
+            # 当前刀默认寄存器不一致（仅提示，不自动替换）
+            self._tool_check_cutting(
+                pl, motion_mode, segment, issue_indexes,
+                line_dedupe=line_dedupe)
             if not self.state.spindle_on:
                 idx = self._issue(
                     "SPINDLE_NOT_RUNNING", pl,
@@ -3872,15 +4555,18 @@ class Analyzer:
         length = segment["length_mm"]
         st = self._wcs_path_stat()
         hb = self._comp_path_bucket()
+        tb = self._tool_path_bucket(self.state.current_tool)
         if length is not None:
             if motion_mode == "rapid":
                 self.length_rapid += length
                 hb["rapid"] += length
+                tb["rapid"] += length
                 if st is not None:
                     st["rapid"] += length
             else:
                 self.length_cutting += length
                 hb["cutting"] += length
+                tb["cutting"] += length
                 if st is not None:
                     st["cutting"] += length
         arc = segment.get("arc")
@@ -3945,6 +4631,17 @@ class Analyzer:
                 **({"cancels_d": crc_ev["cancels_d"]}
                    if "cancels_d" in crc_ev else {}),
             }
+        # 刀具预选（T）/换刀（M6）事件：成功执行的行才落账
+        lt = self._line_tool or {}
+        pre_ev = lt.get("preselect")
+        if pre_ev is not None:
+            self.tool_preselect_events.append(pre_ev)
+            entry["tool_preselect_event"] = self._tool_event_out(pre_ev)
+        ch_ev = lt.get("change")
+        if ch_ev is not None:
+            entry["tool_change_event"] = self._tool_event_out(ch_ev)
+        entry["current_t"] = self.state.current_tool
+        entry["selected_t"] = self.state.selected_tool
         if issue_indexes:
             entry["issue_codes"] = [self.issues[i].code for i in issue_indexes]
         self._annotate_entry(entry, self.current_block)
@@ -3973,6 +4670,7 @@ class Analyzer:
             "wcs": self.state.wcs,
             "wcs_configured": off is not None,
             "offset_mm": self._offset_out(off),
+            "t": segment.get("t", self.state.current_tool),
             "h": segment.get("h", self.state.comp_h),
             "tool_compensation": segment.get("tool_compensation",
                                              self._comp_out()),
@@ -4372,6 +5070,103 @@ class Analyzer:
                                     "CUTTER_COMP_DISCONTINUOUS")},
         }
 
+    def _tools_out(self) -> dict:
+        """换刀分析汇总：刀具登记表、初始刀、换刀点/容差、T 预选与 M6 换刀
+        事件流，以及按刀具的切削长度、钻孔数、换刀次数与问题数。"""
+        issue_by_t: dict = {}
+        for iss in self.issues:
+            tv = iss.details.get("t")
+            key = tv if tv is not None else "__none__"
+            issue_by_t[key] = issue_by_t.get(key, 0) + 1
+
+        def bucket_for(key):
+            b = self.tool_path.get(
+                key, {"rapid": 0.0, "cutting": 0.0,
+                      "cycle_rapid": 0.0, "cycle_cutting": 0.0,
+                      "drill_depth": 0.0})
+            hd = self.tool_holes.get(key, {"drilled": 0, "blocked": 0})
+            return {
+                "path_length_mm": {
+                    "rapid": round(b["rapid"], 6),
+                    "cutting": round(b["cutting"], 6),
+                    "total": round(b["rapid"] + b["cutting"], 6),
+                    "canned_cycle_rapid": round(b["cycle_rapid"], 6),
+                    "canned_cycle_cutting": round(b["cycle_cutting"], 6),
+                    "cutting_incl_cycles": round(
+                        b["cutting"] + b["cycle_cutting"], 6),
+                    "all_total": round(
+                        b["rapid"] + b["cutting"] + b["cycle_rapid"]
+                        + b["cycle_cutting"], 6),
+                },
+                "holes_drilled": hd["drilled"],
+                "holes_blocked": hd["blocked"],
+                "total_drill_depth_mm": round(b.get("drill_depth", 0.0), 6),
+                "tool_changes": (self.tool_changes_by_t.get(key, 0)
+                                 if isinstance(key, int) else 0),
+                "issues": issue_by_t.get(key, 0),
+            }
+
+        # 已使用刀具（有路径/孔/事件的登记或未登记刀号）
+        used_ts = sorted(
+            {t for t in self.tool_path if isinstance(t, int)}
+            | {t for t in self.tool_holes if isinstance(t, int)}
+            | set(self.tool_changes_by_t)
+            | {ev["t"] for ev in self.tool_preselect_events
+               if ev.get("t") is not None})
+        by_t = {}
+        for t in used_ts:
+            entry = self.cfg.tool_for(t)
+            row = dict(bucket_for(t), t=t, registered=entry is not None)
+            if entry is not None:
+                row["default_h"] = entry["h"]
+                row["default_d"] = entry["d"]
+                if "name" in entry:
+                    row["name"] = entry["name"]
+            by_t[f"T{t}"] = row
+        no_tool = bucket_for("__none__")
+        events = []
+        for ev in self.tool_preselect_events:
+            events.append(self._tool_event_out(ev))
+        for ev in self.tool_change_events:
+            events.append(self._tool_event_out(ev))
+        events.sort(key=lambda e: (e["line_no"], 0 if e["kind"] == "preselect"
+                                   else 1))
+        change_codes = ("TOOL_NUMBER_INVALID", "TOOL_CHANGE_WITH_MOTION",
+                        "TOOL_CHANGE_UNREGISTERED", "TOOL_CHANGE_SPINDLE_ON",
+                        "TOOL_CHANGE_CYCLE_ACTIVE",
+                        "TOOL_CHANGE_LENGTH_COMP_ACTIVE",
+                        "TOOL_CHANGE_CUTTER_COMP_ACTIVE",
+                        "TOOL_CHANGE_POSITION_UNKNOWN",
+                        "TOOL_CHANGE_POSITION_MISSING",
+                        "TOOL_CHANGE_POSITION_OUT",
+                        "TOOL_NOT_CURRENT", "TOOL_REGISTER_MISMATCH")
+        return {
+            "supported": {
+                "T": "预选刀具（只预选不换刀、不动刀具），刀号为正整数",
+                "M6": "换刀：把 T 预选刀换为当前刀；含 M6 的程序段不得同时"
+                      "运动；换刀前刀具须登记、主轴须停止、固定循环与刀长/"
+                      "半径补偿须已取消、主轴基准点须落在换刀点容差内",
+            },
+            "initial_tool": self.cfg.initial_tool,
+            "change_point_machine_mm": self.cfg.tool_change_point,
+            "change_tolerance_mm": (self.cfg.tool_change_tolerance
+                                    if self.cfg.tool_change_point is not None
+                                    else None),
+            "tools_registered": {
+                f"T{t}": {k: v for k, v in entry.items()}
+                for t, entry in sorted(self.cfg.tools.items())},
+            "events": events,
+            "preselect_events": [self._tool_event_out(e)
+                                 for e in self.tool_preselect_events],
+            "change_events": [self._tool_event_out(e)
+                              for e in self.tool_change_events],
+            "by_t": by_t,
+            "without_current_tool": no_tool,
+            "tool_change_count": len(self.tool_change_events),
+            "issues": {c: sum(1 for i in self.issues if i.code == c)
+                       for c in change_codes},
+        }
+
     def _build_report(self, physical_lines: int) -> dict:
         counts = {s: 0 for s in SEVERITY_ORDER}
         for iss in self.issues:
@@ -4401,6 +5196,7 @@ class Analyzer:
             "wcs": self._wcs_out(),
             "length_compensation": self._length_comp_out(),
             "cutter_compensation": self._cutter_comp_section_out(),
+            "tools": self._tools_out(),
             "bbox_program_mm": self._bbox_out(self.bmin, self.bmax),
             "bbox_machine_mm": (
                 self._bbox_out(self.mbmin, self.mbmax)
@@ -4483,6 +5279,20 @@ class Analyzer:
                     "原行报告；报告可按 d=D1 筛选，对比列出偏置路径与扫掠"
                     "包围盒变化"),
                 "feed": "F 按出现时的单位换算为 mm/min 后模态保持",
+                "tool_change": (
+                    "刀具：机床配置 tools 维护刀号及其默认 H/D 寄存器，"
+                    "initial_tool 给出开机已换入的初始刀，tool_change_point/"
+                    "tool_change_tolerance 给出机床坐标系换刀点与各轴容差。"
+                    "T 只预选刀具（不换刀、不动刀具，可与运动同段），M6 才把"
+                    "预选刀设为当前刀；含 M6 的程序段不得同时运动。执行 M6 前"
+                    "核对：预选刀已登记、主轴已停止（同行 M5 可停、同行 M3 仍"
+                    "阻断）、固定循环已取消（G80/G0-G3）、刀长补偿已 G49、"
+                    "半径补偿已 G40 并完成退出、主轴基准点机床坐标落在换刀点"
+                    "±容差内；条件不足时定位原行整段阻断并回滚，保持原刀与"
+                    "模态。配置维护了刀具表时，未建立当前刀便切削/钻孔报 "
+                    "TOOL_NOT_CURRENT；直线/圆弧/螺旋/钻孔记录当前 T，"
+                    "生效的 H 或 D 与该刀默认寄存器不一致时报 "
+                    "TOOL_REGISTER_MISMATCH（仅提示，不自动替换）。"),
                 "canned_cycle": (
                     "G81/G82/G83 为模态固定循环，G80 或 G0-G3 取消；"
                     "Z/R/Q/P 模态继承，L 为孔位重复次数（默认 1，正整数）；"
@@ -4671,7 +5481,50 @@ DIALECT = {
                          "对比结果列出 D 半径表变化、各 D 偏置路径/切入退出/"
                          "问题与刀具扫掠包围盒变化",
     },
-    "supported_m": {"M3": "主轴正转", "M5": "主轴停止"},
+    "tool_change": {
+        "T": "预选刀具：只预选（刀库转到该刀位），不换刀、不移动刀具，"
+             "可与运动同段；刀号必须为正整数，同段只允许一个 T",
+        "M6": "自动换刀：把最近一次 T 预选的刀换为当前刀；含 M6 的程序段"
+              "不得同时运动（不得带 G0-G3/G81-G83 或轴/圆心词）",
+        "tool_table": "机床配置 tools 维护刀号及默认 H/D 寄存器，如 "
+                      '{"1": {"h": 1, "d": 1}, "2": {"h": 2, "d": 2}}；'
+                      "initial_tool 给出开机已在主轴上的初始刀；未登记的刀号 "
+                      "M6 不得换入（T 预选阶段只标记 registered=false）",
+        "change_point": "tool_change_point 为机床坐标系换刀点 "
+                        '{"x":..,"y":..,"z":..}，tool_change_tolerance 为各轴 '
+                        "±容差（mm）；M6 时主轴基准点（工件偏置+刀长补偿后的"
+                        "机床坐标）三轴均落在容差内才允许换刀",
+        "m6_preconditions": [
+            "含 M6 的程序段不得同时运动 -> TOOL_CHANGE_WITH_MOTION",
+            "已用 Tn 预选且 Tn 在 tools 表登记 -> 否则 "
+            "TOOL_CHANGE_UNREGISTERED",
+            "主轴已停止（先 M5；M6 M3 仍判在转）-> 否则 "
+            "TOOL_CHANGE_SPINDLE_ON",
+            "固定循环已 G80/G0-G3 取消 -> 否则 TOOL_CHANGE_CYCLE_ACTIVE",
+            "刀长补偿已 G49 -> 否则 TOOL_CHANGE_LENGTH_COMP_ACTIVE",
+            "半径补偿已 G40 并经非零 G1 退出 -> 否则 "
+            "TOOL_CHANGE_CUTTER_COMP_ACTIVE",
+            "换刀点/容差已配置且主轴基准点机床坐标已知 -> 否则 "
+            "TOOL_CHANGE_POSITION_MISSING / TOOL_CHANGE_POSITION_UNKNOWN",
+            "主轴基准点三轴均在换刀点±容差内 -> 否则 "
+            "TOOL_CHANGE_POSITION_OUT",
+        ],
+        "fail_policy": "任一条件不足：定位 M6 原行整段阻断并回滚本行全部"
+                       "模态改动，保持原刀（current_tool 不变）与预选/补偿/"
+                       "循环模态；T 号本身非法（T0/同段多个 T）-> "
+                       "TOOL_NUMBER_INVALID，同样整段阻断",
+        "cutting_checks": "配置维护了 tools 刀具表时，未建立当前刀便"
+                          "（G1/G2/G3）切削或钻孔报 TOOL_NOT_CURRENT；"
+                          "后续直线、圆弧、螺旋与钻孔记录当前 T；当前刀生效"
+                          "的 H（刀长补偿）或 D（半径补偿激活时）与该刀默认"
+                          "寄存器不一致报 TOOL_REGISTER_MISMATCH（warning，"
+                          "仅提示，不自动替换程序寄存器）",
+        "report": "报告 tools 节含刀具表、初始刀、换刀点/容差、T 预选与 M6 "
+                  "换入事件流、按 T 的切削长度/钻孔数/换刀次数/问题汇总；"
+                  "可按 t=T1,T2 筛选；程序包事件另带来源程序与调用栈",
+    },
+    "supported_m": {"M3": "主轴正转", "M5": "主轴停止",
+                    "M6": "换刀（把 T 预选刀设为当前刀；不得同段运动）"},
     "package_flow_m": {
         "O": "子程序号行（仅程序包模式 POST /api/packages）",
         "M98": "调用子程序：P 子程序号、L 重复次数（仅程序包模式）",
@@ -4683,6 +5536,7 @@ DIALECT = {
                     "中支持；单独提交给 /api/analyze、/api/jobs 时仍按未支持"
                     "指令处理。变量/宏表达式（#、[]）在任何模式下均不支持。",
     "supported_words": ["X", "Y", "Z", "I", "J", "K", "R", "F", "S", "N(忽略)",
+                        "T(刀号，预选刀具，M6 换入)",
                         "H(刀长补偿寄存器号，随 G43/G44 生效)",
                         "D(半径补偿寄存器号，随 G41/G42 生效)",
                         "Q(固定循环步进)", "P(固定循环暂停)",
@@ -4695,9 +5549,8 @@ DIALECT = {
         "G28/G30 回零",
         "G54.1 附加工件坐标系",
         "G84-G89 其他固定循环（仅支持 G80-G83）",
-        "M2/M30 程序结束（仅程序包模式支持）", "M4 反转", "M6 换刀",
+        "M2/M30 程序结束（仅程序包模式支持）", "M4 反转",
         "M7-M9 冷却",
-        "T 刀号",
     ],
     "severity_levels": SEVERITY_ORDER,
 }

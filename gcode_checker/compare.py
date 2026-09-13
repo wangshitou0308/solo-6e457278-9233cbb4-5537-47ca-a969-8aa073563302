@@ -20,7 +20,7 @@ def _fingerprint(issue: dict) -> tuple:
     key = ["axis", "unsupported_tokens", "malformed_tokens", "reason",
            "below_mm", "overshoot_mm", "exceed_mm_per_min", "exceed_rpm",
            "cycle", "hole_no", "missing", "bad", "unknown", "plane", "wcs",
-           "h", "d", "checked_path"]
+           "h", "d", "t", "checked_path", "register"]
     detail_fp = tuple((k, str(d.get(k))) for k in key if k in d)
     return (issue["code"], issue.get("normalized", ""), detail_fp)
 
@@ -287,6 +287,10 @@ def compare_reports(baseline: dict, candidate: dict,
     cutter_compare = _cutter_comp_compare(
         baseline, candidate, resolved, introduced)
 
+    # 换刀分析（T 预选 / M6 换刀 + tools 刀具表）：各刀具的切削长度、
+    # 钻孔数、换刀次数与问题的两侧值与变化
+    tool_compare = _tool_compare(baseline, candidate, resolved, introduced)
+
     return {
         "labels": {"baseline": baseline_label, "candidate": candidate_label},
         "machine": candidate["machine"],
@@ -295,6 +299,7 @@ def compare_reports(baseline: dict, candidate: dict,
         "wcs": wcs_compare,
         "length_compensation": length_compare,
         "cutter_compensation": cutter_compare,
+        "tools": tool_compare,
         "risk": {
             "baseline": baseline["risk"],
             "candidate": candidate["risk"],
@@ -691,5 +696,172 @@ def _cutter_comp_compare(baseline: dict, candidate: dict,
             "candidate": sb.get("center_path_total_mm", 0.0),
             "delta": round(sb.get("center_path_total_mm", 0.0)
                            - sa.get("center_path_total_mm", 0.0), 6)},
+        "block_issue_counts": block_counts,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 换刀分析（T 预选 / M6 换刀 + tools 刀具表）对比
+# ---------------------------------------------------------------------------
+
+TOOL_CHANGE_CODES = ("TOOL_NUMBER_INVALID", "TOOL_CHANGE_WITH_MOTION",
+                     "TOOL_CHANGE_UNREGISTERED", "TOOL_CHANGE_SPINDLE_ON",
+                     "TOOL_CHANGE_CYCLE_ACTIVE",
+                     "TOOL_CHANGE_LENGTH_COMP_ACTIVE",
+                     "TOOL_CHANGE_CUTTER_COMP_ACTIVE",
+                     "TOOL_CHANGE_POSITION_UNKNOWN",
+                     "TOOL_CHANGE_POSITION_MISSING",
+                     "TOOL_CHANGE_POSITION_OUT",
+                     "TOOL_NOT_CURRENT", "TOOL_REGISTER_MISMATCH")
+
+
+def _tool_section(report: dict) -> dict:
+    return report.get("tools", {})
+
+
+def _t_of(issue: dict):
+    return issue.get("details", {}).get("t")
+
+
+def _tool_compare(baseline: dict, candidate: dict,
+                  resolved: list, introduced: list) -> dict:
+    """换刀分析对比：刀具表/初始刀/换刀点差异，按 T 的切削长度、钻孔数、
+    换刀次数与问题的两侧值和变化。"""
+    ta, tb = _tool_section(baseline), _tool_section(candidate)
+    ma, mb = baseline.get("machine", {}), candidate.get("machine", {})
+    config_changes = []
+    if ma.get("tools") != mb.get("tools"):
+        config_changes.append("tools")
+    if ma.get("initial_tool") != mb.get("initial_tool"):
+        config_changes.append("initial_tool")
+    if ma.get("tool_change_point") != mb.get("tool_change_point"):
+        config_changes.append("tool_change_point")
+    if ma.get("tool_change_tolerance") != mb.get("tool_change_tolerance"):
+        config_changes.append("tool_change_tolerance")
+
+    def events(sec, kind=None):
+        return [e for e in sec.get("events", [])
+                if kind is None or e.get("kind") == kind]
+
+    def event_counts(sec):
+        return {"preselect": len(events(sec, "preselect")),
+                "change": len(events(sec, "change"))}
+
+    ea, eb = event_counts(ta), event_counts(tb)
+    by_t_a, by_t_b = ta.get("by_t", {}), tb.get("by_t", {})
+    ia = Counter(_t_of(i) for i in baseline["issues"] if _t_of(i) is not None)
+    ib = Counter(_t_of(i) for i in candidate["issues"] if _t_of(i) is not None)
+    res_t = Counter(_t_of(i) for i in resolved if _t_of(i) is not None)
+    int_t = Counter(_t_of(i) for i in introduced if _t_of(i) is not None)
+
+    def _t_key(label):
+        return int(label[1:]) if label.startswith("T") and label[1:].isdigit() \
+            else 0
+
+    by_t = {}
+    for label in sorted(set(by_t_a) | set(by_t_b), key=_t_key):
+        a, b = by_t_a.get(label, {}), by_t_b.get(label, {})
+        tno = a.get("t") if a.get("t") is not None else b.get("t")
+        pa, pb = (a.get("path_length_mm", {}),
+                  b.get("path_length_mm", {}))
+        da = a.get("total_drill_depth_mm", 0.0)
+        db_ = b.get("total_drill_depth_mm", 0.0)
+        by_t[label] = {
+            "t": tno,
+            "registered_baseline": a.get("registered"),
+            "registered_candidate": b.get("registered"),
+            "default_h_baseline": a.get("default_h"),
+            "default_h_candidate": b.get("default_h"),
+            "default_d_baseline": a.get("default_d"),
+            "default_d_candidate": b.get("default_d"),
+            "baseline_path_mm": {
+                "rapid": pa.get("rapid", 0.0),
+                "cutting": pa.get("cutting", 0.0),
+                "total": pa.get("total", 0.0),
+                "canned_cycle_rapid": pa.get("canned_cycle_rapid", 0.0),
+                "canned_cycle_cutting": pa.get("canned_cycle_cutting", 0.0),
+                "cutting_incl_cycles": pa.get(
+                    "cutting_incl_cycles",
+                    pa.get("cutting", 0.0)
+                    + pa.get("canned_cycle_cutting", 0.0)),
+                "all_total": pa.get(
+                    "all_total",
+                    pa.get("total", 0.0)
+                    + pa.get("canned_cycle_rapid", 0.0)
+                    + pa.get("canned_cycle_cutting", 0.0))},
+            "candidate_path_mm": {
+                "rapid": pb.get("rapid", 0.0),
+                "cutting": pb.get("cutting", 0.0),
+                "total": pb.get("total", 0.0),
+                "canned_cycle_rapid": pb.get("canned_cycle_rapid", 0.0),
+                "canned_cycle_cutting": pb.get("canned_cycle_cutting", 0.0),
+                "cutting_incl_cycles": pb.get(
+                    "cutting_incl_cycles",
+                    pb.get("cutting", 0.0)
+                    + pb.get("canned_cycle_cutting", 0.0)),
+                "all_total": pb.get(
+                    "all_total",
+                    pb.get("total", 0.0)
+                    + pb.get("canned_cycle_rapid", 0.0)
+                    + pb.get("canned_cycle_cutting", 0.0))},
+            "delta_path_total_mm": round(
+                pb.get("total", 0.0) - pa.get("total", 0.0), 6),
+            "delta_cutting_path_mm": round(
+                pb.get("cutting", 0.0) - pa.get("cutting", 0.0), 6),
+            "delta_cutting_incl_cycles_mm": round(
+                (pb.get("cutting_incl_cycles",
+                        pb.get("cutting", 0.0)
+                        + pb.get("canned_cycle_cutting", 0.0)))
+                - (pa.get("cutting_incl_cycles",
+                          pa.get("cutting", 0.0)
+                          + pa.get("canned_cycle_cutting", 0.0))), 6),
+            "baseline_holes": a.get("holes_drilled", 0),
+            "candidate_holes": b.get("holes_drilled", 0),
+            "delta_holes": (b.get("holes_drilled", 0)
+                            - a.get("holes_drilled", 0)),
+            "baseline_holes_blocked": a.get("holes_blocked", 0),
+            "candidate_holes_blocked": b.get("holes_blocked", 0),
+            "delta_holes_blocked": (b.get("holes_blocked", 0)
+                                    - a.get("holes_blocked", 0)),
+            "baseline_drill_depth_mm": da,
+            "candidate_drill_depth_mm": db_,
+            "delta_drill_depth_mm": round(db_ - da, 6),
+            "baseline_tool_changes": a.get("tool_changes", 0),
+            "candidate_tool_changes": b.get("tool_changes", 0),
+            "delta_tool_changes": (b.get("tool_changes", 0)
+                                   - a.get("tool_changes", 0)),
+            "baseline_issues": ia.get(tno, 0),
+            "candidate_issues": ib.get(tno, 0),
+            "delta_issues": ib.get(tno, 0) - ia.get(tno, 0),
+            "resolved_issues": res_t.get(tno, 0),
+            "introduced_issues": int_t.get(tno, 0),
+        }
+
+    ca = Counter(i["code"] for i in baseline["issues"]
+                 if i["code"] in TOOL_CHANGE_CODES)
+    cb = Counter(i["code"] for i in candidate["issues"]
+                 if i["code"] in TOOL_CHANGE_CODES)
+    block_counts = {c: {"baseline": ca.get(c, 0), "candidate": cb.get(c, 0),
+                        "delta": cb.get(c, 0) - ca.get(c, 0)}
+                    for c in TOOL_CHANGE_CODES}
+    return {
+        "config_changes": config_changes,
+        "tools_table_baseline": ma.get("tools", {}),
+        "tools_table_candidate": mb.get("tools", {}),
+        "initial_tool": {"baseline": ma.get("initial_tool"),
+                         "candidate": mb.get("initial_tool")},
+        "change_point_machine_mm": {
+            "baseline": ma.get("tool_change_point"),
+            "candidate": mb.get("tool_change_point")},
+        "events": {
+            "baseline": ea, "candidate": eb,
+            "delta": {k: eb[k] - ea[k]
+                      for k in ("preselect", "change")}},
+        "tool_change_count": {
+            "baseline": ta.get("tool_change_count", 0),
+            "candidate": tb.get("tool_change_count", 0),
+            "delta": (tb.get("tool_change_count", 0)
+                      - ta.get("tool_change_count", 0))},
+        "by_t": by_t,
         "block_issue_counts": block_counts,
     }

@@ -86,6 +86,7 @@ def filter_report(report: dict, query: dict) -> dict:
     wcs_list = _csv_param(query, "wcs")
     h_filter = _h_filter_param(query)
     d_filter = _d_filter_param(query)
+    t_filter = _t_filter_param(query)
 
     for s in severities:
         if s not in SEVERITY_ORDER:
@@ -144,6 +145,10 @@ def filter_report(report: dict, query: dict) -> dict:
     if d_filter:
         issues = [i for i in issues
                   if i.get("details", {}).get("d") in d_filter]
+    if t_filter:
+        issues = [i for i in issues
+                  if i.get("details", {}).get("t") in t_filter]
+
     def _in_hole_range(i):
         no = i.get("details", {}).get("hole_no")
         if no is None:
@@ -167,6 +172,7 @@ def filter_report(report: dict, query: dict) -> dict:
     wcs_filter = bool(wcs_upper)
     h_filter_active = bool(h_filter)
     d_filter_active = bool(d_filter)
+    t_filter_active = bool(t_filter)
     out["filter"] = {
         "severity": severities, "code": codes,
         "line_from": line_from, "line_to": line_to,
@@ -176,13 +182,15 @@ def filter_report(report: dict, query: dict) -> dict:
         "wcs": wcs_upper,
         "h": [f"H{v}" for v in h_filter],
         "d": [f"D{v}" for v in d_filter],
+        "t": [f"T{v}" for v in t_filter],
         "matched": len(issues),
         "total_in_report": len(report["issues"]),
     }
-    if (cycle_filter or wcs_filter or h_filter_active) and "drill_cycles" in out:
+    if (cycle_filter or wcs_filter or h_filter_active or t_filter_active) \
+            and "drill_cycles" in out:
         out["drill_cycles"] = _filter_drill_cycles(
             report["drill_cycles"], cycles_upper, hole_from, hole_to,
-            wcs_upper, h_filter)
+            wcs_upper, h_filter, t_filter)
     if plane_filter and "arcs" in out:
         out["arcs"] = _filter_arcs(report["arcs"], planes_upper, issues)
     if wcs_filter and "wcs" in out:
@@ -193,6 +201,8 @@ def filter_report(report: dict, query: dict) -> dict:
     if d_filter_active and "cutter_compensation" in out:
         out["cutter_compensation"] = _filter_cutter_comp(
             report["cutter_compensation"], d_filter, issues)
+    if t_filter_active and "tools" in out:
+        out["tools"] = _filter_tools(report["tools"], t_filter, issues)
     # 逐行轨迹：默认随循环/平面/坐标系筛选裁剪；?trajectory=0 省略，
     # ?trajectory=all 不裁剪
     traj_flag = query.get("trajectory", ["1"])[0]
@@ -204,7 +214,7 @@ def filter_report(report: dict, query: dict) -> dict:
         if cycle_filter and "trajectory" in out:
             out["trajectory"] = _filter_trajectory_cycles(
                 out["trajectory"], cycles_upper, hole_from, hole_to,
-                h_filter)
+                h_filter, t_filter)
         if plane_filter and "trajectory" in out:
             out["trajectory"] = _filter_trajectory_planes(
                 out["trajectory"], planes_upper)
@@ -217,6 +227,9 @@ def filter_report(report: dict, query: dict) -> dict:
         if d_filter_active and "trajectory" in out:
             out["trajectory"] = _filter_trajectory_d(
                 out["trajectory"], d_filter)
+        if t_filter_active and "trajectory" in out:
+            out["trajectory"] = _filter_trajectory_t(
+                out["trajectory"], t_filter)
     return out
 
 
@@ -243,6 +256,69 @@ def _entry_d(e: dict):
         if cc is not None:
             return cc.get("d")
     return None
+
+
+def _entry_t(e: dict):
+    """逐行条目归属的当前刀号：换刀事件取换入刀，预选取预选刀，
+    运动/循环段取段上的 t。"""
+    ev = e.get("tool_change_event")
+    if ev is not None:
+        return ev.get("t")
+    ev = e.get("tool_preselect_event")
+    if ev is not None:
+        return ev.get("t")
+    seg = e.get("segment")
+    if seg is not None:
+        return seg.get("t")
+    return None
+
+
+def _filter_trajectory_t(trajectory, t_nums):
+    """逐行轨迹按当前刀号裁剪：保留命中 T 的运动/循环段与 T/M6 事件
+    （M6 失败被阻断的行仍保留阻断条目；无段无事件的设定/注释/程序流行
+    原样保留）。"""
+    out = []
+    for e in trajectory:
+        if (e.get("tool_change_event") is not None
+                or e.get("tool_preselect_event") is not None):
+            if _entry_t(e) in t_nums:
+                out.append(e)
+            continue
+        seg = e.get("segment")
+        if seg is None:
+            out.append(e)
+        elif _entry_t(e) in t_nums:
+            out.append(e)
+    return out
+
+
+def _filter_tools(tools: dict, t_nums, filtered_issues=None) -> dict:
+    """换刀分析汇总按刀号裁剪：事件、by_t 只保留命中 T；问题计数按
+    筛选后的 issues 重算（未建立当前刀的问题不归属任何已登记 T）。"""
+    wanted = set(t_nums)
+    out = dict(tools)
+
+    def ev_keep(e):
+        return e.get("t") in wanted
+
+    out["events"] = [e for e in tools.get("events", []) if ev_keep(e)]
+    out["preselect_events"] = [e for e in tools.get("preselect_events", [])
+                               if ev_keep(e)]
+    out["change_events"] = [e for e in tools.get("change_events", [])
+                            if ev_keep(e)]
+    out["by_t"] = {f"T{v}": tools.get("by_t", {}).get(f"T{v}")
+                   for v in t_nums if f"T{v}" in tools.get("by_t", {})}
+    out["without_current_tool"] = None
+    if filtered_issues is not None:
+        codes = tuple(tools.get("issues", {}).keys())
+        counts = dict.fromkeys(codes, 0)
+        for i in filtered_issues:
+            if i["code"] in counts:
+                counts[i["code"]] += 1
+        out["issues"] = counts
+    out["tool_change_count"] = len(out["change_events"])
+    out["filtered"] = True
+    return out
 
 
 def _filter_trajectory_d(trajectory, d_nums):
@@ -370,8 +446,8 @@ def _summarize_holes(holes):
 
 
 def _filter_drill_cycles(dc: dict, cycles, hole_from, hole_to,
-                         wcs=None, h_nums=None) -> dict:
-    """按循环类型/孔序/坐标系/刀长补偿 H 号筛选固定循环段与孔记录；
+                         wcs=None, h_nums=None, t_nums=None) -> dict:
+    """按循环类型/孔序/坐标系/刀长补偿 H 号/当前刀号筛选固定循环段与孔记录；
     所有分组/明细/汇总只反映命中孔。"""
     groups = []
     for g in dc.get("groups", []):
@@ -380,7 +456,8 @@ def _filter_drill_cycles(dc: dict, cycles, hole_from, hole_to,
         holes = [h for h in g.get("holes", [])
                  if _hole_in(h["hole_no"], hole_from, hole_to)
                  and (not wcs or h.get("wcs") in wcs)
-                 and (not h_nums or h.get("h") in h_nums)]
+                 and (not h_nums or h.get("h") in h_nums)
+                 and (not t_nums or h.get("t") in t_nums)]
         if not holes:
             continue  # 整组无命中孔，直接剔除
         s = _summarize_holes(holes)
@@ -513,7 +590,7 @@ def _filter_trajectory_planes(trajectory, planes):
 
 
 def _filter_trajectory_cycles(trajectory, cycles, hole_from, hole_to,
-                              h_nums=None):
+                              h_nums=None, t_nums=None):
     """同步裁剪逐行轨迹中固定循环段的孔/动作明细。
 
     每个动作都带 hole_no（含孔间定位段 position），按命中孔过滤；
@@ -529,7 +606,8 @@ def _filter_trajectory_cycles(trajectory, cycles, hole_from, hole_to,
             continue
         holes = [h for h in seg.get("holes", [])
                  if _hole_in(h["hole_no"], hole_from, hole_to)
-                 and (not h_nums or h.get("h") in h_nums)]
+                 and (not h_nums or h.get("h") in h_nums)
+                 and (not t_nums or h.get("t") in t_nums)]
         if not holes:
             continue
         keep_nos = {h["hole_no"] for h in holes}
@@ -564,7 +642,8 @@ def filter_package_report(report: dict, query: dict) -> dict:
     sources = _csv_param(query, "source")
     h_filter = _h_filter_param(query)
     d_filter = _d_filter_param(query)
-    if not sources and not h_filter and not d_filter:
+    t_filter = _t_filter_param(query)
+    if not sources and not h_filter and not d_filter and not t_filter:
         if omit_traj:
             out.pop("trajectory", None)
             out["filter"] = {"trajectory": "omitted"}
@@ -602,6 +681,16 @@ def filter_package_report(report: dict, query: dict) -> dict:
         if "cutter_compensation" in out:
             out["cutter_compensation"] = _filter_cutter_comp(
                 report["cutter_compensation"], d_filter, issues)
+    if t_filter:
+        issues = [i for i in issues
+                  if i.get("details", {}).get("t") in t_filter]
+        traj = _filter_trajectory_t(traj, t_filter)
+        if "tools" in out:
+            out["tools"] = _filter_tools(report["tools"], t_filter, issues)
+        if "drill_cycles" in out:
+            out["drill_cycles"] = _filter_drill_cycles(
+                out.get("drill_cycles", report["drill_cycles"]),
+                None, None, None, None, None, t_filter)
     counts = {s: 0 for s in SEVERITY_ORDER}
     for i in issues:
         counts[i["severity"]] += 1
@@ -617,6 +706,7 @@ def filter_package_report(report: dict, query: dict) -> dict:
         "source": sources,
         "h": [f"H{v}" for v in h_filter],
         "d": [f"D{v}" for v in d_filter],
+        "t": [f"T{v}" for v in t_filter],
         "trajectory": "omitted" if omit_traj else "included",
         "matched_issues": len(issues),
         "matched_blocks": (None if omit_traj else len(traj)),
@@ -678,6 +768,26 @@ def _d_filter_param(query: dict):
         if v <= 0:
             raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_QUERY",
                            f"半径补偿 D 号必须为正整数：{raw!r}")
+        if v not in out:
+            out.append(v)
+    return out
+
+
+def _t_filter_param(query: dict):
+    """?t=T1,T2 或 ?t=1,2（可混用）；刀号必须为正整数。"""
+    out = []
+    for raw in _csv_param(query, "t"):
+        tok = raw.upper()
+        if tok.startswith("T"):
+            tok = tok[1:]
+        try:
+            v = int(tok)
+        except ValueError:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_QUERY",
+                           f"未知刀号 {raw!r}（必须为正整数，如 T1）")
+        if v <= 0:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "BAD_QUERY",
+                           f"刀号必须为正整数：{raw!r}")
         if v not in out:
             out.append(v)
     return out

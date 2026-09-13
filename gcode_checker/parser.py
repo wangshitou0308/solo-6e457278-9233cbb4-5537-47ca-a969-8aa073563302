@@ -49,6 +49,7 @@ SUPPORTED_G = {
 SUPPORTED_M = {
     "3": "spindle_on_cw",  # 主轴正转
     "5": "spindle_off",    # 主轴停止
+    "6": "tool_change",    # 换刀（把 T 预选刀换为当前刀；不得同段运动）
 }
 
 # 可以携带数值的地址字母

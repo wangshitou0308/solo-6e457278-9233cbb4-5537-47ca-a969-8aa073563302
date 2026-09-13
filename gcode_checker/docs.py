@@ -26,6 +26,7 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 | 圆弧参数 | `G17` 用 `I J`、`G18` 用 `I K`、`G19` 用 `J K`（起点相对圆心），或 `R`（正=劣弧，负=优弧）；垂直当前平面的轴随扫角线性联动（螺旋插补） |
 | 工艺 | `F` 进给（按当前单位换算 mm/min）、`S` 主轴转速 rpm |
 | 主轴 | `M3` 正转启动、`M5` 停止 |
+| 刀具 | `T<n>` 预选刀具（只预选、不换刀、不动刀具）、`M6` 换刀（把预选刀换为当前刀；**含 M6 的程序段不得同时运动**） |
 | 词 | `X Y Z`、`I J K`（圆弧圆心）、`Q P L`（固定循环）、`N` 行号（忽略）；注释 `(...)` 与 `;...` |
 
 ### 工件坐标系（G54-G59）口径
@@ -145,6 +146,52 @@ python3 -m gcode_checker --verbose       # 打印访问日志
   可用 `?d=D1,D2`（也接受 `?d=1,2`）筛选问题、逐行轨迹与按 D 汇总
   （结束命中 D 补偿段的 G40 事件带 `cancels_d` 并随筛选保留）。
 
+### 换刀（T 预选 / M6 换刀 + 刀具表）口径
+
+- 机床配置 **`tools`** 维护刀号及其默认 H、D 寄存器，如
+  `{"1": {"h": 1, "d": 1}, "2": {"h": 2, "d": 2}}`（键可写 `1` 或 `"T1"`，
+  刀号与 h/d 均须为正整数，可选 `name/comment`）；**`initial_tool`** 给出
+  开机即处于主轴上的初始刀（须在 `tools` 登记；不设置表示开机未建立当前刀）。
+- **`tool_change_point`** 给出**机床坐标系**换刀点
+  `{"x":0,"y":0,"z":100}`，**`tool_change_tolerance`** 给出各轴 ±容差
+  `{"x":0.5,"y":0.5,"z":0.5}`（mm，非负；缺省容差为 0，即必须精确到达）。
+- **T 只预选刀具**（刀库转到该刀位）：不换刀、不移动刀具，可与运动同段
+  （如 `G0 X0 T2`）；T 号必须为正整数且同段只能一个，否则
+  `TOOL_NUMBER_INVALID` 整段阻断。预选**不核对登记**（未登记刀仅在事件中
+  标记 `registered=false`），是否登记在 M6 时核对。
+- **M6 才把预选刀设为当前刀**，且**含 M6 的程序段不得同时运动**
+  （不得带 `G0-G3/G81-G83` 或 `X/Y/Z/I/J/K/R` 词），否则
+  `TOOL_CHANGE_WITH_MOTION`。
+- 执行 M6 前逐项核对（条件全部满足才换入，否则定位 M6 原行整段阻断、
+  **保持原刀与模态**，预选/补偿/循环/位置均不改变）：
+  1. 已有 `Tn` 预选且 `Tn` 在 `tools` 表登记，否则
+     `TOOL_CHANGE_UNREGISTERED`（无预选 `reason=no_preselect`，
+     未登记 `reason=tool_not_registered`）；
+  2. 主轴已停止（先 `M5`；同行 `M5` 可停，`M6 M3` 仍判在转），否则
+     `TOOL_CHANGE_SPINDLE_ON`；
+  3. 固定循环已取消（`G80` 或 `G0-G3`），否则 `TOOL_CHANGE_CYCLE_ACTIVE`；
+  4. 刀长补偿已用 `G49` 取消，否则 `TOOL_CHANGE_LENGTH_COMP_ACTIVE`；
+  5. 半径补偿已用 `G40` 并经非零平面内 `G1` 完成退出，否则
+     `TOOL_CHANGE_CUTTER_COMP_ACTIVE`；
+  6. 已配置换刀点/容差且主轴基准点机床坐标已知，否则
+     `TOOL_CHANGE_POSITION_MISSING` / `TOOL_CHANGE_POSITION_UNKNOWN`；
+  7. 主轴基准点机床坐标（工件偏置 + Z 向刀长补偿后）三轴均落在
+     换刀点 ±容差内，否则 `TOOL_CHANGE_POSITION_OUT`（details 给各轴
+     实际/目标/容差/偏差与超差轴）。
+- **未建立当前刀便切削或钻孔**（`G1/G2/G3` 或 `G81/G82/G83`）报
+  `TOOL_NOT_CURRENT`；仅当配置维护了 `tools` 刀具表时核对（无刀具表的
+  旧配置保持旧行为）。
+- 后续**直线、圆弧、螺旋和钻孔记录当前 T**（段/孔/展开动作都带 `t`）。
+  当前刀生效的 **H**（刀长补偿中）或 **D**（半径补偿激活时）与该刀默认
+  寄存器不一致时报 **`TOOL_REGISTER_MISMATCH`（warning，仅提示，
+  不自动替换程序寄存器）**，details.reason 为 `h_mismatch`/`d_mismatch`。
+- 报告 `tools` 节含刀具表、初始刀、换刀点/容差、T 预选与 M6 换入事件流、
+  按 T 的切削长度（含固定循环切削 `cutting_incl_cycles`）、钻孔数、
+  换刀次数与问题数；可用 `?t=T1,T2`（也接受 `?t=1,2`）筛选。
+- 程序包模式下 T 预选与 M6 换入事件、问题都带 `source_program` 与
+  `call_stack`（子程序内换刀随调用栈保留），模态（当前刀/预选刀）
+  在调用与返回间连续继承。
+
 ### 圆弧与螺旋插补口径
 
 - 平面为**模态**：`G17/G18/G19` 切换后保持，未写过按控制器上电默认 `G17`。
@@ -191,9 +238,9 @@ python3 -m gcode_checker --verbose       # 打印访问日志
   主轴未转/无进给等工艺问题按**触发行**去重（一个 G83 孔只报一次）。
 
 **未支持示例**（遇到即 `UNSUPPORTED_INSTRUCTION`，整段不执行、不改模态）：
-`G28/30、G54.1、G84-G89、M4、M6、M7-M9、T` 等。
+`G28/30、G54.1、G84-G89、M4、M7-M9` 等。
 无法解析的残片（如 `X-`）报 `MALFORMED_LINE`；若同行还有未支持词（如 `G54.1 X-`），
-两类问题都会列出。
+两类问题都会列出。`T` 预选与 `M6` 换刀已支持，见上节“换刀口径”。
 
 > 注：`M98/M99/M2/M30` 与子程序号 `O` 只在**程序包静态展开**
 > （`POST /api/packages`）中支持，单独提交给 `/api/analyze` 或 `/api/jobs`
@@ -282,7 +329,12 @@ python3 -m gcode_checker --verbose       # 打印访问日志
     "G55": {"x": 50, "y": 20, "z": -5}
   },
   "length_offsets": {"1": 10.0, "2": -3.0, "3": 2.0},
-  "radius_offsets": {"1": 5.0, "2": 3.0}
+  "radius_offsets": {"1": 5.0, "2": 3.0},
+  "tools": {"1": {"h": 1, "d": 1, "name": "T1 立铣刀"},
+            "2": {"h": 2, "d": 2}},
+  "initial_tool": 1,
+  "tool_change_point": {"x": 0, "y": 0, "z": 100},
+  "tool_change_tolerance": {"x": 0.5, "y": 0.5, "z": 0.5}
 }
 ```
 
@@ -299,6 +351,15 @@ python3 -m gcode_checker --verbose       # 打印访问日志
   （可写 `1` 或 `"D1"`，`D0` 拒绝），值必须为非负数值，否则按字段拒绝
   （如 `radius_offsets.D3 必须是数值（刀具半径 mm）`）。
   `G41/G42` 同段的 D 号必须在此表登记。
+- `tools` 为**刀具登记表**：键为正整数刀号（可写 `1` 或 `"T1"`），值为
+  `{"h": 默认刀长寄存器, "d": 默认半径寄存器}`（均为正整数，另可选
+  `name/comment`）；刀号或 h/d 非法时定位字段拒绝（如
+  `tools.T1.h 必须是正整数`）。`M6` 只能换入已登记刀具。
+- `initial_tool` 为开机已在主轴上的初始刀号（正整数，必须在 `tools` 登记）；
+  缺省表示未建立当前刀（此后首次切削/钻孔报 `TOOL_NOT_CURRENT`）。
+- `tool_change_point` 为**机床坐标系**换刀点 `{"x":..,"y":..,"z":..}`
+  （必须三轴齐全、数值），`tool_change_tolerance` 为各轴非负容差 mm
+  （缺省 0，即精确到达）；M6 时主轴基准点须三轴落在换刀点±容差内。
 - `safe_z` 按**刀尖工件（程序）Z 坐标**判定快速移动；Z 轴行程按叠加
   工件偏置与刀长补偿后的**主轴基准点机床 Z** 判定。半径补偿段的行程另按
   **刀具扫掠范围**（刀心轨迹±刀具半径）判定。
@@ -359,7 +420,11 @@ python3 -m gcode_checker --verbose       # 打印访问日志
     期间产生的问题与轨迹段（切入/轮廓/退出），`cutter_compensation` 汇总
     只保留命中 D（结束命中 D 补偿段的 G40 事件带 `cancels_d` 并随筛选
     保留），风险计数随之重算
-  - `trajectory=0`：省略逐行轨迹以减小响应；`trajectory=all`：循环/平面/坐标系/H 筛选时保留完整轨迹
+  - `t=T1,T2`（也接受 `t=1,2`）：按当前刀号筛选；只保留该刀为当前刀期间
+    产生的问题、轨迹段与孔，`tools` 汇总（事件流、按 T 的切削长度/钻孔数/
+    换刀次数/问题）只反映命中 T（T 预选与 M6 换入事件按其刀号保留），
+    风险计数随之重算
+  - `trajectory=0`：省略逐行轨迹以减小响应；`trajectory=all`：循环/平面/坐标系/H/T 筛选时保留完整轨迹
 
   指定 `cycle`/`hole_*` 后，报告中的 `drill_cycles`（groups、by_cycle、
   summary 的孔数/钻深/暂停/展开路径）与逐行轨迹的孔及动作（含孔间定位）
@@ -381,6 +446,9 @@ python3 -m gcode_checker --verbose       # 打印访问日志
     逐行轨迹与问题只保留命中来源程序，风险计数随之重算；非法来源返回 400。
   - `h=H1,H2`：按刀长补偿 H 号筛选（跨全部来源程序，与 `source` 可叠加）；
     即使 `trajectory=0` 省略逐行轨迹，问题与各汇总节仍按 H 筛选。
+  - `t=T1,T2`：按当前刀号筛选（跨全部来源程序，与 `source/h/d` 可叠加）；
+    T 预选/M6 换入事件与问题带来源程序和调用栈；`trajectory=0` 时问题与
+    `tools`/`drill_cycles` 汇总仍按 T 筛选。
   - `trajectory=0`：省略逐行轨迹（顶层 package/call_graph 保留；source/h
     筛选与回显仍然生效）。
 - `GET /api/packages/<id>/report/download`：以 `attachment` 下载程序包
@@ -443,7 +511,12 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 `by_d`（各 D 号的刀心路径长度、补偿段数/切入/退出、问题的新增/解决/
 净变化）、`swept_bbox`（刀具扫掠包围盒工件/机床两侧值与尺寸 delta）、
 `center_path_total_mm`（刀心路径总长变化）与 `block_issue_counts`
-（缺 D/D 不存在/切入退出无效/圆弧半径非正/不连续等问题计数）。
+（缺 D/D 不存在/切入退出无效/圆弧半径非正/不连续等问题计数），
+并在 `tools` 中汇总换刀分析变化：`config_changes`（刀具表/初始刀/换刀点/
+容差是否变化）、刀具表与初始刀两侧值、`events`（T 预选/M6 换入次数两侧值
+与 delta）、`tool_change_count`、`by_t`（各刀具的切削长度
+`delta_cutting_incl_cycles_mm`、钻孔数/阻断孔/钻深、换刀次数、问题的
+新增/解决/净变化）与 `block_issue_counts`（换刀各问题代码计数）。
 - `GET /api/comparisons` / `GET /api/comparisons/<id>`：读取保存的对比。
 
 ## 5. 报告结构
@@ -464,6 +537,7 @@ python3 -m gcode_checker --verbose       # 打印访问日志
       "signed_offset_mm": 10, "applied_line_no": 4},
     "canned_cycle": { …当前激活循环的参数与来源，无则 null… },
     "cycle_return_plane": "G98" },
+  "tool": { "current_t": 2, "selected_t": null },   // T 预选 / M6 换刀模态
   "arcs": {
     "by_plane": { "G17": {"count": 2, "arc_length_mm": 125.6,
         "length_3d_mm": 130.1, "helical_count": 1, "full_circle_count": 1},
@@ -524,6 +598,31 @@ python3 -m gcode_checker --verbose       # 打印访问日志
   },
   "cutter_swept_bbox_program_mm": { …同扫掠盒（顶层冗余便于读取）… },
   "cutter_swept_bbox_machine_mm": { … },
+  "tools": {
+    "initial_tool": 1,
+    "change_point_machine_mm": {"x": 0, "y": 0, "z": 100},
+    "change_tolerance_mm": {"x": 0.5, "y": 0.5, "z": 0.5},
+    "tools_registered": {"T1": {"h": 1, "d": 1}, "T2": {"h": 2, "d": 2}},
+    "preselect_events": [ { "kind": "preselect", "t": 2, "registered": true,
+      "line_no": 10, "current_t": 1, "wcs": "G54" } ],   // T 只预选
+    "change_events": [ { "kind": "change", "t": 2, "previous_t": 1,
+      "line_no": 10, "default_h": 2, "default_d": 2,
+      "spindle_point_machine_mm": [0,0,100],
+      "change_point_mm": {…}, "tolerance_mm": {…} } ],  // M6 换入
+    "events": [ …preselect + change 按行合并的事件流（程序包带来源/调用栈）… ],
+    "by_t": { "T1": { "t": 1, "registered": true, "default_h": 1,
+      "default_d": 1,
+      "path_length_mm": { "rapid":…, "cutting":…, "total":…,
+        "canned_cycle_rapid":…, "canned_cycle_cutting":…,
+        "cutting_incl_cycles":…, "all_total":… },
+      "holes_drilled": 2, "holes_blocked": 0,
+      "total_drill_depth_mm": 16, "tool_changes": 0, "issues": 0 },
+      "T2": { …, "tool_changes": 1, … } },
+    "without_current_tool": { …未建立当前刀段的路径/钻孔/问题… },
+    "tool_change_count": 1,
+    "issues": { "TOOL_NOT_CURRENT": 0, "TOOL_REGISTER_MISMATCH": 1,
+               "TOOL_CHANGE_POSITION_OUT": 0, … }
+  },
   "drill_cycles": {
     "summary": { "cycle_groups": 2, "holes_total": 9, "holes_drilled": 8,
       "holes_blocked": 1, "total_drill_depth_mm": 63.0, "total_dwell_s": 0.5,
@@ -662,6 +761,12 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 半径补偿设定行（`G41 D1`/`G42 D1`/`G40`）的条目 `type` 为
 `cutter_compensation`，并带 `tool_radius_event`（含 D 号、左/右侧、
 半径表值与所在平面；G40 另带 `cancels_d`）；这些行**不移动刀具**。
+`T` 预选行（可与运动同段）带 `tool_preselect_event`（刀号、是否登记、
+预选前当前刀）；`M6` 换刀行 `type` 为 `tool_change`，带
+`tool_change_event`（换入刀、上一刀、默认 H/D、换刀点、容差与换刀时主轴
+基准点机床坐标），并在每条轨迹顶层给 `current_t/selected_t`。程序包模式下
+这些事件另带 `source_program` 与 `call_stack`。运动段、固定循环段与每个
+孔记录都带当前刀号 `t`（孔记录在 `h` 之外另给 `t`）。
 
 ## 6. 问题代码与严重度
 
@@ -695,6 +800,18 @@ python3 -m gcode_checker --verbose       # 打印访问日志
 | `CUTTER_EXIT_INVALID` | error | G40 退出段不是非零平面内 G1，或程序结束时补偿仍激活/待退出 |
 | `CUTTER_ARC_RADIUS` | critical | 半径补偿后圆弧有效半径非正（内偏置过切）；该段阻断回滚 |
 | `CUTTER_COMP_DISCONTINUOUS` | critical | 补偿中 G0/固定循环/切换平面、相邻偏置段折返/干涉无法连续；不猜测刀心轨迹 |
+| `TOOL_NUMBER_INVALID` | error | T 号非正整数或同段多个 T；整段阻断 |
+| `TOOL_CHANGE_WITH_MOTION` | error | 含 M6 的程序段同时给出运动/轴词，或同段多个 M6；整段阻断 |
+| `TOOL_CHANGE_UNREGISTERED` | error | M6 无预选刀（`no_preselect`）或预选刀未在 `tools` 登记；保持原刀 |
+| `TOOL_CHANGE_SPINDLE_ON` | error | M6 换刀时主轴仍在转动（须先 M5） |
+| `TOOL_CHANGE_CYCLE_ACTIVE` | error | M6 时固定循环仍激活（须先 G80/G0-G3） |
+| `TOOL_CHANGE_LENGTH_COMP_ACTIVE` | error | M6 时刀长补偿仍生效（须先 G49） |
+| `TOOL_CHANGE_CUTTER_COMP_ACTIVE` | error | M6 时半径补偿未完成 G40 退出 |
+| `TOOL_CHANGE_POSITION_UNKNOWN` | error | M6 时主轴基准点机床坐标未知（WCS/偏置/位置未建立） |
+| `TOOL_CHANGE_POSITION_MISSING` | error | 机床配置缺 `tool_change_point`/容差，无法核对换刀位置 |
+| `TOOL_CHANGE_POSITION_OUT` | error | 主轴基准点超出换刀点±容差（details 给各轴实际/目标/偏差） |
+| `TOOL_NOT_CURRENT` | error | 配置维护了刀具表但未建立当前刀便切削/钻孔（先 Tn M6 或设 initial_tool） |
+| `TOOL_REGISTER_MISMATCH` | warning | 当前刀生效的 H/D 与该刀默认寄存器不一致（`h_mismatch`/`d_mismatch`），仅提示不替换 |
 
 风险分：critical 25 / error 10 / warning 3 / info 1（封顶 100），
 级别 `none/low(≤10)/medium(≤30)/high(≤60)/critical`。

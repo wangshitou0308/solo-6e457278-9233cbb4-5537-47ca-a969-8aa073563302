@@ -324,6 +324,88 @@ G1 X80 Y40
 M5
 """,
     },
+    "tool_change_demo": {
+        "filename": "tool_change_demo.nc",
+        "title": "T/M6 换刀示例（预选、换刀点容差、H/D 默认寄存器核对）",
+        "description": "T 只预选、M6 才换入；换刀前回机床坐标换刀点 (0,0,100)、"
+                       "M5 停主轴、G49 取消刀长、G40 退出半径补偿。含未预选/"
+                       "主轴未停/循环未取消/刀长未取消/位置偏离换刀点/无当前刀"
+                       "切削/H 与该刀默认寄存器不一致等阻断演示。建议配置：行程 "
+                       "X[0,300] Y[0,200] Z[-50,120]、safe_z=10、F 上限 3000、"
+                       "S 上限 12000；tools：T1{h:1,d:1}、T2{h:2,d:2}、"
+                       "initial_tool=1；tool_change_point={x:0,y:0,z:100}、"
+                       "tool_change_tolerance={x:0.5,y:0.5,z:0.5}；"
+                       "length_offsets：H1=10、H2=8；radius_offsets：D1=5、D2=3。",
+        "content": """\
+; tool_change_demo.nc —— T 预选 / M6 换刀
+; 建议配置：X[0,300] Y[0,200] Z[-50,120]，safe_z=10，F<=3000，S<=12000
+; tools：T1{h:1,d:1}、T2{h:2,d:2}，initial_tool=1
+; tool_change_point={x:0,y:0,z:100}，容差 0.5
+; length_offsets：H1=10，H2=8；radius_offsets：D1=5，D2=3
+G21 G90 G54
+
+; ---- T1（初始刀）铣削一段：直线 + G81 两孔 ----
+M3 S6000
+G0 X0 Y0 Z20
+G1 Z-2 F300
+G1 X40 Y0 F600
+G0 Z20
+G99 G81 R2 Z-8 F250
+X40 Y20
+G80
+
+; ---- 合规换刀到 T2：回换刀点 -> M5 -> G49 -> T2 M6 ----
+G0 X0 Y0 Z100
+G49
+M5
+T2 M6                 ; T 预选 + M6 换入（必须单独程序段、主轴基准在换刀点容差内）
+
+; ---- T2 铣削与钻孔（H2/D2 与该刀默认寄存器一致）----
+M3 S5000
+G43 H2
+G0 X80 Y0 Z20
+G1 Z-4 F300
+G1 X120 Y0 F600
+G49
+G0 Z20
+G99 G81 R2 Z-8 F250
+G80
+
+; ---- 阻断演示（每个失败 M6 都先回到换刀点 (0,0,100)、主轴停止，定位 M6 原行）----
+G0 X0 Y0 Z100
+M5
+; 循环未取消：M3 触发一孔（G98 回初始平面 Z100，位置仍在换刀点容差内），再 M5
+M3 S4000
+G98 G81 R2 Z-8 F250
+M5
+T1 M6                  ; 固定循环仍激活：TOOL_CHANGE_CYCLE_ACTIVE
+G80
+M6                     ; 未预选：TOOL_CHANGE_UNREGISTERED
+T9 M6                  ; T9 未登记：TOOL_CHANGE_UNREGISTERED
+T1 M6                  ; 条件恢复后换刀成功（回到 T1）
+M3 S6000
+T2 M6                  ; 主轴仍转：TOOL_CHANGE_SPINDLE_ON
+M5
+G43 H2
+T2 M6                  ; 刀长补偿未取消：TOOL_CHANGE_LENGTH_COMP_ACTIVE
+G49
+T2 M6                  ; 补偿取消后换刀成功（回到 T2）
+G0 X60 Y0 Z100
+T1 M6                  ; X=60 偏离换刀点 0（超 0.5 容差）：TOOL_CHANGE_POSITION_OUT
+G0 X0 Y0
+T1 M6 X0               ; 含 M6 的程序段同时运动：TOOL_CHANGE_WITH_MOTION（位置已恢复）
+T1 M6                  ; 位置恢复后换刀成功
+G43 H1
+M3 S6000
+G0 X0 Y40 Z20
+G1 Z-2 F900            ; T1 默认 H1：H 一致，正常切削
+G44 H2                 ; T1 默认 H1，此处启用 H2：TOOL_REGISTER_MISMATCH（仅提示）
+G1 X40 Y40 F900
+G49
+G0 X0 Y0 Z100
+M5
+""",
+    },
 }
 
 # 程序包示例（POST /api/packages 请求体格式）。JSON 字符串可直接作为
