@@ -81,11 +81,15 @@ def _unit(v: tuple[float, float]) -> tuple[float, float]:
 
 
 def side_normal(side: str, d: tuple[float, float]) -> tuple[float, float]:
-    """行进方向 d 的左/右单位法向（平面 (u,v) 内，正法向 n=u×v）。"""
+    """行进方向 d 的左/右单位法向（平面 (u,v) 内，正法向 n=u×v）。
+
+    G41 左侧：n × d = (-d_v, d_u)；G42 右侧：d × n = (d_v, -d_u)。
+    例如 G17 下沿 +X 行进时，G41 刀心在 +Y 侧、G42 在 -Y 侧。
+    """
     du, dv = _unit(d)
-    if side == "left":  # n × d = (dv, -du)
-        return (dv, -du)
-    return (-dv, du)   # d × n = (-dv, du)
+    if side == "left":  # n × d
+        return (-dv, du)
+    return (dv, -du)   # d × n
 
 
 def offset_line(start: tuple[float, float], end: tuple[float, float],
@@ -113,11 +117,13 @@ def offset_arc(center: tuple[float, float], radius: float,
                prog_end: tuple[float, float] | None = None) -> Primitive:
     """圆弧按左/右侧偏置。
 
-    G41(左)+顺圆 或 G42(右)+逆圆 => 内偏置（有效半径 R-r_d）；
-    其余组合为外偏置（R+r_d）。内偏置后半径 <= 0 抛 JoinError。
+    以平面正法向 n=u×v 判定：沿圆弧行进方向，G41(左) 法向指向圆心时为
+    内偏置——即 G41+逆圆(G3) 或 G42+顺圆(G2) 为内偏置（R-r_d，凹腔）；
+    G41+顺圆(G2)、G42+逆圆(G3) 为外偏置（R+r_d，凸台）。
+    内偏置后半径 <= 0 抛 JoinError。
     """
-    inward = ((clockwise and side == "left")
-              or ((not clockwise) and side == "right"))
+    inward = ((clockwise and side == "right")
+              or ((not clockwise) and side == "left"))
     r_eff = radius - r_d if inward else radius + r_d
     if r_eff <= GEOM_EPS:
         raise JoinError(

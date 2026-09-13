@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 import uuid
 from dataclasses import dataclass, field
@@ -37,8 +38,10 @@ from .cycles import (
 from .cutter import (
     JoinError,
     Primitive,
+    Connector,
     offset_line,
     offset_arc,
+    side_normal,
     join_primitives,
     sample_primitive,
     primitive_bbox_2d,
@@ -1111,69 +1114,66 @@ class Analyzer:
     # -- 刀具半径补偿：G40/G41/G42 + D ------------------------------------
 
     def _cutter_block_unknown(self, pl, motion_mode, issue_indexes):
-        """单位/定位模式不明导致位置未知时的半径补偿阻断登记。"""
+        """单位/定位模式不明导致位置未知时的半径补偿阻断登记。
+        不改补偿状态（调用方回滚到行前快照）。"""
         st = self.state
-        line_code = (self._line_cutter or {}).get("code")
         if st.cutter_phase == "pending_in":
-            self._cutter_reset_pending_in()
             issue_indexes.append(self._issue(
                 "CUTTER_APPROACH_INVALID", pl,
                 "半径补偿切入段位置未知（单位/定位模式不明），无法解算刀心"
-                "轨迹；该段阻断，补偿不生效，不猜测轨迹",
+                "轨迹；该段阻断，不猜测轨迹，待切入状态保持",
                 {"reason": "position_unknown", "plane": st.plane,
-                 "d": None}))
+                 "d": st.cutter_d}))
         elif st.cutter_phase == "pending_out":
             issue_indexes.append(self._issue(
                 "CUTTER_EXIT_INVALID", pl,
                 "G40 退出段位置未知（单位/定位模式不明），无法解算刀心"
-                "轨迹；该段阻断，保持补偿状态",
+                "轨迹；该段阻断，补偿状态保持",
                 {"reason": "position_unknown", "plane": st.plane,
                  "d": st.cutter_d}))
         elif st.cutter_phase in ("active", "broken"):
-            self._cutter_pending = None
-            st.cutter_phase = "broken"
             issue_indexes.append(self._issue(
                 "CUTTER_COMP_DISCONTINUOUS", pl,
                 "半径补偿段位置未知（单位/定位模式不明），刀心轨迹无法连续；"
-                "该段阻断，补偿轮廓断开",
+                "该段阻断，不猜测轨迹",
                 {"reason": "position_unknown", "plane": st.plane,
                  "d": st.cutter_d}))
 
-    def _accumulate_cutter(self, pl, motion_mode, segment):
-        """半径补偿段的刀心路径长度与刀具扫掠包围盒累计。"""
+    def _accumulate_cutter(self, pl, motion_mode, segment, issue_indexes):
+        """半径补偿段的刀心路径长度、扫掠包围盒累计与机床行程检查。"""
         cc = segment.get("cutter_compensation")
         if cc is None or not cc.get("continuous", True):
             return
-        ui, vi, pi = self._cutter_plane_axes()
-        plane = cc.get("plane") or self.state.cutter_plane
+        ui, vi, pi = PLANE_SPEC[cc.get("plane") or self.state.plane][:3]
         d = cc.get("d")
-        # 刀心路径长度（三维折线，螺旋接弧按采样折线近似）
         pts = cc.get("center_points_mm") or []
+        # 外角补弧链节（刀心折线的一部分）
+        connector_pts = []
+        for conn in segment.get("_cutter_connectors", []):
+            conn3 = self._connector_3d(conn, pi, segment)
+            connector_pts.extend(conn3)
         clen = 0.0
-        for a, b in zip(pts, pts[1:]):
+        chain = list(pts) + connector_pts
+        for a, b in zip(chain, chain[1:]):
             if any(v is None for v in a + b):
                 continue
             clen += math.sqrt(sum((bv - av) ** 2 for av, bv in zip(a, b)))
         bucket = self._cutter_path_bucket(d)
         bucket["segments"] += 1
         bucket["center_length"] += clen
-        if cc.get("mode") in ("tangent_engage",):
+        if cc.get("mode") == "tangent_engage":
             bucket["engages"] += 1
         if cc.get("mode") == "tangent_exit":
             bucket["exits"] += 1
-        # 刀具扫掠包围盒（工件坐标）：刀心折线按半径膨胀
         r_d = cc.get("radius_mm") or 0.0
-        self._grow_cutter_swept(pts, pi, r_d, machine=False)
-        # 外角接弧（挂在前段）同样计入扫掠
-        for conn in segment.get("_cutter_connectors", []):
-            ui2, vi2, _ = self._cutter_plane_axes()
-            conn3 = []
-            p_perp = segment["end"][pi]
-            for cuv in conn.points:
-                p = [None, None, None]
-                p[ui2], p[vi2], p[pi] = cuv[0], cuv[1], p_perp
-                conn3.append(p)
-            self._grow_cutter_swept(conn3, pi, r_d, machine=False)
+        # 刀具扫掠：刀心折线（含外角补弧）平面两轴按半径 r_d 膨胀
+        self._grow_cutter_swept(chain, (ui, vi), r_d, machine=False,
+                                issue_indexes=issue_indexes, pl=pl, cc=cc)
+        if self.state.wcs is not None and self._current_offset() is not None:
+            self._grow_cutter_swept(chain, (ui, vi), r_d, machine=True,
+                                    issue_indexes=issue_indexes, pl=pl, cc=cc)
+        else:
+            self.cutter_swept_wcs_known = False
         self.cutter_segments.append(cc)
 
     def _cutter_path_bucket(self, d):
@@ -1182,14 +1182,24 @@ class Analyzer:
             "segments": 0, "center_length": 0.0,
             "engages": 0, "exits": 0})
 
-    def _grow_cutter_swept(self, pts, perp_idx, r_d: float, machine: bool):
-        """把刀心点（按刀具半径膨胀平面两轴）并入扫掠包围盒。"""
-        ui, vi, pi = (self._cutter_plane_axes() if self.state.cutter_plane
-                      else PLANE_SPEC[self.state.plane][:3])
+    def _grow_cutter_swept(self, pts, plane_axes, r_d: float, machine: bool,
+                           issue_indexes=None, pl=None, cc=None):
+        """把刀心点（平面两轴按刀具半径膨胀）并入扫掠包围盒；
+        machine=True 时叠加工件偏置与刀长补偿做机床行程检查/机床扫掠盒。"""
+        ui, vi = plane_axes
         off = self._current_offset()
-        if machine and off is None:
-            self.cutter_swept_wcs_known = False
-            return
+        signed = self.state.comp_signed
+        if machine:
+            if off is None:
+                self.cutter_swept_wcs_known = False
+                return
+            bmin, bmax = self.cutter_swept_mbmin, self.cutter_swept_mbmax
+        else:
+            bmin, bmax = self.cutter_swept_bmin, self.cutter_swept_bmax
+        c = self.cfg
+        axis_lim = ((0, c.x_min, c.x_max, "X"),
+                    (1, c.y_min, c.y_max, "Y"),
+                    (2, c.z_min, c.z_max, "Z"))
         for p in pts:
             for i, v in enumerate(p):
                 if v is None:
@@ -1197,19 +1207,64 @@ class Analyzer:
                 rad = r_d if i in (ui, vi) else 0.0
                 lo, hi = v - rad, v + rad
                 if machine:
-                    signed = self.state.comp_signed
-                    lo_m = lo + (off[i] + (signed if i == 2 else 0.0))
-                    hi_m = hi + (off[i] + (signed if i == 2 else 0.0))
-                    lo, hi = lo_m, hi_m
-                    bmin, bmax = self.cutter_swept_mbmin, \
-                        self.cutter_swept_mbmax
-                else:
-                    bmin, bmax = self.cutter_swept_bmin, \
-                        self.cutter_swept_bmax
+                    zcomp = signed if i == 2 else 0.0
+                    lo = lo + off[i] + zcomp
+                    hi = hi + off[i] + zcomp
                 if lo < bmin[i]:
                     bmin[i] = lo
                 if hi > bmax[i]:
                     bmax[i] = hi
+        if machine and issue_indexes is not None and pl is not None:
+            # 逐段点列（而非全局累计盒）做行程检查，避免重复报告
+            seg_min = [math.inf] * 3
+            seg_max = [-math.inf] * 3
+            for p in pts:
+                for i, v in enumerate(p):
+                    if v is None:
+                        continue
+                    rad = r_d if i in (ui, vi) else 0.0
+                    zcomp = signed if i == 2 else 0.0
+                    lo = v - rad + off[i] + zcomp
+                    hi = v + rad + off[i] + zcomp
+                    seg_min[i] = min(seg_min[i], lo)
+                    seg_max[i] = max(seg_max[i], hi)
+            for i, lo_lim, hi_lim, axis_name in axis_lim:
+                if not math.isfinite(seg_min[i]):
+                    continue
+                over_lo = lo_lim - seg_min[i]
+                over_hi = seg_max[i] - hi_lim
+                if over_lo > MM_EPS:
+                    v = {"value_mm": round(seg_min[i], 6),
+                         "bound_mm": lo_lim,
+                         "overshoot_mm": round(over_lo, 6), "side": "min",
+                         "axis": axis_name,
+                         "plane": (cc or {}).get("plane"),
+                         "d": (cc or {}).get("d"),
+                         "checked_path": "tool_swept_envelope"}
+                    issue_indexes.append(self._issue(
+                        "OUT_OF_BOUNDS", pl,
+                        f"{axis_name} 轴刀具扫掠范围（刀心±刀具半径，并叠加"
+                        f"{self.state.wcs} 偏置与刀长补偿）机床坐标最小 "
+                        f"{fmt_num(v['value_mm'])} mm 越出行程下限 "
+                        f"{fmt_num(lo_lim)} mm（超程 "
+                        f"{fmt_num(v['overshoot_mm'])} mm；半径补偿扫掠）",
+                        v))
+                elif over_hi > MM_EPS:
+                    v = {"value_mm": round(seg_max[i], 6),
+                         "bound_mm": hi_lim,
+                         "overshoot_mm": round(over_hi, 6), "side": "max",
+                         "axis": axis_name,
+                         "plane": (cc or {}).get("plane"),
+                         "d": (cc or {}).get("d"),
+                         "checked_path": "tool_swept_envelope"}
+                    issue_indexes.append(self._issue(
+                        "OUT_OF_BOUNDS", pl,
+                        f"{axis_name} 轴刀具扫掠范围（刀心±刀具半径，并叠加"
+                        f"{self.state.wcs} 偏置与刀长补偿）机床坐标最大 "
+                        f"{fmt_num(v['value_mm'])} mm 越出行程上限 "
+                        f"{fmt_num(hi_lim)} mm（超程 "
+                        f"{fmt_num(v['overshoot_mm'])} mm；半径补偿扫掠）",
+                        v))
 
     def _apply_cutter_comp(self, pl: ParsedLine,
                            issue_indexes: list[int]) -> bool:
@@ -1340,50 +1395,34 @@ class Analyzer:
 
     def _cutter_block_motion(self, pl: ParsedLine, motion_key: str | None,
                              issue_indexes: list[int]) -> bool:
-        """运动归属确定后、几何解算前的半径补偿阻断检查。
+        """运动归属确定后、几何解算前的半径补偿阻断检查（当前只查 G0；
+        平面切换与固定循环在主流程中更早拦截）。
 
         返回 True 表示本行必须按半径补偿问题阻断（已登记问题）。
-        - pending_in/pending_out/active 下 G0 快速移动：快速不参与刀补轮廓；
-        - active/pending_out 下定义或触发固定循环；
-        - pending_in/pending_out/active 下切换补偿平面（G17/G18/G19）。
+        阻断不改补偿状态：主流程回滚到行前快照，待切入仍可由后续非零 G1
+        完成切入。
         """
         st = self.state
-        keys = [g_code_key(w) for w in pl.g_words]
-        line_plane = next((k for k in reversed(keys) if k in PLANE_G), None)
-        # 平面切换（G40 退出动作必须在建立补偿的同一平面完成）
-        if line_plane is not None and st.cutter_phase in (
-                "pending_in", "pending_out", "active"):
-            issue_indexes.append(self._issue(
-                "CUTTER_COMP_DISCONTINUOUS", pl,
-                f"半径补偿进行中（{st.cutter_phase}，{st.cutter_plane}）"
-                f"不能切换到 {PLANE_G[line_plane]}；须先在原平面用 G40 经"
-                "非零 G1 退出；该段阻断，补偿状态不变",
-                {"reason": "plane_change", "plane": PLANE_G[line_plane],
-                 "crc_plane": st.cutter_plane, "phase": st.cutter_phase,
-                 "d": st.cutter_d}))
-            return True
-        # G0 快速移动
-        if motion_key == "0" and st.cutter_phase != "inactive":
-            if st.cutter_phase == "pending_in":
-                code = "CUTTER_APPROACH_INVALID"
-                basis = ("半径补偿切入段必须是非零平面内 G1 直线切削段，"
-                         "G0 快速移动不能作为切入段；该段阻断，补偿不生效")
-            elif st.cutter_phase == "pending_out":
-                code = "CUTTER_EXIT_INVALID"
-                basis = ("G40 退出段必须是非零平面内 G1 直线切削段，"
-                         "G0 快速移动不能作为退出段；该段阻断")
-            else:
-                code = "CUTTER_COMP_DISCONTINUOUS"
-                basis = ("半径补偿进行中不允许 G0 快速移动（会使偏置轨迹"
-                         "不连续）；该段阻断，补偿轮廓断开")
-            issue_indexes.append(self._issue(
-                code, pl, basis,
-                {"reason": "rapid_move", "plane": st.plane,
-                 "phase": st.cutter_phase, "d": st.cutter_d}))
-            if st.cutter_phase == "pending_in":
-                self._cutter_reset_pending_in()
-            return True
-        return False
+        if motion_key != "0" or st.cutter_phase == "inactive":
+            return False
+        if st.cutter_phase == "pending_in":
+            code = "CUTTER_APPROACH_INVALID"
+            basis = ("半径补偿切入段必须是非零平面内 G1 直线切削段，"
+                     "G0 快速移动不能作为切入段；该段阻断，待切入状态保持，"
+                     "后续非零 G1 仍可切入")
+        elif st.cutter_phase == "pending_out":
+            code = "CUTTER_EXIT_INVALID"
+            basis = ("G40 退出段必须是非零平面内 G1 直线切削段，"
+                     "G0 快速移动不能作为退出段；该段阻断，补偿状态保持")
+        else:
+            code = "CUTTER_COMP_DISCONTINUOUS"
+            basis = ("半径补偿进行中不允许 G0 快速移动（会使偏置轨迹"
+                     "不连续）；该段阻断，不猜测刀心轨迹")
+        issue_indexes.append(self._issue(
+            code, pl, basis,
+            {"reason": "rapid_move", "plane": st.plane,
+             "phase": st.cutter_phase, "d": st.cutter_d}))
+        return True
 
     def _cutter_reset_pending_in(self):
         """切入失败：撤销本次未完成的 G41/G42 启用（回到 inactive）。"""
@@ -1444,20 +1483,14 @@ class Analyzer:
 
         # 纯设定行（无轴词）不进入本函数；这里只处理运动段。
         if phase == "pending_in":
-            if line_code == "G40":
-                # 同段 G40 出现在待切入状态：取消本次启用
-                self._cutter_reset_pending_in()
-                st.cutter_phase = "pending_out" if False else "inactive"
-                return True
             if motion_mode != "linear" or is_vertical:
-                self._cutter_reset_pending_in()
                 return _fail(
                     "CUTTER_APPROACH_INVALID",
                     "半径补偿切入段必须是非零平面内 G1 直线切削段（刀具沿"
-                    "该段法向建立完整偏置）；当前段为"
+                    "该段建立完整偏置）；当前段为"
                     + ("纯垂直移动（平面内零位移）" if is_vertical
                        else MOTION_CN.get(motion_mode, motion_mode))
-                    + "，不能作为切入段；该段阻断，补偿不生效")
+                    + "，不能作为切入段；该段阻断，待切入状态保持")
             return self._cutter_engage(pl, segment, issue_indexes)
 
         if phase == "pending_out":
@@ -1499,65 +1532,78 @@ class Analyzer:
         p[pi] = perp_value
         return p
 
+    def _ramp_primitive(self, start_uv, end_uv, side, r_d):
+        """构造切入/退出段的满偏置直线 prim（刀心尾/首段，方向=程序方向）。
+
+        起点为程序起点按侧法向偏置 r_d（满偏置），终点为程序终点同法向
+        偏置；窗口 t∈[0, 弦长]，程序端点记原始段端点以便连接校验。
+        """
+        dx, dy = end_uv[0] - start_uv[0], end_uv[1] - start_uv[1]
+        length = math.hypot(dx, dy)
+        d = (dx / length, dy / length)
+        nrm = side_normal(side, d)
+        shift = (r_d * nrm[0], r_d * nrm[1])
+        p_off_s = (start_uv[0] + shift[0], start_uv[1] + shift[1])
+        return Primitive(
+            kind="line", prog_start=start_uv, prog_end=end_uv,
+            p0=p_off_s, direction=d, win0=0.0, win1=length)
+
     def _cutter_engage(self, pl, segment, issue_indexes) -> bool:
-        """切入：G1 直线段从无偏置起点斜变到满偏置终点（切向切入）。"""
+        """切入：非零平面内 G1，刀心从程序起点（无偏置）斜变到满偏置终点。
+
+        尾段为满偏置直线 prim，与下一偏置段做正常内角裁切/外角补弧。
+        """
         st = self.state
         ui, vi, pi = self._cutter_plane_axes()
         s, e = segment["start"], segment["end"]
         u0, v0 = self._uv(s, ui, vi)
         u1, v1 = self._uv(e, ui, vi)
-        try:
-            prim = offset_line((u0, v0), (u1, v1), st.cutter_side,
-                               st.cutter_r)
-        except JoinError as ex:
-            issue_indexes.append(self._issue(
-                "CUTTER_COMP_DISCONTINUOUS", pl,
-                f"切入段偏置失败：{ex}；该段阻断，补偿不生效",
-                {"reason": "approach_offset", "plane": st.cutter_plane,
-                 "d": st.cutter_d}))
-            self._cutter_reset_pending_in()
-            return False
-        # 切向切入：刀心沿程序直线从（无偏置）起点走到（满偏置）终点
-        center_uv = [(u0, v0), prim.point(prim.win1)]
-        # 起点窗口标记为已用满偏置终点（供与下一段连接）
-        prim.win0 = prim.win1
+        prim = self._ramp_primitive((u0, v0), (u1, v1),
+                                    st.cutter_side, st.cutter_r)
+        tail_uv = prim.point(prim.win1)
         perp0, perp1 = s[pi], e[pi]
-        center_points = [self._map_3d(center_uv[0], perp0, ui, vi, pi),
-                         self._map_3d(center_uv[1], perp1, ui, vi, pi)]
+        center_points = [self._map_3d((u0, v0), perp0, ui, vi, pi),
+                         self._map_3d(tail_uv, perp1, ui, vi, pi)]
         self._cutter_attach(
             segment, prim, center_points,
             {"mode": "tangent_engage", "line_no": pl.line_no})
+        segment["cutter_compensation"]["ramp"] = {
+            "kind": "engage",
+            "start_mm": [round6(u0), round6(v0)],
+            "end_mm": [round6(tail_uv[0]), round6(tail_uv[1])]}
         self._cutter_pending = {"segment": segment, "prim": prim,
                                 "line_no": pl.line_no}
         st.cutter_phase = "active"
         return True
 
     def _cutter_exit(self, pl, segment, issue_indexes) -> bool:
-        """退出：G1 直线段从满偏置起点斜变到无偏置终点（切向退出）。"""
+        """退出：非零平面内 G1，刀心从满偏置起点斜变到程序终点（无偏置）。
+
+        首段为满偏置直线 prim，与上一偏置段做正常内角裁切/外角补弧。
+        """
         st = self.state
         ui, vi, pi = self._cutter_plane_axes()
         s, e = segment["start"], segment["end"]
         u0, v0 = self._uv(s, ui, vi)
         u1, v1 = self._uv(e, ui, vi)
-        r_d = st.cutter_r
-        # 起点刀心 = 程序起点 + 本段方向的侧法向 * r（与前段偏置终点相接）
-        dx, dy = u1 - u0, v1 - v0
-        length = math.hypot(dx, dy)
-        du, dv = dx / length, dy / length
-        if st.cutter_side == "left":
-            nu, nv = dv, -du
-        else:
-            nu, nv = -dv, du
-        c0 = (u0 + r_d * nu, v0 + r_d * nv)
+        prim = self._ramp_primitive((u0, v0), (u1, v1),
+                                    st.cutter_side, st.cutter_r)
+        head_uv = prim.point(prim.win0)
         perp0, perp1 = s[pi], e[pi]
-        center_points = [self._map_3d(c0, perp0, ui, vi, pi),
+        center_points = [self._map_3d(head_uv, perp0, ui, vi, pi),
                          self._map_3d((u1, v1), perp1, ui, vi, pi)]
-        # 与上一偏置段做外角补接/内角裁切检查：前段在程序角点处的偏置终点
-        # 与本退出起点必须能连续（同一点或外角圆角）。
-        if not self._cutter_join_exit(pl, segment, c0, issue_indexes):
+        self._cutter_attach(segment, prim, center_points,
+                            {"mode": "tangent_exit", "line_no": pl.line_no})
+        segment["cutter_compensation"]["active"] = False
+        segment["cutter_compensation"]["code"] = "G40"
+        segment["cutter_compensation"]["d"] = st.cutter_d
+        segment["cutter_compensation"]["ramp"] = {
+            "kind": "exit",
+            "start_mm": [round6(head_uv[0]), round6(head_uv[1])],
+            "end_mm": [round6(u1), round6(v1)]}
+        if not self._cutter_join(pl, segment, prim, issue_indexes,
+                                 exit_mode=True):
             return False
-        self._cutter_attach_exit(segment, center_points,
-                                 {"mode": "tangent_exit", "line_no": pl.line_no})
         # 完成退出
         st.cutter_phase = "inactive"
         st.cutter_side = None
@@ -1593,14 +1639,10 @@ class Analyzer:
                     (cu, cv), radius, a0, sweep, clockwise, side, r_d,
                     prog_start=(u0, v0), prog_end=(u1, v1))
         except JoinError as ex:
-            self._cutter_break_chain(pl, segment, issue_indexes,
-                                     reason="arc_radius_nonpositive",
-                                     basis=("半径补偿后圆弧有效半径非正："
-                                            + str(ex)))
             issue_indexes.append(self._issue(
                 "CUTTER_ARC_RADIUS", pl,
                 f"半径补偿后圆弧有效半径非正：{ex}；不猜测刀心轨迹，"
-                "相关轮廓已阻断，补偿轮廓断开",
+                "该段阻断（回滚本行，补偿状态保持）",
                 {"reason": "arc_radius_nonpositive",
                  "plane": st.cutter_plane, "d": st.cutter_d,
                  "tool_radius_mm": round6(r_d),
@@ -1617,7 +1659,7 @@ class Analyzer:
         info = {"mode": "contour", "line_no": pl.line_no,
                 "inward": getattr(prim, "offset_inward", False)}
         self._cutter_attach(segment, prim, center_points, info)
-        if not self._cutter_join_pending(pl, segment, prim, issue_indexes):
+        if not self._cutter_join(pl, segment, prim, issue_indexes):
             return False
         self._cutter_pending = {"segment": segment, "prim": prim,
                                 "line_no": pl.line_no}
@@ -1687,112 +1729,32 @@ class Analyzer:
             "continuous": True,
         }
 
-    def _cutter_join(self, pl, cur_seg, cur_prim, issue_indexes) -> bool:
+    def _cutter_join(self, pl, cur_seg, cur_prim, issue_indexes,
+                     exit_mode: bool = False) -> bool:
         """把当前偏置段与上一偏置段按几何关系连接（内角裁切/外角补弧）。
 
-        失败 => 断开两段轮廓、登记 CUTTER_COMP_DISCONTINUOUS 并阻断当前段。
+        失败 => 登记 CUTTER_COMP_DISCONTINUOUS 并阻断当前段（调用方回滚）。
+        exit_mode 时当前段为 G40 退出斜切段（首段满偏置）。
         """
         st = self.state
         pend = self._cutter_pending
         if pend is None:
-            return True  # 切入段，无前段
+            return True  # 无前段（不应发生，切入段不调用本函数）
         prev_seg, prev_prim = pend["segment"], pend["prim"]
         try:
             result = join_primitives(prev_prim, cur_prim, st.cutter_r)
         except JoinError as ex:
-            self._cutter_break_chain(pl, cur_seg, prev_seg,
-                                     reason="join_discontinuous")
             issue_indexes.append(self._issue(
                 "CUTTER_COMP_DISCONTINUOUS", pl,
-                f"相邻偏置段无法连续：{ex}；不猜测刀心轨迹，相关轮廓已阻断，"
-                "补偿轮廓断开",
+                f"相邻偏置段无法连续：{ex}；不猜测刀心轨迹，该段阻断"
+                "（回滚本行，补偿状态保持）",
                 {"reason": "join_discontinuous",
                  "plane": st.cutter_plane, "d": st.cutter_d,
                  "prev_line_no": pend["line_no"]}))
             return False
         self._apply_join_result(pl, result, prev_seg, prev_prim,
-                                cur_seg, cur_prim)
+                                cur_seg, cur_prim, exit_mode)
         return True
-
-    def _cutter_join_exit(self, pl, exit_seg, exit_start_uv,
-                          issue_indexes) -> bool:
-        """退出段起点（满偏置点）与上一偏置段终点的连接检查。
-
-        点重合或外角圆角可达即可；外角圆角挂到前段（在角点处生成）。
-        """
-        st = self.state
-        pend = self._cutter_pending
-        if pend is None:
-            return True
-        prev_seg, prev_prim = pend["segment"], pend["prim"]
-        p_end = prev_prim.point(prev_prim.win1)
-        gap = math.hypot(exit_start_uv[0] - p_end[0],
-                         exit_start_uv[1] - p_end[1])
-        if gap <= 1e-5:
-            prev_seg["cutter_compensation"]["junction"] = {
-                "kind": "collinear", "with_line_no": pl.line_no}
-            exit_seg["_exit_junction"] = {"kind": "collinear"}
-            return True
-        # 两点应位于以前段程序角点为圆心、r_d 为半径的圆上
-        corner = prev_prim.prog_end
-        r1 = math.hypot(p_end[0] - corner[0], p_end[1] - corner[1])
-        r2 = math.hypot(exit_start_uv[0] - corner[0],
-                        exit_start_uv[1] - corner[1])
-        if abs(r1 - st.cutter_r) > 1e-4 or abs(r2 - st.cutter_r) > 1e-4:
-            self._cutter_break_chain(pl, exit_seg, prev_seg,
-                                     reason="exit_discontinuous")
-            issue_indexes.append(self._issue(
-                "CUTTER_COMP_DISCONTINUOUS", pl,
-                "G40 退出段起点刀心与上一偏置段终点无法用圆角连接"
-                "（不在同一刀具半径圆上）；不猜测刀心轨迹，相关轮廓已阻断",
-                {"reason": "exit_discontinuous",
-                 "plane": st.cutter_plane, "d": st.cutter_d,
-                 "prev_line_no": pend["line_no"]}))
-            return False
-        from .cutter import JoinResult
-        a_from = math.atan2(p_end[1] - corner[1], p_end[0] - corner[0])
-        a_to = math.atan2(exit_start_uv[1] - corner[1],
-                          exit_start_uv[0] - corner[0])
-        # 取与前段切向转动一致的短弧
-        d_prev = prev_prim.tangent(prev_prim.win1)
-        # 退出段满偏置起点的切向 = 程序退出方向（圆角终点切向应与之连续）
-        result = JoinResult("outer", prev_prim.win1, prev_prim.win1, None)
-        # 直接构造外角接弧
-        from .cutter import Connector
-        turn_sign = 1.0  # 由 a_from->a_to 的短弧方向决定
-        sweep = a_to - a_from
-        # 选择使切向连续的扫向：终点切向应等于退出程序方向
-        ui, vi, pi = self._cutter_plane_axes()
-        ex_dir = self._unit2((exit_seg["end"][ui] - exit_seg["start"][ui],
-                              exit_seg["end"][vi] - exit_seg["start"][vi]))
-        for cand in (sweep, sweep - 2 * math.pi, sweep + 2 * math.pi):
-            if abs(cand) <= math.pi + 1e-9:
-                sgn = 1.0 if cand > 0 else -1.0
-                # 圆角在 a_to 处切向
-                tconn = (-sgn * math.sin(a_to), sgn * math.cos(a_to))
-                if tconn[0] * ex_dir[0] + tconn[1] * ex_dir[1] > 0.999:
-                    sweep = cand
-                    break
-        else:
-            sweep = sweep if abs(sweep) <= math.pi else sweep - 2 * math.pi
-        n = max(4, int(math.ceil(abs(sweep) / (math.pi / 2) * 8)))
-        pts = []
-        for k in range(n + 1):
-            a = a_from + sweep * (k / n)
-            pts.append((corner[0] + st.cutter_r * math.cos(a),
-                        corner[1] + st.cutter_r * math.sin(a)))
-        pts[-1] = exit_start_uv
-        conn = Connector(center=corner, radius=st.cutter_r,
-                         a_from=a_from, a_to=a_to, sweep=sweep, points=pts)
-        result = JoinResult("outer", prev_prim.win1, prev_prim.win1, conn)
-        self._apply_join_result(pl, result, prev_seg, prev_prim,
-                                exit_seg, None, exit_mode=True)
-        return True
-
-    @staticmethod
-    def _unit2(v):
-        n = math.hypot(v[0], v[1])
-        return (v[0] / n, v[1] / n)
 
     def _apply_join_result(self, pl, result, prev_seg, prev_prim,
                            cur_seg, cur_prim, exit_mode=False):
@@ -1800,16 +1762,16 @@ class Analyzer:
         pi = self._cutter_plane_axes()[2]
         kind = result.kind
         if kind == "inner":
+            # 前段：从其窗口起点裁到交点
             self._resample_prim_segment(prev_seg, prev_prim,
                                         prev_prim.win0, result.prev_t)
             prev_prim.win1 = result.prev_t
-            if not exit_mode:
-                self._resample_prim_segment(cur_seg, cur_prim,
-                                            result.next_t, cur_prim.win1)
-                cur_prim.win0 = result.next_t
-                point_uv = cur_prim.point(result.next_t)
-            else:
-                point_uv = prev_prim.point(result.prev_t)
+            # 当前段：从交点裁到窗口终点
+            self._resample_prim_segment(cur_seg, cur_prim,
+                                        result.next_t, cur_prim.win1,
+                                        exit_mode=exit_mode)
+            cur_prim.win0 = result.next_t
+            point_uv = cur_prim.point(result.next_t)
             junction_at = {"kind": "inner_trim", "at_line_no": pl.line_no,
                            "point_mm": [round6(v) for v in point_uv]}
             prev_seg["cutter_compensation"]["junction"] = {
@@ -1830,10 +1792,10 @@ class Analyzer:
             }
             prev_junction = dict(junction_out)
             prev_junction["with_line_no"] = pl.line_no
-            prev_junction["at_line_no"] = pl.line_no
             prev_seg["cutter_compensation"]["junction"] = prev_junction
             cur_seg["cutter_compensation"]["junction"] = junction_out
-            prev_seg.setdefault("_cutter_connectors", []).append(conn)
+            # 外角补弧作为独立刀心链节挂到当前段（在角点处生成）
+            cur_seg.setdefault("_cutter_connectors", []).append(conn)
         else:  # collinear
             prev_seg["cutter_compensation"]["junction"] = {
                 "kind": "collinear", "with_line_no": pl.line_no}
@@ -1851,75 +1813,100 @@ class Analyzer:
             out.append(p)
         return out
 
-    def _resample_prim_segment(self, seg, prim, t0, t1):
-        """按新窗口重写段上的刀心采样点（垂直轴按程序点线性映射）。"""
+    def _resample_prim_segment(self, seg, prim, t0, t1,
+                               exit_mode=False):
+        """按新窗口重写段上的刀心采样点（垂直轴按程序点线性映射）。
+
+        切入/退出斜切段（ramp）刀心折线起点为无偏置程序端点：切入时尾部
+        窗口起点用 ramp.start 锚定，退出时头部窗口终点用 ramp.end 锚定。
+        """
         ui, vi, pi_idx = self._cutter_plane_axes()
         uv_pts = sample_primitive(prim, t0, t1)
         pts = seg["points"]
         p0 = pts[0][pi_idx]
         p1 = pts[-1][pi_idx]
         n = len(uv_pts)
-        center = []
-        for k, uv in enumerate(uv_pts):
-            frac = 0.0 if n == 1 else k / (n - 1)
-            perp = (p0 + (p1 - p0) * frac) if (p0 is not None
-                                               and p1 is not None) else None
-            center.append(self._map_3d(uv, perp, ui, vi, pi_idx))
         cc = seg["cutter_compensation"]
+        ramp = cc.get("ramp")
+        center = []
+        if ramp is not None and ramp["kind"] == "engage":
+            # 保留无偏置起点，替换尾部满偏置采样
+            start_uv = tuple(ramp["start_mm"])
+            for k, uv in enumerate(uv_pts):
+                frac = 0.0 if n == 1 else k / (n - 1)
+                perp = (p0 + (p1 - p0) * frac if (p0 is not None
+                                                  and p1 is not None) else None)
+                center.append(self._map_3d(uv, perp, ui, vi, pi_idx))
+            center = [self._map_3d(start_uv, p0, ui, vi, pi_idx)] + center
+        elif ramp is not None and ramp["kind"] == "exit":
+            # 保留无偏置终点，替换头部满偏置采样
+            end_uv = tuple(ramp["end_mm"])
+            for k, uv in enumerate(uv_pts):
+                frac = 0.0 if n == 1 else k / (n - 1)
+                perp = (p0 + (p1 - p0) * frac if (p0 is not None
+                                                  and p1 is not None) else None)
+                center.append(self._map_3d(uv, perp, ui, vi, pi_idx))
+            center = center + [self._map_3d(end_uv, p1, ui, vi, pi_idx)]
+        else:
+            for k, uv in enumerate(uv_pts):
+                frac = 0.0 if n == 1 else k / (n - 1)
+                perp = (p0 + (p1 - p0) * frac if (p0 is not None
+                                                  and p1 is not None) else None)
+                center.append(self._map_3d(uv, perp, ui, vi, pi_idx))
         cc["center_points_mm"] = [[round6(c) for c in p] for p in center]
 
-    def _cutter_break_chain(self, pl, segment, prev_seg, reason):
-        """标记补偿轮廓断开：当前段与前段刀心轨迹置为不连续，
-        状态进入 broken（须重新 G41/G42 或 G40）。"""
-        st = self.state
-
-        def _disc(seg, at_key):
-            if seg is None:
-                return
-            cc = seg.get("cutter_compensation")
-            if cc is None:
-                return
-            cc["continuous"] = False
-            if cc.get("junction") is None:
-                cc["junction"] = {"kind": "disconnected", "reason": reason,
-                                  at_key: pl.line_no}
-
-        _disc(segment, "at_line_no")
-        _disc(prev_seg, "with_line_no")
-        self._cutter_pending = None
-        st.cutter_phase = "broken"
-
     def _cutter_finalize_eof(self):
-        """程序结束时仍处于待切入/补偿中/待退出：定位到最后相关行报告。"""
+        """程序结束时半径补偿仍未完成切入/退出：定位到 G41/G42 或 G40
+        所在原行报告（不改动状态）。"""
         st = self.state
         if st.cutter_phase in ("inactive", "broken"):
             return
-        if not self.entries:
-            return
         if st.cutter_phase == "pending_in":
             line_no = st.cutter_apply_line
-            self._cutter_reset_pending_in()
-        else:
-            line_no = st.cutter_cancel_line or self.entries[-1]["line_no"]
-        entry = next((e for e in reversed(self.entries)
-                      if e["line_no"] == line_no), self.entries[-1])
-        pl = ParsedLine(line_no=entry["line_no"], source=entry["source_line"],
-                        code_text="")
+            src = self._source_for_line(line_no)
+            self.issues.append(Issue(
+                code="CUTTER_APPROACH_INVALID",
+                severity=ISSUE_SEVERITY["CUTTER_APPROACH_INVALID"],
+                line_no=line_no or 0, source=src, normalized="",
+                state_in=self._snapshot(), state_out=self._snapshot(),
+                basis=("程序结束时仍未给出非零平面内 G1 切入段：G41/G42 Dn "
+                       "只登记了待切入状态，刀补未生效"),
+                details={"reason": "eof_no_approach",
+                         "plane": st.cutter_plane, "d": st.cutter_d}))
+            return
         if st.cutter_phase == "pending_out":
-            self._issue(
-                "CUTTER_EXIT_INVALID", pl,
-                "程序结束时半径补偿仍未退出：G40 之后缺少非零平面内 G1 "
-                "退出段；相关刀心轨迹不完整",
-                {"reason": "eof_no_exit", "plane": st.cutter_plane,
-                 "d": st.cutter_d, "g40_line_no": st.cutter_cancel_line})
-        else:
-            self._issue(
-                "CUTTER_EXIT_INVALID", pl,
-                "程序结束时半径补偿仍处于激活/待切入状态，缺少 G40 与非零 "
-                "G1 退出段；相关刀心轨迹不完整",
-                {"reason": "eof_no_exit", "plane": st.cutter_plane,
-                 "d": st.cutter_d,
-                 "engage_line_no": st.cutter_apply_line})
+            line_no = st.cutter_cancel_line
+            src = self._source_for_line(line_no)
+            self.issues.append(Issue(
+                code="CUTTER_EXIT_INVALID",
+                severity=ISSUE_SEVERITY["CUTTER_EXIT_INVALID"],
+                line_no=line_no or 0, source=src, normalized="",
+                state_in=self._snapshot(), state_out=self._snapshot(),
+                basis=("程序结束时 G40 之后缺少非零平面内 G1 退出段，"
+                       "半径补偿未正常退出"),
+                details={"reason": "eof_no_exit", "plane": st.cutter_plane,
+                         "d": st.cutter_d, "g40_line_no": line_no}))
+            return
+        # active：补偿中程序结束
+        line_no = st.cutter_apply_line
+        src = self._source_for_line(line_no)
+        self.issues.append(Issue(
+            code="CUTTER_EXIT_INVALID",
+            severity=ISSUE_SEVERITY["CUTTER_EXIT_INVALID"],
+            line_no=line_no or 0, source=src, normalized="",
+            state_in=self._snapshot(), state_out=self._snapshot(),
+            basis=("程序结束时半径补偿仍处于激活状态，缺少 G40 与非零平面内 "
+                   "G1 退出段；相关刀心轨迹不完整"),
+            details={"reason": "eof_active", "plane": st.cutter_plane,
+                     "d": st.cutter_d, "engage_line_no": line_no}))
+
+    def _source_for_line(self, line_no):
+        if not line_no:
+            return ""
+        for e in reversed(self.entries):
+            if e["line_no"] == line_no:
+                return e["source_line"]
+        return ""
 
     def _comp_out(self):
         """当前刀长补偿（供轨迹输出）：未生效返回 None。"""
@@ -2141,6 +2128,7 @@ class Analyzer:
             self._process_line(pl)
             if self.progress:
                 self.progress(min(99, int(pl.line_no / total * 100)))
+        self._cutter_finalize_eof()
         if self.progress:
             self.progress(100)
         return self._build_report(len(lines))
@@ -2154,6 +2142,7 @@ class Analyzer:
             if self.progress and (n % 2000 == 0 or n == total):
                 self.progress(min(99, int(n / total * 100)))
         self.current_block = None
+        self._cutter_finalize_eof()
         if self.progress:
             self.progress(100)
         physical = sum(1 for b in blocks if not b.line.is_blank)
@@ -2171,6 +2160,16 @@ class Analyzer:
         self._line_comp = None
         self._line_cutter = None
         self._snap_in_line_no = pl.line_no
+        # 半径补偿回滚所需的行前状态（待连接段/路径累计/扫掠包围盒）
+        self._snap_in_cutter_pending = self._cutter_pending
+        self._snap_in_cutter_path = copy.deepcopy(self.cutter_path)
+        self._snap_in_cutter_bmin = list(self.cutter_swept_bmin)
+        self._snap_in_cutter_bmax = list(self.cutter_swept_bmax)
+        self._snap_in_cutter_mbmin = list(self.cutter_swept_mbmin)
+        self._snap_in_cutter_mbmax = list(self.cutter_swept_mbmax)
+        self._snap_in_cutter_wcs_known = self.cutter_swept_wcs_known
+        self._snap_in_prev_seg = (self._cutter_pending["segment"]
+                                  if self._cutter_pending is not None else None)
 
         if pl.is_blank:
             self.blank_count += 1
@@ -2649,7 +2648,7 @@ class Analyzer:
             self._attach_segment_comp(segment)
             self._run_segment_checks(pl, motion_mode, segment, issue_indexes)
             self._accumulate(motion_mode, segment)
-            self._accumulate_cutter(pl, motion_mode, segment)
+            self._accumulate_cutter(pl, motion_mode, segment, issue_indexes)
 
         normalized = self._normalized(
             applied_g, m_words, motion_g,
@@ -2817,6 +2816,27 @@ class Analyzer:
                 and self.length_events[-1].get(
                     "line_no") == self._snap_in_line_no:
             self.length_events.pop()
+        # 撤销本行登记的半径补偿事件（G41/G42/G40 设定行阻断/运动行回滚）
+        if self._snap_in_line_no is not None and self.cutter_events \
+                and self.cutter_events[-1].get(
+                    "line_no") == self._snap_in_line_no:
+            self.cutter_events.pop()
+        # 恢复本行待连接偏置段（join 失败/圆弧半径非正回滚时）
+        self._cutter_pending = self._snap_in_cutter_pending
+        # 回滚后刀心路径累计与扫掠包围盒恢复到行前
+        self.cutter_path = self._snap_in_cutter_path
+        self.cutter_swept_bmin = list(self._snap_in_cutter_bmin)
+        self.cutter_swept_bmax = list(self._snap_in_cutter_bmax)
+        self.cutter_swept_mbmin = list(self._snap_in_cutter_mbmin)
+        self.cutter_swept_mbmax = list(self._snap_in_cutter_mbmax)
+        self.cutter_swept_wcs_known = self._snap_in_cutter_wcs_known
+        # 上一已完成段在阻断行之前，其上的 junction/connector 标注也要撤销
+        if self._snap_in_prev_seg is not None:
+            prev = self._snap_in_prev_seg
+            prev_cc = prev.get("cutter_compensation")
+            if prev_cc is not None:
+                prev_cc["junction"] = None
+            prev.pop("_cutter_connectors", None)
 
     # -- 固定钻孔循环 ------------------------------------------------------
 
@@ -3676,6 +3696,14 @@ class Analyzer:
             comps = [c] * len(points)
         # 弧段产生的问题带上平面信息，报告可按 plane=G17/G18/G19 筛选
         arc_plane = (segment.get("arc") or {}).get("plane_code")
+        # 半径补偿轮廓段：机床行程按刀具扫掠包围盒（刀心±半径）在
+        # _accumulate_cutter 中统一判定，此处不再按编程刀尖轨迹重复检查。
+        cutter_cc = segment.get("cutter_compensation")
+        skip_travel_bounds = (cutter_cc is not None
+                              and cutter_cc.get("continuous", True)
+                              and cutter_cc.get("mode") in (
+                                  "tangent_engage", "contour",
+                                  "tangent_exit"))
 
         def _details(d):
             if arc_plane is not None:
@@ -3702,25 +3730,26 @@ class Analyzer:
                 _details({"reason": "wcs_not_configured",
                           "wcs": self.state.wcs})))
         else:
-            for v in self._bounds_violations(points, comps):
-                c = self.cfg
-                bound = {"X": (c.x_min, c.x_max),
-                         "Y": (c.y_min, c.y_max),
-                         "Z": (c.z_min, c.z_max)}[v["axis"]]
-                comp_note = ""
-                if v["axis"] == "Z" and abs(self.state.comp_signed) > MM_EPS:
-                    comp_note = (f"与 {self.state.wcs} 偏置及刀长补偿"
-                                 f"H{self.state.comp_h}"
-                                 f"（{fmt_num(self.state.comp_signed)} mm）")
-                else:
-                    comp_note = f"已叠加 {self.state.wcs} 偏置"
-                issue_indexes.append(self._issue(
-                    "OUT_OF_BOUNDS", pl,
-                    f"{v['axis']} 轴主轴基准点机床坐标 "
-                    f"{fmt_num(v['value_mm'])} mm 越出行程"
-                    f"边界 {fmt_num(v['bound_mm'])} mm（超程 "
-                    f"{fmt_num(v['overshoot_mm'])} mm；{comp_note}）",
-                    _details(v)))
+            if not skip_travel_bounds:
+                for v in self._bounds_violations(points, comps):
+                    c = self.cfg
+                    bound = {"X": (c.x_min, c.x_max),
+                             "Y": (c.y_min, c.y_max),
+                             "Z": (c.z_min, c.z_max)}[v["axis"]]
+                    comp_note = ""
+                    if v["axis"] == "Z" and abs(self.state.comp_signed) > MM_EPS:
+                        comp_note = (f"与 {self.state.wcs} 偏置及刀长补偿"
+                                     f"H{self.state.comp_h}"
+                                     f"（{fmt_num(self.state.comp_signed)} mm）")
+                    else:
+                        comp_note = f"已叠加 {self.state.wcs} 偏置"
+                    issue_indexes.append(self._issue(
+                        "OUT_OF_BOUNDS", pl,
+                        f"{v['axis']} 轴主轴基准点机床坐标 "
+                        f"{fmt_num(v['value_mm'])} mm 越出行程"
+                        f"边界 {fmt_num(v['bound_mm'])} mm（超程 "
+                        f"{fmt_num(v['overshoot_mm'])} mm；{comp_note}）",
+                        _details(v)))
             self._grow_bbox(points, machine=True, comps=comps)
 
         self._grow_bbox(points, machine=False)
@@ -3857,6 +3886,22 @@ class Analyzer:
             off = self._current_offset()
             tip_z = self.state.z.value if self.state.z.known else None
             entry["tool_length_event"] = self._length_event_out(ev, tip_z, off)
+        # 半径补偿段（G40/G41/G42 纯设定行）：记录事件
+        crc = self._line_cutter or {}
+        crc_ev = crc.get("event")
+        if crc_ev is not None:
+            entry["tool_radius_event"] = {
+                "line_no": crc_ev["line_no"],
+                "source_line": crc_ev["source_line"],
+                "code": crc_ev["code"],
+                "side": crc_ev.get("side"),
+                "d": crc_ev.get("d"),
+                "radius_mm": crc_ev.get("radius_mm"),
+                "plane": crc_ev.get("plane"),
+                "wcs": crc_ev.get("wcs"),
+                **({"cancels_d": crc_ev["cancels_d"]}
+                   if "cancels_d" in crc_ev else {}),
+            }
         if issue_indexes:
             entry["issue_codes"] = [self.issues[i].code for i in issue_indexes]
         self._annotate_entry(entry, self.current_block)
@@ -3906,6 +3951,76 @@ class Analyzer:
         }
         if "arc" in segment:
             out["arc"] = segment["arc"]
+        cc = segment.get("cutter_compensation")
+        if cc is not None:
+            out["cutter_compensation"] = self._cutter_comp_out(segment, cc,
+                                                                off)
+        return out
+
+    def _cutter_comp_out(self, segment, cc: dict, off) -> dict:
+        """段上的半径补偿输出：刀心轨迹、连接方式、刀具扫掠包围盒。"""
+        center = cc.get("center_points_mm")
+        r_d = cc.get("radius_mm") or 0.0
+        ui, vi, pi = (PLANE_SPEC[cc["plane"]] if cc.get("plane") in PLANE_SPEC
+                      else PLANE_SPEC[self.state.plane])[:3]
+
+        def spindle(p):
+            if off is None or p is None:
+                return None
+            return self._spindle_out(p, off, self.state.comp_signed)
+
+        # 外角补弧（刀心链节）展开到输出
+        connector_out = None
+        all_center = list(center) if center else []
+        for conn in segment.get("_cutter_connectors", []):
+            pts3 = self._connector_3d(conn, pi, segment)
+            cp = [[round6(c) for c in p] for p in pts3]
+            all_center.extend(cp)
+            connector_out = {
+                "kind": "outer_arc",
+                "center_mm": [round6(conn.center[0]),
+                              round6(conn.center[1])],
+                "radius_mm": round6(conn.radius),
+                "sweep_deg": round(math.degrees(conn.sweep), 6),
+                "center_points_mm": cp,
+            }
+        swept_bbox = None
+        if all_center:
+            bmin = [math.inf] * 3
+            bmax = [-math.inf] * 3
+            for p in all_center:
+                for i, v in enumerate(p):
+                    if v is None:
+                        continue
+                    rad = r_d if i in (ui, vi) else 0.0
+                    bmin[i] = min(bmin[i], v - rad)
+                    bmax[i] = max(bmax[i], v + rad)
+            if not any(math.isinf(v) for v in bmin):
+                swept_bbox = {
+                    "x_mm": [round(bmin[0], 6), round(bmax[0], 6)],
+                    "y_mm": [round(bmin[1], 6), round(bmax[1], 6)],
+                    "z_mm": [round(bmin[2], 6), round(bmax[2], 6)],
+                    "size_mm": [round(bmax[0] - bmin[0], 6),
+                                round(bmax[1] - bmin[1], 6),
+                                round(bmax[2] - bmin[2], 6)]}
+        out = {
+            "active": cc.get("active", True),
+            "code": cc.get("code"),
+            "side": cc.get("side"),
+            "d": cc.get("d"),
+            "radius_mm": cc.get("radius_mm"),
+            "plane": cc.get("plane"),
+            "mode": cc.get("mode"),
+            "continuous": cc.get("continuous", True),
+            "ramp": cc.get("ramp"),
+            "junction": cc.get("junction"),
+            "connector": connector_out,
+            "center_path_mm": [[round6(c) for c in p]
+                               for p in (center or [])],
+            "center_path_machine_mm": (
+                [spindle(p) for p in center] if off is not None else None),
+            "swept_bbox_program_mm": swept_bbox,
+        }
         return out
 
     def _bbox_out(self, bmin, bmax):
@@ -4141,6 +4256,79 @@ class Analyzer:
             },
         }
 
+    def _cutter_comp_section_out(self) -> dict:
+        """半径补偿（G40/G41/G42 + D）汇总：D 半径表、事件流、按 D 汇总、
+        刀心路径与刀具扫掠包围盒。"""
+        issue_by_d: dict = {}
+        for iss in self.issues:
+            d = iss.details.get("d")
+            if d is not None:
+                issue_by_d[d] = issue_by_d.get(d, 0) + 1
+
+        by_d = {}
+        for d in sorted(set(self.cutter_path) |
+                        {ev["d"] for ev in self.cutter_events
+                         if ev.get("d") is not None}):
+            if d == "__none__":
+                continue
+            b = self.cutter_path.get(d, {"segments": 0, "center_length": 0.0,
+                                        "engages": 0, "exits": 0})
+            by_d[f"D{d}"] = {
+                "d": d,
+                "radius_mm": self.cfg.radius_offsets.get(d),
+                "compensated_segments": b["segments"],
+                "engages": b["engages"],
+                "exits": b["exits"],
+                "center_path_length_mm": round(b["center_length"], 6),
+                "issues": issue_by_d.get(d, 0),
+            }
+        events = []
+        for ev in self.cutter_events:
+            events.append({
+                "line_no": ev["line_no"],
+                "source_line": ev["source_line"],
+                "code": ev["code"],
+                "side": ev.get("side"),
+                "d": ev.get("d"),
+                "radius_mm": ev.get("radius_mm"),
+                "plane": ev.get("plane"),
+                "wcs": ev.get("wcs"),
+                **({"cancels_d": ev["cancels_d"],
+                    "cancels_side": ev.get("cancels_side")}
+                   if "cancels_d" in ev else {}),
+            })
+        return {
+            "supported": {
+                "G40": "取消刀具半径补偿（须用非零平面内 G1 退出）",
+                "G41": "左侧半径补偿（按平面正法向 n=u×v 判定左/右）",
+                "G42": "右侧半径补偿",
+                "D": "D 号只在与 G41/G42 同段时生效，刀具半径取自机床"
+                     "配置 radius_offsets（D 为正整数且已登记）",
+            },
+            "offsets_mm": {f"D{d}": self.cfg.radius_offsets[d]
+                          for d in sorted(self.cfg.radius_offsets)},
+            "events": events,
+            "by_d": by_d,
+            "center_path_total_mm": round(
+                sum(b["center_length"]
+                    for d, b in self.cutter_path.items()
+                    if d != "__none__"), 6),
+            "swept_bbox_program_mm": self._bbox_out(
+                self.cutter_swept_bmin, self.cutter_swept_bmax),
+            "swept_bbox_machine_mm": (
+                self._bbox_out(self.cutter_swept_mbmin,
+                              self.cutter_swept_mbmax)
+                if self.cutter_swept_wcs_known else None),
+            "issues": {code: sum(1 for i in self.issues if i.code == code)
+                       for code in ("CUTTER_COMP_MISSING_D",
+                                    "CUTTER_COMP_D_NOT_FOUND",
+                                    "CUTTER_COMP_CONFLICT",
+                                    "CUTTER_APPROACH_INVALID",
+                                    "CUTTER_EXIT_INVALID",
+                                    "CUTTER_ARC_RADIUS",
+                                    "CUTTER_COMP_DISCONTINUOUS")},
+        }
+
     def _build_report(self, physical_lines: int) -> dict:
         counts = {s: 0 for s in SEVERITY_ORDER}
         for iss in self.issues:
@@ -4169,10 +4357,17 @@ class Analyzer:
             "arcs": self._arcs_out(),
             "wcs": self._wcs_out(),
             "length_compensation": self._length_comp_out(),
+            "cutter_compensation": self._cutter_comp_section_out(),
             "bbox_program_mm": self._bbox_out(self.bmin, self.bmax),
             "bbox_machine_mm": (
                 self._bbox_out(self.mbmin, self.mbmax)
                 if self.all_moves_wcs_known else None),
+            "cutter_swept_bbox_program_mm": self._bbox_out(
+                self.cutter_swept_bmin, self.cutter_swept_bmax),
+            "cutter_swept_bbox_machine_mm": (
+                self._bbox_out(self.cutter_swept_mbmin,
+                              self.cutter_swept_mbmax)
+                if self.cutter_swept_wcs_known else None),
             "machine_bbox_note": (
                 None if self.all_moves_wcs_known
                 else "存在坐标系未建立或未配置偏置的运动，"
@@ -4257,6 +4452,9 @@ DIALECT = {
         "G43": "刀长补偿加（主轴基准点 = 刀尖工件 + H 偏置；须同行给 H）",
         "G44": "刀长补偿减（主轴基准点 = 刀尖工件 - H 偏置；须同行给 H）",
         "G49": "取消刀长补偿",
+        "G40": "取消刀具半径补偿（须用非零平面内 G1 退出）",
+        "G41": "刀具半径补偿左侧（按平面正法向 n=u×v 判定；须同行给 D）",
+        "G42": "刀具半径补偿右侧（同 G41，方向相反；须同行给 D）",
         "G20": "英制单位", "G21": "公制单位",
         "G90": "绝对定位", "G91": "增量定位",
         "G54": "工件坐标系 1（偏置由配置 wcs_offsets 提供）",

@@ -20,7 +20,7 @@ def _fingerprint(issue: dict) -> tuple:
     key = ["axis", "unsupported_tokens", "malformed_tokens", "reason",
            "below_mm", "overshoot_mm", "exceed_mm_per_min", "exceed_rpm",
            "cycle", "hole_no", "missing", "bad", "unknown", "plane", "wcs",
-           "h"]
+           "h", "d", "checked_path"]
     detail_fp = tuple((k, str(d.get(k))) for k in key if k in d)
     return (issue["code"], issue.get("normalized", ""), detail_fp)
 
@@ -282,6 +282,11 @@ def compare_reports(baseline: dict, candidate: dict,
     length_compare = _length_comp_compare(
         baseline, candidate, resolved, introduced)
 
+    # 刀具半径补偿（G40/G41/G42 + D）：偏置路径、扫掠包围盒、切入/退出
+    # 与问题的两侧值与变化
+    cutter_compare = _cutter_comp_compare(
+        baseline, candidate, resolved, introduced)
+
     return {
         "labels": {"baseline": baseline_label, "candidate": candidate_label},
         "machine": candidate["machine"],
@@ -289,6 +294,7 @@ def compare_reports(baseline: dict, candidate: dict,
         "arcs": arc_compare,
         "wcs": wcs_compare,
         "length_compensation": length_compare,
+        "cutter_compensation": cutter_compare,
         "risk": {
             "baseline": baseline["risk"],
             "candidate": candidate["risk"],
@@ -555,3 +561,135 @@ def compare_package_reports(baseline: dict, candidate: dict,
         "edges_changed": edges_changed,
     }
     return result
+
+
+# ---------------------------------------------------------------------------
+# 刀具半径补偿（G40/G41/G42 + D）对比
+# ---------------------------------------------------------------------------
+
+def _cc_section(report: dict) -> dict:
+    return report.get("cutter_compensation", {})
+
+
+def _d_of(issue: dict):
+    return issue.get("details", {}).get("d")
+
+
+def _bbox_pair(sec: dict, key: str):
+    """取 sweep 包围盒的 min/max 六值（None 表示不可用）。"""
+    box = sec.get(key)
+    if box is None:
+        return None
+    return {
+        "x_mm": box.get("x_mm"), "y_mm": box.get("y_mm"),
+        "z_mm": box.get("z_mm"), "size_mm": box.get("size_mm")}
+
+
+def _cutter_comp_compare(baseline: dict, candidate: dict,
+                         resolved: list, introduced: list) -> dict:
+    """半径补偿对比：D 半径表变化、G40/G41/G42 事件、按 D 的偏置路径/
+    切入退出/问题，以及刀具扫掠包围盒（工件/机床）的变化。"""
+    sa, sb = _cc_section(baseline), _cc_section(candidate)
+    table_a, table_b = sa.get("offsets_mm", {}), sb.get("offsets_mm", {})
+
+    def _d_key(t):
+        return int(t[1:]) if t[1:].isdigit() else 0
+
+    table_changes = []
+    for label in sorted(set(table_a) | set(table_b), key=_d_key):
+        va, vb = table_a.get(label), table_b.get(label)
+        if va != vb:
+            table_changes.append({
+                "d": label, "baseline_mm": va, "candidate_mm": vb,
+                "delta_mm": (round(vb - va, 6)
+                             if va is not None and vb is not None else None)})
+
+    def events(sec):
+        out = {"G41": 0, "G42": 0, "G40": 0}
+        for e in sec.get("events", []):
+            code = e.get("code")
+            if code in out:
+                out[code] += 1
+        return out
+
+    ea, eb = events(sa), events(sb)
+
+    by_d_a, by_d_b = sa.get("by_d", {}), sb.get("by_d", {})
+    ia = Counter(_d_of(i) for i in baseline["issues"] if _d_of(i) is not None)
+    ib = Counter(_d_of(i) for i in candidate["issues"] if _d_of(i) is not None)
+    res_d = Counter(_d_of(i) for i in resolved if _d_of(i) is not None)
+    int_d = Counter(_d_of(i) for i in introduced if _d_of(i) is not None)
+    by_d = {}
+    for label in sorted(set(by_d_a) | set(by_d_b), key=_d_key):
+        a, b = by_d_a.get(label, {}), by_d_b.get(label, {})
+        dno = a.get("d") if a.get("d") is not None else b.get("d")
+        la, lb = a.get("center_path_length_mm", 0.0), \
+            b.get("center_path_length_mm", 0.0)
+        by_d[label] = {
+            "d": dno,
+            "radius_baseline_mm": table_a.get(label),
+            "radius_candidate_mm": table_b.get(label),
+            "baseline_center_path_mm": la,
+            "candidate_center_path_mm": lb,
+            "delta_center_path_mm": round(lb - la, 6),
+            "baseline_segments": a.get("compensated_segments", 0),
+            "candidate_segments": b.get("compensated_segments", 0),
+            "delta_segments": (b.get("compensated_segments", 0)
+                               - a.get("compensated_segments", 0)),
+            "baseline_engages": a.get("engages", 0),
+            "candidate_engages": b.get("engages", 0),
+            "baseline_exits": a.get("exits", 0),
+            "candidate_exits": b.get("exits", 0),
+            "baseline_issues": ia.get(dno, 0),
+            "candidate_issues": ib.get(dno, 0),
+            "delta_issues": ib.get(dno, 0) - ia.get(dno, 0),
+            "resolved_issues": res_d.get(dno, 0),
+            "introduced_issues": int_d.get(dno, 0),
+        }
+
+    def sweep_of(r):
+        return {"program": r.get("cutter_swept_bbox_program_mm"),
+                "machine": r.get("cutter_swept_bbox_machine_mm")}
+
+    sw_a, sw_b = sweep_of(baseline), sweep_of(candidate)
+    swept_compare = {
+        "baseline_program_bbox": sw_a["program"],
+        "candidate_program_bbox": sw_b["program"],
+        "baseline_machine_bbox": sw_a["machine"],
+        "candidate_machine_bbox": sw_b["machine"],
+    }
+    if sw_a["program"] is not None and sw_b["program"] is not None:
+        swept_compare["delta_program_size_mm"] = [
+            round(sw_b["program"]["size_mm"][i]
+                  - sw_a["program"]["size_mm"][i], 6) for i in range(3)]
+    if sw_a["machine"] is not None and sw_b["machine"] is not None:
+        swept_compare["delta_machine_size_mm"] = [
+            round(sw_b["machine"]["size_mm"][i]
+                  - sw_a["machine"]["size_mm"][i], 6) for i in range(3)]
+
+    cutter_codes = ("CUTTER_COMP_MISSING_D", "CUTTER_COMP_D_NOT_FOUND",
+                    "CUTTER_COMP_CONFLICT", "CUTTER_APPROACH_INVALID",
+                    "CUTTER_EXIT_INVALID", "CUTTER_ARC_RADIUS",
+                    "CUTTER_COMP_DISCONTINUOUS")
+    ca = Counter(i["code"] for i in baseline["issues"]
+                 if i["code"] in cutter_codes)
+    cb = Counter(i["code"] for i in candidate["issues"]
+                 if i["code"] in cutter_codes)
+    block_counts = {c: {"baseline": ca.get(c, 0),
+                        "candidate": cb.get(c, 0),
+                        "delta": cb.get(c, 0) - ca.get(c, 0)}
+                    for c in cutter_codes}
+    return {
+        "offset_table_changes": table_changes,
+        "events": {
+            "baseline": ea, "candidate": eb,
+            "delta": {c: eb[c] - ea[c] for c in ("G41", "G42", "G40")}},
+        "by_d": by_d,
+        "swept_bbox": swept_compare,
+        "center_path_total_mm": {
+            "baseline": sa.get("center_path_total_mm", 0.0),
+            "candidate": sb.get("center_path_total_mm", 0.0),
+            "delta": round(sb.get("center_path_total_mm", 0.0)
+                           - sa.get("center_path_total_mm", 0.0), 6)},
+        "block_issue_counts": block_counts,
+    }
