@@ -24,6 +24,9 @@ SUPPORTED_G = {
     "43": "tool_len_plus",   # 刀长补偿：主轴基准点 + H 偏置（加）
     "44": "tool_len_minus",  # 刀长补偿：主轴基准点 - H 偏置（减）
     "49": "tool_len_cancel",  # 取消刀长补偿
+    "40": "tool_rad_cancel",  # 取消刀具半径补偿
+    "41": "tool_rad_left",    # 刀具半径补偿：左侧（按平面正法向判定）
+    "42": "tool_rad_right",   # 刀具半径补偿：右侧
     "20": "inch",        # 英制
     "21": "mm",          # 公制
     "90": "absolute",    # 绝对定位
